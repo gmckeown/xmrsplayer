@@ -15,7 +15,7 @@ The **SID** format was added from the reverse engineering of Rob Hubbard's 6510 
 - Eventually, it may be necessary to work by *Track* to build the *Patterns* because the lengths are changing on some *Tracks* which makes it impossible to generate homogeneous patterns (but I can still do it for a large part of his music)
 - Above all, add to the player the use of the `resid-rs` box, because any other means is really doomed to failure. As you can see, the code is generic enough to do what we want, I just lack time so if there are people who speak rust and who are motivated to have fun with me :-)
 
-If no one comes forward, I think I'll take care of the **IT** format soon.
+The **IT** format is a WIP, loader mostly done.
 
 ## Use it as a Crate
 

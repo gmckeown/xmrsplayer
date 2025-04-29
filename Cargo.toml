@@ -1,6 +1,6 @@
 [package]
 name = "xmrsplayer"
-version = "0.9.5"
+version = "0.9.7"
 edition = "2021"
 description = "XMrsPlayer is a safe no-std soundtracker music player"
 authors = ["Sebastien Bechet"]
@@ -10,13 +10,13 @@ repository = "https://codeberg.org/sbechet/xmrsplayer"
 readme = "README.md"
 license = "MIT"
 
-keywords = ["xm", "module", "mod", "s3m", "soundtracker"]
+keywords = ["xm", "module", "mod", "s3m", "it", "soundtracker"]
 categories = ["multimedia::audio", "embedded", "no-std"]
 
 [dependencies]
-xmrs = { version = "0.9.5", default-features = false }
+xmrs = { version = "0.9.7", default-features = false }
 clap = { version = "4.5", optional = true, features = ["cargo", "derive"] }
-rodio =  { version = "0.19", optional = true }
+rodio =  { version = "0.20.1", optional = true }
 console =  { version = "0.15", optional = true }
 cpal =  { version = "0.15", optional = true }
 num-traits = { version = "0.2",default-features = false, optional=true } # libm wrapper
@@ -26,7 +26,7 @@ hound = { version = "3.5", optional=true }
 [features]
 default = ["micromath"]
 demo = ["std", "clap", "console", "cpal", "hound", "import", "sid"]
-import = ["xmrs/import_amiga", "xmrs/import_it", "xmrs/import_s3m", "xmrs/import_sid", "xmrs/import_xm"]
+import = ["xmrs/import", "xmrs/import_sid"]
 libm = ["num-traits/libm", "xmrs/libm"]
 micromath = ["dep:micromath", "xmrs/micromath"]
 sid = ["xmrs/import_sid"]

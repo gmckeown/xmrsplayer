@@ -13,10 +13,11 @@ pub struct StateEnvelope<'a> {
 impl<'a> StateEnvelope<'a> {
     // value is volume_envelope_volume=1.0 or volume_envelope_panning=0.5
     pub fn new(env: &'a Envelope, default_value: f32) -> Self {
+        let enabled = env.enabled;
         Self {
             env,
             default_value,
-            enabled: true,
+            enabled,
             value: default_value,
             counter: 0,
         }
@@ -27,7 +28,7 @@ impl<'a> StateEnvelope<'a> {
     }
 
     pub fn reset(&mut self) {
-        self.enabled = true;
+        self.enabled = self.env.enabled;
         self.value = self.default_value;
         self.counter = 0;
     }

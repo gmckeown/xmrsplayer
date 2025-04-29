@@ -125,7 +125,7 @@ impl<'a> StateInstrDefault<'a> {
         self.sustained = false;
 
         if let Some(ss) = &mut self.state_sample {
-            ss.sustained = false;
+            ss.set_sustained(false);
         }
 
         if !self.envelope_volume.has_volume_envelope() {
