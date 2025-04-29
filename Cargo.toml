@@ -10,7 +10,7 @@ repository = "https://codeberg.org/sbechet/xmrsplayer"
 readme = "README.md"
 license = "MIT"
 
-keywords = ["xm", "module", "mod", "s3m", "it", "soundtracker"]
+keywords = ["xm", "mod", "s3m", "it", "soundtracker"]
 categories = ["multimedia::audio", "embedded", "no-std"]
 
 [dependencies]
