@@ -85,7 +85,7 @@ impl<'a> Channel<'a> {
             effect_arpeggio: EffectArpeggio::new(historical.clone()),
             effect_note_retrig_backup: NoteRetrigState::default(),
             effect_note_retrig_counter: 0,
-            effect_panbrello: EffectVibratoTremolo::default(),
+            effect_panbrello: EffectVibratoTremolo::new(Waveform::Sine),
             effect_tremolo: EffectVibratoTremolo::new(Waveform::Sine),
             effect_tremor: false,
             effect_tremor_on: 0,
@@ -190,9 +190,12 @@ impl<'a> Channel<'a> {
     fn tickn_update_instr(&mut self) {
         if let Some(instr) = &mut self.instr {
             // Panning
+            let space_from_center = (0.5 - (self.panning - 0.5).abs()) * 2.0;
+            let instr_env_pan_val = instr.envelope_panning.value - 0.5;
+            let panbrello = self.effect_panbrello.value();
             let panning: f32 = self.panning
-                + (instr.envelope_panning.value - 0.5) * (0.5 - (self.panning - 0.5).abs()) * 2.0
-                + (self.effect_panbrello.value() - 0.5) * (0.5 - (self.panning - 0.5).abs()) * 2.0;
+                + instr_env_pan_val * space_from_center
+                + panbrello * space_from_center;
             let panning = panning.clamp(0.0, 1.0);
 
             // Volume
@@ -418,8 +421,7 @@ impl<'a> Channel<'a> {
                 }
                 TrackEffect::Panbrello { speed: s, depth: d } => {
                     if current_tick == 0 {
-                        self.effect_panbrello.data.speed = s;
-                        self.effect_panbrello.data.depth = d;
+                        self.effect_panbrello.tick0(s,d);
                     } else {
                         self.effect_panbrello.tick();
                     }
