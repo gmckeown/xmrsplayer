@@ -41,7 +41,7 @@ impl<'a> StateAutoVibrato<'a> {
 
         let current_depth = if self.phase < self.vibrato.sweep && !sustain {
             // sweep can't be zero
-            (self.phase / self.vibrato.sweep) * self.vibrato.depth as f32
+            (self.phase / self.vibrato.sweep) * self.vibrato.depth
         } else {
             self.vibrato.depth
         };

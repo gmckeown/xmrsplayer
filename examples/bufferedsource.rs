@@ -16,7 +16,11 @@ impl<'a> BufferedSource<'a> {
         BufferedSource {
             player,
             buffer: [0.0; BUFFER_SIZE],
-            buffer_index: 0,
+            // Start past the end so the first `next()` triggers
+            // `generate_samples()` before returning a value. Without this,
+            // the first 2047 samples came out of the zero-initialised
+            // buffer (~46 ms of silence at 44.1 kHz).
+            buffer_index: BUFFER_SIZE,
             sample_rate,
         }
     }
@@ -54,13 +58,15 @@ impl<'a> Iterator for BufferedSource<'a> {
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.buffer_index += 1;
-
+        // Refill first when we've drained the buffer, then read, then
+        // advance. The previous code incremented before reading so
+        // `buffer[0]` was never returned.
         if self.buffer_index >= BUFFER_SIZE {
             self.generate_samples();
             self.buffer_index = 0;
         }
-
-        Some(self.buffer[self.buffer_index])
+        let sample = self.buffer[self.buffer_index];
+        self.buffer_index += 1;
+        Some(sample)
     }
 }

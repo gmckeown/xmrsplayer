@@ -46,7 +46,7 @@ impl<'a> StateSample<'a> {
     }
 
     pub fn set_step(&mut self, frequency: f32) {
-        if self.sample.len() == 0 {
+        if self.sample.is_empty() {
             self.disable();
         } else {
             self.step = Some(((1 << M) as f32 * (frequency / self.rate)) as u32);
@@ -90,7 +90,7 @@ impl<'a> StateSample<'a> {
 
         let useek = self
             .sample
-            .meta_seek(self.position.0 as usize, self.sustained) as usize;
+            .meta_seek(self.position.0 as usize, self.sustained);
         let u = self.sample.at(useek);
 
         let vseek = self
@@ -100,7 +100,7 @@ impl<'a> StateSample<'a> {
 
         self.increment_position();
 
-        return (lerp(u.0, v.0, t), lerp(u.1, v.1, t));
+        (lerp(u.0, v.0, t), lerp(u.1, v.1, t))
     }
 
     pub fn set_position(&mut self, position: usize) {
@@ -117,7 +117,7 @@ impl<'a> StateSample<'a> {
                 self.position.1 = self.get_position_fraction();
             }
         }
-        return self.position.0;
+        self.position.0
     }
 
     #[inline(always)]

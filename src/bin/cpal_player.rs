@@ -109,40 +109,38 @@ fn main() -> Result<(), std::io::Error> {
         return Ok(());
     }
 
-    match cli.filename {
-        Some(filename) => {
-            println!("opening {}", filename);
-            let contents = std::fs::read(filename.trim())?;
-            match Module::load(&contents) {
-                Ok(module) => {
-                    drop(contents); // cleanup memory
-                    println!("Playing {} !", module.name);
+    if let Some(filename) = cli.filename {
+        println!("opening {}", filename);
+        let contents = std::fs::read(filename.trim())?;
+        match Module::load(&contents) {
+            Ok(module) => {
+                drop(contents); // cleanup memory
+                println!("Playing {} !", module.name);
 
-                    let module = Box::new(module);
-                    let module_ref: &'static Module = Box::leak(module);
-                    play_music(
-                        module_ref,
-                        cli.song,
-                        cli.amplification,
-                        cli.position,
-                        cli.loops,
-                        cli.debug,
-                        cli.ch,
-                        cli.speed,
-                        cli.historical,
-                        cli.output.clone(),
-                    );
-                }
-                Err(e) => {
-                    println!("{:?}", e);
-                }
+                let module = Box::new(module);
+                let module_ref: &'static Module = Box::leak(module);
+                play_music(
+                    module_ref,
+                    cli.song,
+                    cli.amplification,
+                    cli.position,
+                    cli.loops,
+                    cli.debug,
+                    cli.ch,
+                    cli.speed,
+                    cli.historical,
+                    cli.output.clone(),
+                );
+            }
+            Err(e) => {
+                println!("{:?}", e);
             }
         }
-        _ => {}
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn play_music(
     module: &'static Module,
     song: usize,
@@ -282,7 +280,7 @@ fn play_music(
                             player_lock.get_loop_count()
                         );
                         for (i, instr) in player_lock.module.instrument.iter().enumerate() {
-                            if instr.name != "" {
+                            if !instr.name.is_empty() {
                                 println!("instrument {:2}: {}", i, instr.name);
                             }
                         }

@@ -72,7 +72,7 @@ impl<'a> XmrsPlayer<'a> {
             global_volume: 1.0,
             amplification: 1.0,
             row_loop_count: vec![vec![0; MAX_NUM_ROWS]; module.get_song_length(current_song)],
-            hhelper: hhelper.clone(),
+            hhelper,
             effect_volume_slide_speed: 0.0,
             effect_volume_slide_fine: true,
             current_table_index: 0,
@@ -94,7 +94,7 @@ impl<'a> XmrsPlayer<'a> {
             pause: false,
         };
 
-        player.channel = vec![Channel::new(module, sample_rate, hhelper.clone()); num_channels];
+        player.channel = vec![Channel::new(module, sample_rate, hhelper); num_channels];
 
         player
     }
@@ -129,11 +129,11 @@ impl<'a> XmrsPlayer<'a> {
     }
 
     pub fn get_tempo(&self) -> usize {
-        self.tempo as usize
+        self.tempo
     }
 
     pub fn get_bpm(&self) -> usize {
-        self.bpm as usize
+        self.bpm
     }
 
     /// Jump to row at index table_position in pattern_order at speed
@@ -341,16 +341,15 @@ impl<'a> XmrsPlayer<'a> {
             self.row_loop_count[self.current_table_index][self.current_row] += 1;
         }
 
-        self.current_row = self.current_row.wrapping_add(1); /* Maybe this can be an u8 on old computers, this line can
-                                                              * increment from 255 to 0, in which case it
-                                                              * is still necessary to go the next
-                                                              * pattern. */
+        // `current_row` is a `usize`, so the wrap-to-0 branch below cannot
+        // fire in practice (pattern lengths are bounded well below usize::MAX).
+        // A previous comment speculated about shrinking this field to `u8`
+        // and wanted the wrap to push us into the next pattern; if that ever
+        // happens, reintroduce the `== 0` guard in the condition below.
+        self.current_row += 1;
         let pattern_len = self.module.pattern[pat_idx].len();
 
-        if !self.position_jump
-            && !self.pattern_break
-            && (self.current_row as usize >= pattern_len || self.current_row == 0)
-        {
+        if !self.position_jump && !self.pattern_break && self.current_row >= pattern_len {
             self.current_table_index += 1;
             self.current_row = self.jump_row; /* This will be 0 most of
                                                * the time, except when E60
@@ -389,7 +388,10 @@ impl<'a> XmrsPlayer<'a> {
             }
 
             self.current_tick += 1;
-            if self.current_tick >= self.tempo + self.extra_ticks {
+            // `F00` (speed = 0) halts row advance: tick() keeps firing so
+            // sustained effects continue, but tick0() never runs again
+            // until the tempo is set to a non-zero value.
+            if self.tempo != 0 && self.current_tick >= self.tempo + self.extra_ticks {
                 self.current_tick = 0;
                 self.extra_ticks = 0;
             }
@@ -437,32 +439,32 @@ impl<'a> XmrsPlayer<'a> {
         Some(samples)
     }
 
-    pub fn samples_to_sample(&mut self, samples: &Vec<(f32, f32)>) -> (f32, f32) {
+    pub fn samples_to_sample(&mut self, samples: &[(f32, f32)]) -> (f32, f32) {
         let sample = samples
-            .into_iter()
+            .iter()
             .fold((0.0, 0.0), |(acc_left, acc_right), (left, right)| {
                 (acc_left + left, acc_right + right)
             });
-        return (sample.0, sample.1);
+        (sample.0, sample.1)
     }
 
     /// This function applies volume and amplification to the various channel samples. It is applied to the result of the `samples_from_channels()` function.
-    pub fn samples_apply_volume(&mut self, samples: &Vec<(f32, f32)>) -> (f32, f32) {
+    pub fn samples_apply_volume(&mut self, samples: &[(f32, f32)]) -> (f32, f32) {
         let fgvol = self.global_volume * self.amplification;
         let sample = self.samples_to_sample(samples);
-        return (sample.0 * fgvol, sample.1 * fgvol);
+        (sample.0 * fgvol, sample.1 * fgvol)
     }
 
     /// Returns the sum of the samples from the `samples_from_channels()` and `samples_apply_volume()` functions, separating the left channel from the right.
     pub fn sample(&mut self, apply_volume: bool) -> Option<(f32, f32)> {
         if let Some(samples) = self.samples_from_channels() {
             if apply_volume {
-                return Some(self.samples_apply_volume(&samples));
+                Some(self.samples_apply_volume(&samples))
             } else {
-                return Some(self.samples_to_sample(&samples));
+                Some(self.samples_to_sample(&samples))
             }
         } else {
-            return None;
+            None
         }
     }
 
@@ -471,7 +473,7 @@ impl<'a> XmrsPlayer<'a> {
         match self.right_sample {
             Some(right) => {
                 self.right_sample = None;
-                return Some(right);
+                Some(right)
             }
             None => {
                 let next_samples = self.sample(true);
@@ -479,9 +481,9 @@ impl<'a> XmrsPlayer<'a> {
                     Some((left, right)) => {
                         self.right_sample = Some(right);
 
-                        return Some(left);
+                        Some(left)
                     }
-                    None => return None,
+                    None => None,
                 }
             }
         }
@@ -493,7 +495,7 @@ impl<'a> Iterator for XmrsPlayer<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.max_loop_count > 0 && self.loop_count >= self.max_loop_count {
-            return None;
+            None
         } else {
             self.sample_one()
         }

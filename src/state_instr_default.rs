@@ -15,7 +15,7 @@ use xmrs::prelude::*;
 impl<'a> Deref for StateInstrDefault<'a> {
     type Target = InstrDefault;
     fn deref(&self) -> &InstrDefault {
-        &self.instr
+        self.instr
     }
 }
 
@@ -93,9 +93,8 @@ impl<'a> StateInstrDefault<'a> {
     }
 
     pub fn sample_reset(&mut self) {
-        match &mut self.state_sample {
-            Some(s) => s.reset(),
-            None => {}
+        if let Some(s) = &mut self.state_sample {
+            s.reset()
         }
     }
 
@@ -128,10 +127,8 @@ impl<'a> StateInstrDefault<'a> {
             ss.set_sustained(false);
         }
 
-        if !self.envelope_volume.has_volume_envelope() {
-            if self.instr.volume_fadeout == 0.0 {
-                self.cut_pitch();
-            }
+        if !self.envelope_volume.has_volume_envelope() && self.instr.volume_fadeout == 0.0 {
+            self.cut_pitch();
         }
     }
 
@@ -186,7 +183,7 @@ impl<'a> StateInstrDefault<'a> {
                 return self.select_sample(num);
             }
         }
-        return false;
+        false
     }
 
     fn select_sample(&mut self, num: usize) -> bool {
@@ -203,7 +200,7 @@ impl<'a> StateInstrDefault<'a> {
         self.state_sample = None;
         self.panning = 0.5;
         self.volume = 0.0;
-        return false;
+        false
     }
 
     pub fn tick(&mut self) {

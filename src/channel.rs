@@ -48,13 +48,19 @@ pub struct Channel<'a> {
     effect_note_retrig_backup: NoteRetrigState,
     effect_note_retrig_counter: usize,
     effect_panbrello: EffectVibratoTremolo,
-    effect_portamento: f32,
     effect_tone_portamento_goal: f32,
     effect_tremolo: EffectVibratoTremolo,
     effect_tremor: bool,
     effect_tremor_on: usize,
     effect_tremor_off: usize,
     effect_vibrato: EffectVibratoTremolo,
+    /// If `true`, the next note trigger resets the vibrato phase to 0;
+    /// otherwise the phase carries over. Set from
+    /// `TrackEffect::VibratoWaveform::retrig`. Defaults to `true`.
+    vibrato_retrig_on_new_note: bool,
+    /// Same as `vibrato_retrig_on_new_note` but for tremolo, driven by
+    /// `TrackEffect::TremoloWaveform::retrig`.
+    tremolo_retrig_on_new_note: bool,
     effect_semitone: bool,
     effect_note_delay: usize,
     /// Where to restart a E6y loop
@@ -72,7 +78,7 @@ impl<'a> Channel<'a> {
         let period_helper = PeriodHelper::new(module.frequency_type, historical.is_some());
         Self {
             module,
-            historical: historical,
+            historical,
             period_helper: period_helper.clone(),
             rate,
             channel_volume: 1.0,
@@ -82,7 +88,7 @@ impl<'a> Channel<'a> {
             current: TrackUnit::default(),
             period: 0.0,
             instr: None,
-            effect_arpeggio: EffectArpeggio::new(historical.clone()),
+            effect_arpeggio: EffectArpeggio::new(historical),
             effect_note_retrig_backup: NoteRetrigState::default(),
             effect_note_retrig_counter: 0,
             effect_panbrello: EffectVibratoTremolo::new(Waveform::Sine),
@@ -91,7 +97,8 @@ impl<'a> Channel<'a> {
             effect_tremor_on: 0,
             effect_tremor_off: 0,
             effect_vibrato: EffectVibratoTremolo::new(Waveform::Sine),
-            effect_portamento: 0.0,
+            vibrato_retrig_on_new_note: true,
+            tremolo_retrig_on_new_note: true,
             effect_tone_portamento_goal: 0.0,
             effect_semitone: false,
             effect_note_delay: 0,
@@ -153,53 +160,47 @@ impl<'a> Channel<'a> {
     pub(crate) fn trigger_pitch(&mut self, flags: TriggerKeep) {
         self.effect_tremor = false;
 
-        match &mut self.instr {
-            Some(instr) => {
-                if !contains(flags, TRIGGER_KEEP_SAMPLE_POSITION) {
-                    instr.sample_reset();
-                }
-
-                if !contains(flags, TRIGGER_KEEP_ENVELOPE) {
-                    instr.envelopes_reset();
-                }
-
-                instr.vibrato_reset();
-
-                if !contains(flags, TRIGGER_KEEP_VOLUME) {
-                    instr.volume_reset();
-                    self.volume = instr.volume;
-                }
-
-                // TODO
-                self.panning = instr.panning;
-
-                if !contains(flags, TRIGGER_KEEP_PERIOD) {
-                    self.period = self.period_helper.note_to_period(self.note);
-
-                    // New-pitch trigger: reset effect vibrato and tremolo
-                    // phase. Matches FT2's triggerInstrument
-                    // (ft2_replayer.c:351-363) which zeroes `vibratoPos` and
-                    // `tremoloPos` on any note trigger unless the "no retrig"
-                    // flag of vibTremCtrl (bits 2/6, from an `E4x` / `E7x`
-                    // with x in 4..7 or C..F) is set. xmrs doesn't currently
-                    // surface that per-channel flag, so we take the FT2
-                    // default — always reset on new-note trigger. Tone
-                    // portamento, ghost instruments and keyoffs set
-                    // TRIGGER_KEEP_PERIOD and don't fall into this branch,
-                    // which matches FT2 (preparePortamento and keyOff do not
-                    // call triggerInstrument).
-                    self.effect_vibrato.retrigger();
-                    self.effect_tremolo.retrigger();
-
-                    instr.update_frequency(
-                        self.period,
-                        0.0,
-                        self.effect_vibrato.value(),
-                        self.effect_semitone,
-                    );
-                }
+        if let Some(instr) = &mut self.instr {
+            if !contains(flags, TRIGGER_KEEP_SAMPLE_POSITION) {
+                instr.sample_reset();
             }
-            None => {}
+
+            if !contains(flags, TRIGGER_KEEP_ENVELOPE) {
+                instr.envelopes_reset();
+            }
+
+            instr.vibrato_reset();
+
+            if !contains(flags, TRIGGER_KEEP_VOLUME) {
+                instr.volume_reset();
+                self.volume = instr.volume;
+            }
+
+            // TODO
+            self.panning = instr.panning;
+
+            if !contains(flags, TRIGGER_KEEP_PERIOD) {
+                self.period = self.period_helper.note_to_period(self.note);
+
+                // Reset the effect vibrato / tremolo phase on a new-note
+                // trigger, unless the channel flag explicitly says to
+                // keep it. Tone portamento, ghost instruments and keyoffs
+                // take the `TRIGGER_KEEP_PERIOD` path above and skip this
+                // block entirely — they don't count as new-note triggers.
+                if self.vibrato_retrig_on_new_note {
+                    self.effect_vibrato.retrigger();
+                }
+                if self.tremolo_retrig_on_new_note {
+                    self.effect_tremolo.retrigger();
+                }
+
+                instr.update_frequency(
+                    self.period,
+                    0.0,
+                    self.effect_vibrato.value(),
+                    self.effect_semitone,
+                );
+            }
         }
     }
 
@@ -334,12 +335,10 @@ impl<'a> Channel<'a> {
                     todo!()
                 }
                 TrackEffect::InstrumentSampleOffset(seek) => {
-                    if current_tick == 0 {
-                        if self.current.note.is_valid() {
-                            if let Some(instr) = &mut self.instr {
-                                if let Some(sample) = &mut instr.state_sample {
-                                    sample.set_position(seek);
-                                }
+                    if current_tick == 0 && self.current.note.is_valid() {
+                        if let Some(instr) = &mut self.instr {
+                            if let Some(sample) = &mut instr.state_sample {
+                                sample.set_position(seek);
                             }
                         }
                     }
@@ -424,11 +423,9 @@ impl<'a> Channel<'a> {
                         volume_modifier: m.clone(),
                     };
 
-                    if current_tick == 0 {
-                        if self.effect_note_retrig_backup != current_state {
-                            self.effect_note_retrig_counter = 0;
-                            self.effect_note_retrig_backup = current_state;
-                        }
+                    if current_tick == 0 && self.effect_note_retrig_backup != current_state {
+                        self.effect_note_retrig_counter = 0;
+                        self.effect_note_retrig_backup = current_state;
                     }
 
                     // Increment the counter FIRST, then test. FT2's
@@ -442,7 +439,7 @@ impl<'a> Channel<'a> {
                     self.effect_note_retrig_counter += 1;
 
                     // If speed (s) is 0, retrig is effectively disabled.
-                    if s != 0 && self.effect_note_retrig_counter % s == 0 {
+                    if s != 0 && self.effect_note_retrig_counter.is_multiple_of(s) {
                         self.trigger_pitch(TRIGGER_KEEP_VOLUME | TRIGGER_KEEP_ENVELOPE);
                         match m {
                             NoteRetrigOperator::None => {
@@ -485,9 +482,12 @@ impl<'a> Channel<'a> {
                     }
                 }
                 TrackEffect::Portamento(p) => {
-                    if current_tick == 0 {
-                        self.effect_portamento = p;
-                    } else {
+                    // Effect memory for `Portamento` is resolved at import
+                    // time in `xmrs/src/import/import_memory.rs`, so by the
+                    // time this arm runs `p` is always the final
+                    // (non-zero) value — we only need to apply the slide
+                    // on non-tick0 ticks, never stash it.
+                    if current_tick != 0 {
                         self.period = (self.period + p).clamp(1.0, 32000.0 - 1.0);
                     }
                 }
@@ -513,10 +513,10 @@ impl<'a> Channel<'a> {
                     waveform: w,
                     retrig: r,
                 } => {
+                    // Update the waveform and latch the retrig flag for
+                    // the next note trigger; don't reset the phase now.
                     self.effect_tremolo.data.waveform = WaveformState::new(w);
-                    if r {
-                        self.effect_tremolo.retrigger();
-                    }
+                    self.tremolo_retrig_on_new_note = r;
                 }
                 TrackEffect::Tremor {
                     on_time: on,
@@ -554,10 +554,10 @@ impl<'a> Channel<'a> {
                     waveform: w,
                     retrig: r,
                 } => {
+                    // Same as TremoloWaveform above: latch the flag, no
+                    // immediate phase reset.
                     self.effect_vibrato.data.waveform = WaveformState::new(w);
-                    if r {
-                        self.effect_vibrato.retrigger();
-                    }
+                    self.vibrato_retrig_on_new_note = r;
                 }
                 TrackEffect::Volume { value: v, tick: t } => {
                     if current_tick == t {
@@ -579,7 +579,7 @@ impl<'a> Channel<'a> {
         let instrnr = self.current.instrument.unwrap();
 
         if let InstrumentType::Default(id) = &self.module.instrument[instrnr].instr_type {
-            let was_same = self.instr.as_ref().map_or(false, |i| i.num == instrnr);
+            let was_same = self.instr.as_ref().is_some_and(|i| i.num == instrnr);
 
             // Only proceed if the instrument has samples
             if !id.sample.is_empty() {
@@ -597,10 +597,10 @@ impl<'a> Channel<'a> {
                 }
             }
 
-            return was_same;
+            was_same
         } else {
             // TODO
-            return false;
+            false
         }
     }
 
@@ -640,14 +640,14 @@ impl<'a> Channel<'a> {
             return true; // Keyoff does not change instrument
         }
 
-        return self.tick0_change_instr(false);
+        self.tick0_change_instr(false)
     }
 
-    fn tick0_load_pitch(&mut self, new_instr: bool) {
+    fn tick0_load_pitch(&mut self, was_same_instr: bool) {
         // Note is not valid? Return early.
         if !self.current.note.is_valid() {
             if self.current.note.is_keyoff() {
-                if self.current.instrument.is_none() || new_instr {
+                if self.current.instrument.is_none() || was_same_instr {
                     self.key_off(0);
                 } else {
                     self.trigger_pitch(TRIGGER_KEEP_PERIOD | TRIGGER_KEEP_ENVELOPE);
@@ -691,17 +691,20 @@ impl<'a> Channel<'a> {
     }
 
     fn tick0_load_instrument_and_pitch(&mut self) {
-        if self.historical.is_some() {
-            if self.current.has_note_off() {
-                // Historical Kxy effect bug
-                return;
-            }
+        if self.historical.is_some() && self.current.has_note_off() {
+            // Historical Kxy effect bug
+            return;
         }
 
-        // First, load instr
-        let new_instr: bool = self.tick0_load_instrument();
+        // First, load instr. `was_same_instr` is true when the instrument
+        // slot on this row matches the one currently held by the channel
+        // (or when there's no instrument to load — see tick0_load_instrument
+        // for the exact contract). This flag drives the keyoff branch in
+        // tick0_load_pitch: a keyoff with a *different* instrument must
+        // retrigger rather than just cut.
+        let was_same_instr: bool = self.tick0_load_instrument();
         // Next, choose sample from note
-        self.tick0_load_pitch(new_instr);
+        self.tick0_load_pitch(was_same_instr);
     }
 
     pub(crate) fn tick0(&mut self, pattern_slot: &TrackUnit) {
