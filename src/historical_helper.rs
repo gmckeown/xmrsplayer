@@ -23,6 +23,10 @@ impl HistoricalHelper {
 
     /// Arpeggio
     pub fn arpeggio_tick(&self, tick: u8) -> u8 {
+        if self.tempo == 0 {
+            // Speed 0 halts the song; no arpeggio progression.
+            return 0;
+        }
         let tick = tick as usize % self.tempo;
         let reverse_tick = (self.tempo - tick - 1) as u8;
         match reverse_tick {

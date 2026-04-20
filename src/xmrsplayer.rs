@@ -71,7 +71,7 @@ impl<'a> XmrsPlayer<'a> {
             bpm: module.default_bpm,
             global_volume: 1.0,
             amplification: 1.0,
-            row_loop_count: vec![vec![0; MAX_NUM_ROWS]; module.get_song_length(song)],
+            row_loop_count: vec![vec![0; MAX_NUM_ROWS]; module.get_song_length(current_song)],
             hhelper: hhelper.clone(),
             effect_volume_slide_speed: 0.0,
             effect_volume_slide_fine: true,
@@ -273,6 +273,11 @@ impl<'a> XmrsPlayer<'a> {
                     self.global_volume = volume.clamp(0.0, 1.0);
                 }
                 GlobalEffect::VolumeSlide { speed: s, fine: f } => {
+                    if f {
+                        // Fine slide: apply once at tick 0.
+                        self.global_volume = (self.global_volume + s).clamp(0.0, 1.0);
+                    }
+                    // Save speed for non-fine application during subsequent ticks.
                     self.effect_volume_slide_speed = s;
                     self.effect_volume_slide_fine = f;
                 }
@@ -356,15 +361,22 @@ impl<'a> XmrsPlayer<'a> {
     }
 
     fn tick(&mut self) {
+        // Detect whether any channel carries a global volume slide this row.
+        // The global slide must be applied at most once per tick, not once per channel.
+        let any_global_slide = self
+            .channel
+            .iter()
+            .any(|ch| ch.current.has_global_volume_slide());
+
         for ch in &mut self.channel {
             ch.tick(self.current_tick);
+        }
 
-            // Specific effect to slide global volume
-            if ch.current.has_global_volume_slide() && self.current_tick != 0 {
-                /* Hxy: Global volume slide */
-                self.global_volume =
-                    (self.global_volume + self.effect_volume_slide_speed).clamp(0.0, 1.0);
-            }
+        // tick() is only called for current_tick != 0, so no extra guard needed here.
+        // Fine slides were already applied in tick0_global_effects.
+        if any_global_slide && !self.effect_volume_slide_fine {
+            self.global_volume =
+                (self.global_volume + self.effect_volume_slide_speed).clamp(0.0, 1.0);
         }
     }
 
@@ -436,8 +448,7 @@ impl<'a> XmrsPlayer<'a> {
 
     /// This function applies volume and amplification to the various channel samples. It is applied to the result of the `samples_from_channels()` function.
     pub fn samples_apply_volume(&mut self, samples: &Vec<(f32, f32)>) -> (f32, f32) {
-        let fgvol =
-            (self.global_volume * self.amplification) / (self.global_volume + self.amplification);
+        let fgvol = self.global_volume * self.amplification;
         let sample = self.samples_to_sample(samples);
         return (sample.0 * fgvol, sample.1 * fgvol);
     }

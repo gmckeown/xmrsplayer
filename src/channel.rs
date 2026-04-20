@@ -208,8 +208,11 @@ impl<'a> Channel<'a> {
             }
 
             // Volume and Freq in one
-            self.actual_volume[0] = volume * panning.sqrt();
-            self.actual_volume[1] = volume * (1.0 - panning).sqrt();
+            // panning = 0.0 => full left, 1.0 => full right.
+            // actual_volume[0] multiplies the left sample channel,
+            // actual_volume[1] the right.
+            self.actual_volume[0] = volume * (1.0 - panning).sqrt();
+            self.actual_volume[1] = volume * panning.sqrt();
 
             // Frequency
             let arp_pitch = if self.current.has_arpeggio() {
@@ -421,7 +424,7 @@ impl<'a> Channel<'a> {
                 }
                 TrackEffect::Panbrello { speed: s, depth: d } => {
                     if current_tick == 0 {
-                        self.effect_panbrello.tick0(s,d);
+                        self.effect_panbrello.tick0(s, d);
                     } else {
                         self.effect_panbrello.tick();
                     }
@@ -441,7 +444,8 @@ impl<'a> Channel<'a> {
                     }
                 }
                 TrackEffect::PanningSlide { speed: s, fine: f } => {
-                    if current_tick == 0 || (current_tick != 0 && !f) {
+                    // Fine slides fire once at tick 0; non-fine slides fire on ticks > 0 only.
+                    if f == (current_tick == 0) {
                         self.panning = (self.panning + s).clamp(0.0, 1.0);
                     }
                 }
@@ -526,7 +530,8 @@ impl<'a> Channel<'a> {
                     }
                 }
                 TrackEffect::VolumeSlide { speed: s, fine: f } => {
-                    if current_tick == 0 || (current_tick != 0 && !f) {
+                    // Fine slides fire once at tick 0; non-fine slides fire on ticks > 0 only.
+                    if f == (current_tick == 0) {
                         self.volume = (self.volume + s).clamp(0.0, 1.0);
                     }
                 }
@@ -567,7 +572,7 @@ impl<'a> Channel<'a> {
     /// Return true if it was the same instrument
     fn tick0_load_instrument(&mut self) -> bool {
         if let Some(instr) = self.current.instrument {
-            if instr > self.module.instrument.len() {
+            if instr >= self.module.instrument.len() {
                 // Invalid instrument, cut current note
                 self.cut_pitch();
                 self.instr = None;

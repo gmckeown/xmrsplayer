@@ -79,17 +79,23 @@ impl<'a> StateSample<'a> {
     }
 
     pub fn set_sustained(&mut self, sustained: bool) {
-        self.position.0 = self.sample.meta_seek(self.position.0 as usize, self.sustained) as u32;
+        self.position.0 = self
+            .sample
+            .meta_seek(self.position.0 as usize, self.sustained) as u32;
         self.sustained = sustained;
     }
 
     fn tick(&mut self) -> (f32, f32) {
         let t = self.get_position_fraction() as f32 / (1 << M) as f32;
 
-        let useek = self.sample.meta_seek(self.position.0 as usize, self.sustained) as usize;
+        let useek = self
+            .sample
+            .meta_seek(self.position.0 as usize, self.sustained) as usize;
         let u = self.sample.at(useek);
 
-        let vseek = self.sample.meta_seek(self.position.0 as usize + 1, self.sustained);
+        let vseek = self
+            .sample
+            .meta_seek(self.position.0 as usize + 1, self.sustained);
         let v = self.sample.at(vseek);
 
         self.increment_position();

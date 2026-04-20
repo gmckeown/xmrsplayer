@@ -23,8 +23,9 @@ struct Cli {
     #[arg(short = 'o', long, value_name = "output filename")]
     output: Option<String>,
 
-    /// Choose amplification
-    #[arg(short = 'a', long, default_value = "10.0")]
+    /// Choose amplification (1.0 = unity after volume-chain fix; lower
+    /// to avoid clipping on modules with many simultaneous channels)
+    #[arg(short = 'a', long, default_value = "0.25")]
     amplification: f32,
 
     /// Play only a specific channel (from 1 to n, 0 for all)
@@ -312,7 +313,7 @@ fn write_wave(
     let mut player_lock = player_clone.lock().unwrap();
 
     for sample in player_lock.by_ref() {
-        let sample_i16 = (sample * 32767.0).round() as i16;
+        let sample_i16 = (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16;
         writer.write_sample(sample_i16)?;
     }
 
