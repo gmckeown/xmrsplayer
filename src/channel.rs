@@ -242,6 +242,16 @@ impl<'a> Channel<'a> {
     }
 
     fn tickn_effects(&mut self, current_tick: usize) {
+        if current_tick == 0 {
+            // At every row-load tick, clear the tremor mute flag. FT2's Tremor
+            // effect never runs at tickZero (it's only in the TickNonZero jump
+            // table), so the row always begins "playing". If the current row
+            // also carries a Tremor effect, its handler below will overwrite
+            // this; if it doesn't, the previous row's last tremor state
+            // (which might have left us on the "off" half) must not mute the
+            // whole next row.
+            self.effect_tremor = false;
+        }
         let len = self.current.effects.len();
         for i in 0..len {
             match self.current.effects[i].clone() {
