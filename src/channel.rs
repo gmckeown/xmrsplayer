@@ -175,6 +175,22 @@ impl<'a> Channel<'a> {
 
                 if !contains(flags, TRIGGER_KEEP_PERIOD) {
                     self.period = self.period_helper.note_to_period(self.note);
+
+                    // New-pitch trigger: reset effect vibrato and tremolo
+                    // phase. Matches FT2's triggerInstrument
+                    // (ft2_replayer.c:351-363) which zeroes `vibratoPos` and
+                    // `tremoloPos` on any note trigger unless the "no retrig"
+                    // flag of vibTremCtrl (bits 2/6, from an `E4x` / `E7x`
+                    // with x in 4..7 or C..F) is set. xmrs doesn't currently
+                    // surface that per-channel flag, so we take the FT2
+                    // default — always reset on new-note trigger. Tone
+                    // portamento, ghost instruments and keyoffs set
+                    // TRIGGER_KEEP_PERIOD and don't fall into this branch,
+                    // which matches FT2 (preparePortamento and keyOff do not
+                    // call triggerInstrument).
+                    self.effect_vibrato.retrigger();
+                    self.effect_tremolo.retrigger();
+
                     instr.update_frequency(
                         self.period,
                         0.0,
@@ -414,6 +430,17 @@ impl<'a> Channel<'a> {
                             self.effect_note_retrig_backup = current_state;
                         }
                     }
+
+                    // Increment the counter FIRST, then test. FT2's
+                    // doMultiNoteRetrig (ft2_replayer.c:1222) does exactly
+                    // this: `cnt = counter + 1; if cnt < speed return`, so the
+                    // first fire occurs when cnt reaches `speed` (i.e. after
+                    // `speed` effect ticks), never on the row-load tick.
+                    // The previous xmrsplayer code incremented AFTER the
+                    // modulo test, which with `counter = 0` at the start
+                    // meant 0 % s == 0 fired a spurious retrig at tick 0.
+                    self.effect_note_retrig_counter += 1;
+
                     // If speed (s) is 0, retrig is effectively disabled.
                     if s != 0 && self.effect_note_retrig_counter % s == 0 {
                         self.trigger_pitch(TRIGGER_KEEP_VOLUME | TRIGGER_KEEP_ENVELOPE);
@@ -429,8 +456,6 @@ impl<'a> Channel<'a> {
                             }
                         }
                     }
-                    // Increment retrig counter after processing
-                    self.effect_note_retrig_counter += 1;
                 }
                 TrackEffect::Panbrello { speed: s, depth: d } => {
                     if current_tick == 0 {
@@ -694,11 +719,19 @@ impl<'a> Channel<'a> {
             self.tickn_effects(0);
 
             if self.effect_arpeggio.in_progress() && !self.current.has_arpeggio() {
+                // Arpeggio state is row-local (it's always restarted from
+                // tick=0 whenever the effect reappears via `tick0`), so a
+                // full retrigger is correct here.
                 self.effect_arpeggio.retrigger();
             }
 
             if self.effect_vibrato.in_progress() && !self.current.has_vibrato() {
-                self.effect_vibrato.retrigger();
+                // Only clear the output modulation. FT2 preserves
+                // `vibratoPos` across rows where vibrato disappears so that
+                // a subsequent re-appearance continues the LFO smoothly
+                // (ft2_replayer.c::getNewNote, line 1364 — sets outPeriod
+                // back to realPeriod but leaves vibratoPos untouched).
+                self.effect_vibrato.clear_output();
             }
 
             self.tickn_update_instr();

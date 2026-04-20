@@ -1,3 +1,9 @@
+// This example is a scratch pad that was used to reverse-engineer the FT2
+// historical arpeggio table. Only `step2` is called from `main` today;
+// `step1`, `step3`, the intermediate constants and the `historical_ft2_tick`
+// reference implementation are kept for archaeological purposes.
+#![allow(dead_code, unused_assignments)]
+
 /*
    Try to optimize stupid historical FT2 arbeggio bug
 */

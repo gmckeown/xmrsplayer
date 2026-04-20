@@ -37,6 +37,24 @@ impl EffectVibratoTremolo {
         evt.data.waveform = WaveformState::new(wf);
         evt
     }
+
+    /// Zero the output modulation while preserving the LFO phase.
+    ///
+    /// This matches FT2's behaviour at a row boundary where the effect stops:
+    /// `ft2_replayer.c::getNewNote` sets `outPeriod = realPeriod` (i.e.
+    /// removes the vibrato/tremolo modulation for the new row) but keeps
+    /// `vibratoPos` / `tremoloPos` untouched, so that a later re-appearance
+    /// of the effect on the same note continues the LFO smoothly instead of
+    /// restarting from phase 0.
+    ///
+    /// Use this in preference to `retrigger()` when the effect merely
+    /// disappears from the next row — `retrigger()` additionally resets the
+    /// phase and should only be called on new-note triggers.
+    pub fn clear_output(&mut self) {
+        self.in_progress = false;
+        self.value = 0.0;
+        // `self.pos` intentionally preserved.
+    }
 }
 
 impl EffectPlugin for EffectVibratoTremolo {

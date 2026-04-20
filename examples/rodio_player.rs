@@ -21,7 +21,7 @@ struct Cli {
     filename: Option<String>,
 
     /// Choose amplification
-    #[arg(short = 'a', long, default_value = "1.0")]
+    #[arg(short = 'a', long, default_value = "0.25")]
     amplification: f32,
 
     /// Play only a specific channel (from 1 to n, 0 for all)
@@ -44,9 +44,13 @@ struct Cli {
     #[arg(short = 'p', long, default_value = "0")]
     position: usize,
 
-    /// Force speed
+    /// Force speed (0 = don't force)
     #[arg(short = 's', long, default_value = "0")]
-    speed: u16,
+    speed: usize,
+
+    /// Song number inside the module (for modules with several songs)
+    #[arg(long, default_value = "0")]
+    song: usize,
 }
 
 fn main() -> Result<(), std::io::Error> {
@@ -75,6 +79,7 @@ fn main() -> Result<(), std::io::Error> {
                             let module_ref: &'static Module = Box::leak(module);
                             rodio_play(
                                 module_ref,
+                                cli.song,
                                 cli.amplification,
                                 cli.position,
                                 cli.loops,
@@ -100,6 +105,7 @@ fn main() -> Result<(), std::io::Error> {
                             let module_ref: &'static Module = Box::leak(module);
                             rodio_play(
                                 module_ref,
+                                cli.song,
                                 cli.amplification,
                                 cli.position,
                                 cli.loops,
@@ -125,6 +131,7 @@ fn main() -> Result<(), std::io::Error> {
                             let module_ref: &'static Module = Box::leak(module);
                             rodio_play(
                                 module_ref,
+                                cli.song,
                                 cli.amplification,
                                 cli.position,
                                 cli.loops,
@@ -151,12 +158,13 @@ fn main() -> Result<(), std::io::Error> {
 
 fn rodio_play(
     module: &'static Module,
+    song: usize,
     amplification: f32,
     position: usize,
     loops: usize,
     debug: bool,
     ch: u8,
-    speed: u16,
+    speed: usize,
     historical: bool,
 ) {
     let (_stream, stream_handle) = rodio::OutputStream::try_default().unwrap();
@@ -171,6 +179,7 @@ fn rodio_play(
     let player = Arc::new(Mutex::new(XmrsPlayer::new(
         module,
         SAMPLE_RATE as f32,
+        song,
         is_ft2,
     )));
     {
