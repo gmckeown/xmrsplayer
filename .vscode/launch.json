@@ -14,7 +14,7 @@
                     "--features=demo",
                 ],
             },
-            "args": ["-f","/home/user/example.xm"],
+            "args": ["-f","/home/user/Downloads/mod/Future_Crew_and_others_music_modules/SCRAMBLE.MOD"],
             "cwd": "${workspaceFolder}"
         },
         {

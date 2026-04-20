@@ -1,6 +1,6 @@
 [package]
 name = "xmrsplayer"
-version = "0.9.7"
+version = "0.9.10"
 edition = "2021"
 description = "XMrsPlayer is a safe no-std soundtracker music player"
 authors = ["Sebastien Bechet"]
@@ -13,8 +13,14 @@ license = "MIT"
 keywords = ["xm", "mod", "s3m", "it", "soundtracker"]
 categories = ["multimedia::audio", "embedded", "no-std"]
 
+# Disable auto-discovery of examples so that `examples/bufferedsource.rs`
+# (a helper module used by `rodio_player.rs` via `mod bufferedsource;`)
+# is NOT compiled as a standalone example. Only the targets declared in
+# `[[example]]` sections below are built.
+autoexamples = false
+
 [dependencies]
-xmrs = { version = "0.9.7", default-features = false }
+xmrs = { version = "0.9.10", default-features = false }
 clap = { version = "4.5", optional = true, features = ["cargo", "derive"] }
 rodio =  { version = "0.20.1", optional = true }
 console =  { version = "0.15", optional = true }
@@ -25,7 +31,9 @@ hound = { version = "3.5", optional=true }
 
 [features]
 default = ["micromath"]
-demo = ["std", "clap", "console", "cpal", "hound", "import", "sid"]
+# The `demo` feature gates the interactive example players (cpal_player
+# binary and rodio_player example). rodio is needed for rodio_player.
+demo = ["std", "clap", "console", "cpal", "hound", "rodio", "import", "sid"]
 import = ["xmrs/import", "xmrs/import_sid"]
 libm = ["num-traits/libm", "xmrs/libm"]
 micromath = ["dep:micromath", "xmrs/micromath"]
@@ -45,4 +53,17 @@ panic = "abort"
 [[bin]]
 name = "xmrsplayer"
 path = "src/bin/cpal_player.rs"
+required-features = [ "demo" ]
+
+# arp_bug is a pure-computation example that uses only core/std — no
+# feature-gated deps needed.
+[[example]]
+name = "arp_bug"
+path = "examples/arp_bug.rs"
+
+# rodio_player pulls in rodio/clap/console and the xmrs import modules,
+# all of which are gated by the `demo` feature.
+[[example]]
+name = "rodio_player"
+path = "examples/rodio_player.rs"
 required-features = [ "demo" ]
