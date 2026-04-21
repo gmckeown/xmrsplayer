@@ -34,6 +34,12 @@ pub struct XmrsPlayer<'a> {
 
     pub channel: Vec<Channel<'a>>,
 
+    /// Last tempo value propagated to per-channel state
+    /// (`EffectArpeggio`). Tracked so the per-step propagation loop is
+    /// skipped when tempo has not actually changed — which is the
+    /// common case, since Fxx landing on a row is rare.
+    last_propagated_tempo: usize,
+
     row_loop_count: Vec<Vec<usize>>,
     loop_count: usize,
     max_loop_count: usize,
@@ -92,6 +98,7 @@ impl<'a> XmrsPlayer<'a> {
             jump_row: 0,
             extra_ticks: 0,
             channel: vec![],
+            last_propagated_tempo: module.default_tempo,
             loop_count: 0,
             max_loop_count: 0,
             right_sample: None,
@@ -412,11 +419,16 @@ impl<'a> XmrsPlayer<'a> {
 
             // Propagate the current song speed to each channel so the
             // arpeggio FT2 LUT indexes from the live tempo, not the
-            // default copy stashed at construction. This has to run on
-            // every step because Fxx (speed change) can land anywhere
-            // in a pattern.
-            for ch in &mut self.channel {
-                ch.set_tempo(self.tempo);
+            // default copy stashed at construction. Fxx (speed
+            // change) can land anywhere in a pattern, but most
+            // tick-boundaries see no change — gate the N-channel
+            // loop on an actual tempo delta to keep the common case
+            // at a single compare.
+            if self.tempo != self.last_propagated_tempo {
+                for ch in &mut self.channel {
+                    ch.set_tempo(self.tempo);
+                }
+                self.last_propagated_tempo = self.tempo;
             }
             /* FT2 manual says number of ticks / second = BPM * 0.4 */
             self.remaining_samples_in_tick += self.sample_rate / (self.bpm as f32 * 0.4);
@@ -474,16 +486,50 @@ impl<'a> XmrsPlayer<'a> {
         (sample.0 * fgvol, sample.1 * fgvol)
     }
 
-    /// Returns the sum of the samples from the `samples_from_channels()` and `samples_apply_volume()` functions, separating the left channel from the right.
+    /// Returns the sum of the samples from all channels, optionally
+    /// scaled by `global_volume * amplification`. This is the hot
+    /// path used by the `Iterator` impl: unlike
+    /// [`Self::samples_from_channels`] + [`Self::samples_apply_volume`],
+    /// it walks channels once with an `(f32, f32)` accumulator and
+    /// never allocates a per-sample `Vec`. At 48 kHz stereo that saves
+    /// ~96 k allocations/second.
+    ///
+    /// Semantically identical to the older
+    /// `samples_from_channels().map(samples_apply_volume_or_sum)`
+    /// composition — the three explicit stages are still available
+    /// for callers that need per-channel inspection.
     pub fn sample(&mut self, apply_volume: bool) -> Option<(f32, f32)> {
-        if let Some(samples) = self.samples_from_channels() {
-            if apply_volume {
-                Some(self.samples_apply_volume(&samples))
-            } else {
-                Some(self.samples_to_sample(&samples))
+        if self.pause {
+            return Some((0.0, 0.0));
+        }
+
+        self.step();
+
+        if self.max_loop_count > 0 && self.loop_count >= self.max_loop_count {
+            return None;
+        }
+
+        let (mut left, mut right) = (0.0f32, 0.0f32);
+        for ch in &mut self.channel {
+            if let Some((l, r)) = ch.next() {
+                if !ch.is_muted() {
+                    left += l;
+                    right += r;
+                }
             }
+            // `None` from a channel (no active instrument) contributes
+            // zero; muted channels are advanced (so position tracking
+            // stays correct when they unmute) but their output is
+            // discarded.
+        }
+
+        self.generated_samples += 1;
+
+        if apply_volume {
+            let g = self.global_volume * self.amplification;
+            Some((left * g, right * g))
         } else {
-            None
+            Some((left, right))
         }
     }
 
