@@ -13,7 +13,6 @@ pub(crate) mod effect_arpeggio;
 pub(crate) mod effect_vibrato_tremolo;
 
 pub mod channel;
-pub(crate) mod ft2_quirks;
 pub(crate) mod helper;
 pub mod prelude;
 pub(crate) mod state_auto_vibrato;

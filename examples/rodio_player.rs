@@ -35,10 +35,6 @@ struct Cli {
     #[arg(short = 'l', long, default_value = "0")]
     loops: usize,
 
-    /// Force FT2 replay-quirks mode (default: autodetect)
-    #[arg(short = 't', long, alias = "historical", default_value = "false")]
-    ft2_quirks: bool,
-
     /// Start at a specific pattern order table position
     #[arg(short = 'p', long, default_value = "0")]
     position: usize,
@@ -85,7 +81,6 @@ fn main() -> Result<(), std::io::Error> {
                                 cli.debug,
                                 cli.ch,
                                 cli.speed,
-                                cli.ft2_quirks,
                             );
                         }
                         Err(e) => {
@@ -111,7 +106,6 @@ fn main() -> Result<(), std::io::Error> {
                                 cli.debug,
                                 cli.ch,
                                 cli.speed,
-                                false,
                             );
                         }
                         Err(e) => {
@@ -137,7 +131,6 @@ fn main() -> Result<(), std::io::Error> {
                                 cli.debug,
                                 cli.ch,
                                 cli.speed,
-                                false,
                             );
                         }
                         Err(e) => {
@@ -164,7 +157,6 @@ fn rodio_play(
     debug: bool,
     ch: u8,
     speed: usize,
-    ft2_quirks: bool,
 ) {
     // rodio 0.22 renamed the API terminology: the old `Sink` (audio track
     // you append sources to) became `Player`; the old `OutputStream` (the
@@ -180,29 +172,17 @@ fn rodio_play(
     // stream_handle.log_on_drop(false);
     let sink = rodio::Player::connect_new(&stream_handle.mixer());
 
-    // Auto-enable FT2 quirks for XMs saved from FT2 or ft2-clone (whose
-    // stated goal is bit-exact FT2 replication). See xmrs xmmodule.rs for
-    // how `module.comment` is assembled from the tracker string.
-    let ft2_quirks = ft2_quirks
-        || module.comment == "FastTracker v2.00 (1.02)"
-        || module.comment == "FastTracker v2.00 (1.03)"
-        || module.comment == "FastTracker v2.00 (1.04)"
-        || module.comment.starts_with("Fasttracker II clone ");
-
     let player = Arc::new(Mutex::new(XmrsPlayer::new(
         module,
         SAMPLE_RATE as f32,
         song,
-        ft2_quirks,
     )));
     {
         let mut player_lock = player.lock().unwrap();
         player_lock.amplification = amplification;
         if debug {
             println!("Debug on");
-            if ft2_quirks {
-                println!("FT2 quirks enabled (XM saved from FT2 or ft2-clone).")
-            }
+            println!("Module format: {:?}", module.format);
         }
         player_lock.debug(debug);
         if ch != 0 {

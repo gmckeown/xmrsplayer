@@ -1,5 +1,4 @@
 use crate::channel::Channel;
-use crate::ft2_quirks::Ft2Quirks;
 use crate::triggerkeep::*;
 use alloc::{vec, vec::Vec};
 use xmrs::prelude::*;
@@ -43,11 +42,6 @@ pub struct XmrsPlayer<'a> {
     right_sample: Option<f32>,
     #[cfg(feature = "std")]
     debug: bool,
-    /// `Some` when FT2-era replay bugs are enabled (arpeggio overflow,
-    /// E60 pattern-loop quirk, K00+note quirk, …). `None` disables
-    /// them; canonical `ModuleFormat::Xm` semantics still apply
-    /// independently.
-    ft2_quirks: Option<Ft2Quirks>,
 
     pause: bool,
 }
@@ -55,18 +49,20 @@ pub struct XmrsPlayer<'a> {
 impl<'a> XmrsPlayer<'a> {
     /// Build a player for the given module.
     ///
-    /// `ft2_quirks`: when `true`, replicate known FT2 replay bugs
-    /// (arpeggio table overflow, E60 pattern-loop quirk, K00+note
-    /// quirk, …) in addition to the module's canonical format
-    /// semantics. Canonical XM/IT/S3M/MOD semantics are driven by
-    /// `module.format` and are always applied regardless of this flag.
-    pub fn new(module: &'a Module, sample_rate: f32, song: usize, ft2_quirks: bool) -> Self {
+    /// Format-specific FT2/XM behaviour — arpeggio LUT, E60 pattern-
+    /// loop bug, arpeggio period clamp, portamento-down signed-
+    /// overflow, K00-eats-note, vol-col `Bx` advancing the vibrato —
+    /// is driven entirely by `module.format`. `ModuleFormat::Xm`
+    /// activates the canonical FT2 reference behaviour, all other
+    /// formats use their own native semantics. There is no longer a
+    /// separate `ft2_quirks` flag: the format IS the switch.
+    ///
+    /// If you want FT2-style playback on a module carrying a non-Xm
+    /// format tag (unusual — typically a hand-authored module against
+    /// an FT2-style player), just set `module.format = ModuleFormat::Xm`
+    /// before constructing the player.
+    pub fn new(module: &'a Module, sample_rate: f32, song: usize) -> Self {
         let num_channels = module.get_num_channels();
-        let quirks_state = if ft2_quirks {
-            Some(Ft2Quirks::new(module.default_tempo))
-        } else {
-            None
-        };
 
         let current_song = if song < module.pattern_order.len() {
             song
@@ -83,7 +79,6 @@ impl<'a> XmrsPlayer<'a> {
             global_volume: 1.0,
             amplification: 1.0,
             row_loop_count: vec![vec![0; MAX_NUM_ROWS]; module.get_song_length(current_song)],
-            ft2_quirks: quirks_state,
             effect_volume_slide_speed: 0.0,
             effect_volume_slide_fine: true,
             current_table_index: 0,
@@ -105,7 +100,8 @@ impl<'a> XmrsPlayer<'a> {
             pause: false,
         };
 
-        player.channel = vec![Channel::new(module, sample_rate, quirks_state); num_channels];
+        player.channel =
+            vec![Channel::new(module, sample_rate, module.default_tempo); num_channels];
 
         player
     }
@@ -264,8 +260,15 @@ impl<'a> XmrsPlayer<'a> {
                     } else {
                         // Set loop start point
                         ch.pattern_loop_origin = self.current_row;
-                        if self.ft2_quirks.is_some() {
-                            // Replicate FT2 E60 bug
+                        if self.module.format == ModuleFormat::Xm {
+                            // Replicate FT2 E60 bug: in FT2, E60 not
+                            // only sets the per-channel loop origin,
+                            // it ALSO leaks that row number into the
+                            // song's pBreakPos. When the pattern then
+                            // ends naturally, the next pattern starts
+                            // at pBreakPos instead of row 0. Some XM
+                            // modules rely on this; canonical XM
+                            // playback needs to reproduce it.
                             self.jump_row = ch.pattern_loop_origin;
                         }
                     }
@@ -407,8 +410,13 @@ impl<'a> XmrsPlayer<'a> {
                 self.extra_ticks = 0;
             }
 
-            if let Some(q) = &mut self.ft2_quirks {
-                q.set_tempo(self.tempo);
+            // Propagate the current song speed to each channel so the
+            // arpeggio FT2 LUT indexes from the live tempo, not the
+            // default copy stashed at construction. This has to run on
+            // every step because Fxx (speed change) can land anywhere
+            // in a pattern.
+            for ch in &mut self.channel {
+                ch.set_tempo(self.tempo);
             }
             /* FT2 manual says number of ticks / second = BPM * 0.4 */
             self.remaining_samples_in_tick += self.sample_rate / (self.bpm as f32 * 0.4);

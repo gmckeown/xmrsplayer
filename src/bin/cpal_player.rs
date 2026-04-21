@@ -40,18 +40,6 @@ struct Cli {
     #[arg(short = 'l', long, default_value = "0")]
     loops: usize,
 
-    /// Force FT2 replay-quirks mode (arpeggio table overflow, E60
-    /// pattern-loop, K00+note) on top of canonical format semantics.
-    /// Default is autodetect (on for FT2/ft2-clone-saved XMs, off for
-    /// IT/S3M/MOD and for XMs from other trackers).
-    #[arg(
-        short = 't',
-        long = "ft2-quirks",
-        alias = "historical",
-        default_value = "false"
-    )]
-    ft2_quirks: bool,
-
     /// Start at a specific pattern order table position
     #[arg(short = 'p', long, default_value = "0")]
     position: usize,
@@ -97,7 +85,6 @@ fn sid_test_player(cli: &Cli) {
         cli.debug,
         cli.ch,
         cli.speed,
-        cli.ft2_quirks,
         cli.output.clone(),
     );
 }
@@ -136,7 +123,6 @@ fn main() -> Result<(), std::io::Error> {
                     cli.debug,
                     cli.ch,
                     cli.speed,
-                    cli.ft2_quirks,
                     cli.output.clone(),
                 );
             }
@@ -158,7 +144,6 @@ fn play_music(
     debug: bool,
     ch: u8,
     speed: usize,
-    ft2_quirks: bool,
     output: Option<String>,
 ) {
     let host = cpal::default_host();
@@ -171,24 +156,10 @@ fn play_music(
         .expect("failed to get default output config");
     let sample_rate = config.sample_rate();
 
-    // Try to detect FT2-equivalent modules for FT2 quirks auto-enable.
-    // In addition to original FT2-saved files ("FastTracker v2.00 (...)"),
-    // we also recognize files saved by ft2-clone, whose stated project
-    // goal is bit-exact FT2 replication — so enabling FT2 quirks for them
-    // is the right default. ft2-clone writes `PROG_NAME_STR` =
-    // "Fasttracker II clone" (see ft2-src/ft2_replayer.h), which xmrs'
-    // xmmodule.rs formats into `comment` as "Fasttracker II clone (1.0x)".
-    let ft2_quirks = ft2_quirks
-        || module.comment == "FastTracker v2.00 (1.02)"
-        || module.comment == "FastTracker v2.00 (1.03)"
-        || module.comment == "FastTracker v2.00 (1.04)"
-        || module.comment.starts_with("Fasttracker II clone ");
-
     let player = Arc::new(Mutex::new(XmrsPlayer::new(
         module,
         sample_rate as f32,
         song,
-        ft2_quirks,
     )));
 
     {
@@ -196,9 +167,7 @@ fn play_music(
         player_lock.amplification = amplification;
         if debug {
             println!("Debug on");
-            if ft2_quirks {
-                println!("FT2 quirks enabled (XM saved from FT2 or ft2-clone).")
-            }
+            println!("Module format: {:?}", module.format);
         }
         player_lock.debug(debug);
         if ch != 0 {

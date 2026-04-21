@@ -9,7 +9,6 @@ use xmrs::waveform::WaveformState;
 use crate::effect::*;
 use crate::effect_arpeggio::EffectArpeggio;
 use crate::effect_vibrato_tremolo::EffectVibratoTremolo;
-use crate::ft2_quirks::Ft2Quirks;
 use crate::triggerkeep::*;
 
 use crate::helper::*;
@@ -27,7 +26,6 @@ struct NoteRetrigState {
 #[derive(Clone)]
 pub struct Channel<'a> {
     module: &'a Module,
-    ft2_quirks: Option<Ft2Quirks>,
     period_helper: PeriodHelper,
     rate: f32,
 
@@ -74,11 +72,20 @@ pub struct Channel<'a> {
 }
 
 impl<'a> Channel<'a> {
-    pub(crate) fn new(module: &'a Module, rate: f32, ft2_quirks: Option<Ft2Quirks>) -> Self {
-        let period_helper = PeriodHelper::new(module.frequency_type, ft2_quirks.is_some());
+    /// Build a channel. Format-specific quirks (FT2 arpeggio LUT,
+    /// FT2 arpeggio period clamp) are driven by `module.format` via
+    /// `EffectArpeggio` and `PeriodHelper`; Channel itself no longer
+    /// carries an `Ft2Quirks` field, so there is only one source of
+    /// truth for "is this an XM?".
+    ///
+    /// `tempo` is the initial song speed, forwarded to the arpeggio
+    /// effect so its FT2 LUT is usable on the very first row. The
+    /// player must subsequently call [`Self::set_tempo`] whenever the
+    /// song tempo changes (Fxx effect) to keep the LUT index in sync.
+    pub(crate) fn new(module: &'a Module, rate: f32, tempo: usize) -> Self {
+        let period_helper = PeriodHelper::new(module.frequency_type, module.format);
         Self {
             module,
-            ft2_quirks,
             period_helper: period_helper.clone(),
             rate,
             channel_volume: 1.0,
@@ -88,7 +95,7 @@ impl<'a> Channel<'a> {
             current: TrackUnit::default(),
             period: 0.0,
             instr: None,
-            effect_arpeggio: EffectArpeggio::new(ft2_quirks),
+            effect_arpeggio: EffectArpeggio::new(module.format, tempo),
             effect_note_retrig_backup: NoteRetrigState::default(),
             effect_note_retrig_counter: 0,
             effect_panbrello: EffectVibratoTremolo::new(Waveform::Sine),
@@ -107,6 +114,13 @@ impl<'a> Channel<'a> {
             muted: false,
             actual_volume: [0.0, 0.0],
         }
+    }
+
+    /// Forward a tempo change to the arpeggio effect. Called by the
+    /// player on every step so the FT2 arpeggio LUT is indexed from
+    /// the current speed rather than a stale copy.
+    pub(crate) fn set_tempo(&mut self, tempo: usize) {
+        self.effect_arpeggio.set_tempo(tempo);
     }
 
     pub fn is_muted(&self) -> bool {
@@ -483,24 +497,79 @@ impl<'a> Channel<'a> {
                         self.panning = (self.panning + s).clamp(0.0, 1.0);
                     }
                 }
-                TrackEffect::Portamento(p) => {
-                    // Effect memory for `Portamento` is resolved at import
-                    // time in `xmrs/src/import/import_memory.rs`, so by the
-                    // time this arm runs `p` is always the final
-                    // (non-zero) value — we only need to apply the slide
-                    // on non-tick0 ticks, never stash it.
+                TrackEffect::Portamento { speed: p, fine: f } => {
+                    // Effect memory is resolved at import time in
+                    // `xmrs/src/import/import_memory.rs`, so by the time
+                    // this arm runs `p` is always the final (non-zero)
+                    // value — we only need to apply the slide and never
+                    // stash anything.
                     //
-                    // The minimum clamp encodes a format-specific quirk.
+                    // `fine = false` (regular slide, e.g. 1xx/2xx in XM,
+                    // Exx/Fxx in S3M/IT when hi-nibble < 0xE) fires at
+                    // every non-zero tick. `fine = true` (E1x/E2x,
+                    // X1y/X2y, EFx/FFx, EEx/FEx) fires exactly once at
+                    // tick 0. Previously both collapsed into a single
+                    // tick-scope, causing fine slides to be over-applied
+                    // by a factor of `(speed − 1)`.
                     //
-                    // For S3M files we clamp the period at 0, which
-                    // replicates the Scream Tracker 3 behaviour
-                    if current_tick != 0 {
+                    // The format-specific clamping semantics apply
+                    // identically in both scopes:
+                    //
+                    // * **S3M** clamps the period at 0 (Scream Tracker
+                    //   3 behaviour — lets the note go infinitely
+                    //   high).
+                    //
+                    // * **XM** reproduces FT2's portamento-down
+                    //   signed-overflow quirk
+                    //   (`ft2_replayer.c:pitchSlideDown` at line 1914,
+                    //   and the parallel bugs in `finePitchSlideDown`
+                    //   line 643 and `extraFinePitchSlide` line 1213 —
+                    //   all three are explicitly marked "FT2 bug" in
+                    //   the source). The clamp
+                    //   `if ((int16_t)realPeriod >= 32000)` uses a
+                    //   signed comparison: values in [32000, 32767]
+                    //   snap back to 31999, but once the period crosses
+                    //   32767 the int16 cast flips negative and the
+                    //   clamp is silently skipped, letting the period
+                    //   keep growing. Some XM modules exploit this to
+                    //   produce very deep pitch slides.
+                    //
+                    // * Other formats (Mod, It) use the plain clamp
+                    //   at 31999.
+                    let fires = if f {
+                        current_tick == 0
+                    } else {
+                        current_tick != 0
+                    };
+                    if fires {
                         let min_period = if self.module.format == ModuleFormat::S3m {
                             0.0
                         } else {
                             1.0
                         };
-                        self.period = (self.period + p).clamp(min_period, 32000.0 - 1.0);
+                        let new_period = self.period + p;
+                        // The FT2 signed-overflow quirk is **only** in
+                        // pitchSlideDown (p > 0 = period grows). FT2's
+                        // pitchSlideUp has a plain min-clamp, not a
+                        // max-clamp, so a portamento up that happens
+                        // to land in the [32000, 32767] window must
+                        // NOT snap to 31999 — it just passes through.
+                        // Gated on `p > 0.0`.
+                        if self.module.format == ModuleFormat::Xm && p > 0.0 {
+                            let wrapped = (new_period as i32).rem_euclid(65536) as i16;
+                            if (32000..=32767).contains(&(wrapped as i32)) {
+                                self.period = 31999.0;
+                            } else {
+                                // wrapped < 32000: still climbing
+                                //   through the normal range.
+                                // wrapped ≥ 32768 (i16-negative):
+                                //   FT2's signed check fails, no clamp
+                                //   fires, period keeps growing.
+                                self.period = new_period.max(min_period);
+                            }
+                        } else {
+                            self.period = new_period.clamp(min_period, 32000.0 - 1.0);
+                        }
                     }
                 }
                 TrackEffect::TonePortamento(p) => {
@@ -560,6 +629,23 @@ impl<'a> Channel<'a> {
                 TrackEffect::VibratoDepth(d) => {
                     if current_tick == 0 {
                         self.effect_vibrato.data.depth = d;
+                    } else if self.module.format == ModuleFormat::Xm && !self.current.has_vibrato()
+                    {
+                        // FT2 vol-column Bx quirk: when the slot carries a
+                        // vol-column vibrato-depth with NO main-effect 4xx
+                        // accompanying it, FT2's `v_Vibrato` still advances
+                        // the vibrato LFO every non-zero tick
+                        // (ft2_replayer.c:v_Vibrato calls doVibrato after
+                        // optionally updating the depth). Without this call
+                        // the LFO would freeze at its last position and
+                        // only the depth would change, which is perceptibly
+                        // wrong on XM modules that drive vibrato primarily
+                        // from the vol column.
+                        //
+                        // When a main Vibrato IS on the row, its own arm
+                        // (below) calls `tick()`, so we must NOT double-
+                        // tick here — hence the `!has_vibrato()` guard.
+                        self.effect_vibrato.tick();
                     }
                 }
                 TrackEffect::VibratoWaveform {
@@ -703,18 +789,28 @@ impl<'a> Channel<'a> {
     }
 
     fn tick0_load_instrument_and_pitch(&mut self) {
-        // FT2 quirk (opt-in): a Kxx NoteOff effect on the same row as a
-        // note in the note column makes the note silent ("K00 eats note",
-        // documented in OpenMPT's `key_off.xm`). Model this by skipping
-        // the tick-0 instrument/pitch load when the slot carries a Kxx
-        // effect — the `TrackEffect::NoteOff` arm in `tickn_effects`
-        // will then be the only thing that fires on this row.
+        // FT2 "K00 eats note" quirk. In FT2, K00 is handled specially at
+        // tickZero via getNewNote (ft2_replayer.c:1418): it fires a keyoff
+        // and then RETURNS, never running triggerNote — so the note column
+        // of that row is effectively dropped.
         //
-        // Must use `has_note_off_effect()` (Kxx only) and NOT
-        // `has_note_off()` (which also matches note-column `===`):
-        // a note-column key-off has different semantics (cf. `key_off`)
-        // and belongs on the normal tick-0 path via `tick0_load_pitch`.
-        if self.ft2_quirks.is_some() && self.current.has_note_off_effect() {
+        // Key constraints:
+        //   - This is canonical XM behaviour: `module.format ==
+        //     ModuleFormat::Xm` is now the single source of truth for
+        //     "apply FT2 replay semantics", so every XM module gets
+        //     this quirk automatically. (There is no longer a separate
+        //     `ft2_quirks` flag — format IS the switch.)
+        //   - Only K00 (param 0) short-circuits. For Kxy with y > 0 FT2
+        //     takes the normal getNewNote path and then fires keyOffCmd at
+        //     tick y, which means the note DOES play. Use
+        //     `has_note_off_at_tick_zero()` rather than `has_note_off_effect()`,
+        //     which would also match non-zero Kxy and wrongly eat their
+        //     notes.
+        //   - Note-column `===` (`Pitch::Off`) has a different semantic
+        //     (see `key_off()`) and belongs on the normal tick-0 path
+        //     via `tick0_load_pitch`, hence the helper distinguishes
+        //     effect-Kxx from column-keyoff.
+        if self.module.format == ModuleFormat::Xm && self.current.has_note_off_at_tick_zero() {
             return;
         }
 
@@ -751,8 +847,22 @@ impl<'a> Channel<'a> {
             }
 
             if self.effect_vibrato.in_progress() && !self.current.has_vibrato() {
-                // Only clear the output modulation.
-                self.effect_vibrato.clear_output();
+                // When leaving a Vibrato (main-effect 4xx/6xx) row, clear
+                // the lingering period offset so the next row plays at
+                // `realPeriod`.
+                //
+                // Exception: XM vol-column Bx produces a standalone
+                // `VibratoDepth` without a `Vibrato`. FT2 keeps the LFO
+                // alive in that case (see the VibratoDepth arm above), so
+                // we must NOT clear the output — otherwise the vibrato
+                // would audibly cut in and out on every row that only
+                // carries vol-col B.
+                let xm_volcol_b_alone =
+                    self.module.format == ModuleFormat::Xm && self.current.has_vibrato_depth();
+                if !xm_volcol_b_alone {
+                    // Only clear the output modulation.
+                    self.effect_vibrato.clear_output();
+                }
             }
 
             self.tickn_update_instr();
