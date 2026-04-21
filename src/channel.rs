@@ -116,8 +116,16 @@ impl<'a> Channel<'a> {
             effect_tremor: false,
             effect_tremor_on: 0,
             effect_tremor_off: 0,
+            // ST3 starts with `atreon = false` ("in the silent half
+            // of the cycle") and `atremor = 0`. On the first Ixy
+            // tick the `atremor == 0` check triggers the toggle,
+            // which flips `atreon` to `true` (playing) and reloads
+            // the counter with `on_time`. Mirroring that here: start
+            // with `silent_s3m = true` so the first toggle flips us
+            // to "playing"; the counter sentinel `-1` acts like ST3's
+            // initial `atremor = 0` (not > 0, so toggle branch).
             effect_tremor_counter_s3m: -1,
-            effect_tremor_silent_s3m: false,
+            effect_tremor_silent_s3m: true,
             effect_vibrato: EffectVibratoTremolo::new(Waveform::Sine),
             vibrato_retrig_on_new_note: true,
             tremolo_retrig_on_new_note: true,
@@ -196,17 +204,18 @@ impl<'a> Channel<'a> {
     }
 
     pub(crate) fn trigger_pitch(&mut self, flags: TriggerKeep) {
-        // FT2/XM resets the tremor mute on every note trigger; ST3
-        // keeps the tremor state counter persistent (it only advances
-        // when Ixy runs, so a retrigger without Ixy leaves the
-        // counter where it was). The `effect_tremor` field is still
-        // read by the volume path, so for S3M we derive it from the
-        // persistent silent-flag rather than clearing it here.
-        if !self.module.quirks.tremor_state_persists {
-            self.effect_tremor = false;
-        } else {
-            self.effect_tremor = self.effect_tremor_silent_s3m;
-        }
+        // A new note always starts un-muted: in both FT2 (resets
+        // `realVol` from the instrument) and ST3 (`avol = aorgvol`
+        // on trigger), any tremor mute from previous rows is
+        // overridden by the fresh note's volume.
+        //
+        // For `tremor_state_persists` modules (ST3), the internal
+        // counter state (`effect_tremor_counter_s3m` + `_silent_s3m`)
+        // is intentionally NOT reset here — ST3's `atremor` / `atreon`
+        // live across note triggers, so the next tick where Ixy runs
+        // resumes the cycle from where it left off. Only the
+        // immediate volume gate (`effect_tremor`) is cleared.
+        self.effect_tremor = false;
 
         if let Some(instr) = &mut self.instr {
             if !contains(flags, TRIGGER_KEEP_SAMPLE_POSITION) {
