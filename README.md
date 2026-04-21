@@ -54,7 +54,7 @@ See the `examples/` directory for complete players built on `cpal` and `rodio`.
 ### Runtime
 
 | Feature      | Effect                                                                                            |
-| ------------ | ------------------------------------------------------------------------------------------èèè---- |
+| ------------ | ------------------------------------------------------------------------------------------------- |
 | `std`        | Enable the standard library and use `f32`'s inherent methods for float math. Forwarded to `xmrs`. |
 | `libm`       | `no_std` float backend via `num-traits` + `libm`.                                                 |
 | `micromath`  | `no_std` float backend via `micromath` (smaller, slightly less precise).                          |
