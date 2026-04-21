@@ -1,5 +1,5 @@
 use crate::effect::EffectPlugin;
-use crate::historical_helper::HistoricalHelper;
+use crate::ft2_quirks::Ft2Quirks;
 use core::default::Default;
 
 #[derive(Clone, Default)]
@@ -11,15 +11,15 @@ pub struct Arpeggio {
 #[derive(Clone, Default)]
 pub struct EffectArpeggio {
     data: Arpeggio,
-    historical: Option<HistoricalHelper>,
+    ft2_quirks: Option<Ft2Quirks>,
     tick: u8,
     in_progress: bool,
 }
 
 impl EffectArpeggio {
-    pub fn new(historical: Option<HistoricalHelper>) -> Self {
+    pub fn new(ft2_quirks: Option<Ft2Quirks>) -> Self {
         Self {
-            historical,
+            ft2_quirks,
             ..Default::default()
         }
     }
@@ -49,8 +49,8 @@ impl EffectPlugin for EffectArpeggio {
     }
 
     fn value(&self) -> f32 {
-        match &self.historical {
-            Some(historical) => match historical.arpeggio_tick(self.tick) {
+        match &self.ft2_quirks {
+            Some(q) => match q.arpeggio_tick(self.tick) {
                 1 => self.data.offset1,
                 2 => self.data.offset2,
                 _ => 0.0,

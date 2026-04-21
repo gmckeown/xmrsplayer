@@ -86,16 +86,27 @@ impl<'a> StateSample<'a> {
     }
 
     fn tick(&mut self) -> (f32, f32) {
+        // Ask the sample where we actually are. `seek` returns `None`
+        // when the play head has run past the end of a non-looping
+        // sample — at which point the voice is done and must be shut
+        // off, otherwise it would hold the tail frame indefinitely and
+        // produce an audible drone on any instrument whose tail isn't
+        // silent.
+        let pos = self.position.0 as usize;
+        let useek = match self.sample.seek(pos, self.sustained) {
+            Some(s) => s,
+            None => {
+                self.disable();
+                return (0.0, 0.0);
+            }
+        };
+        // Linear interpolation peek: the "next" sample follows the same
+        // rules. If the next frame is past the end, reuse the current
+        // one rather than blending into silence.
+        let vseek = self.sample.seek(pos + 1, self.sustained).unwrap_or(useek);
+
         let t = self.get_position_fraction() as f32 / (1 << M) as f32;
-
-        let useek = self
-            .sample
-            .meta_seek(self.position.0 as usize, self.sustained);
         let u = self.sample.at(useek);
-
-        let vseek = self
-            .sample
-            .meta_seek(self.position.0 as usize + 1, self.sustained);
         let v = self.sample.at(vseek);
 
         self.increment_position();

@@ -1,3 +1,4 @@
+use core::num::NonZero;
 use rodio::Source;
 use std::sync::{Arc, Mutex};
 use xmrsplayer::xmrsplayer::XmrsPlayer;
@@ -8,7 +9,7 @@ pub struct BufferedSource<'a> {
     pub player: Arc<Mutex<XmrsPlayer<'a>>>,
     buffer: [f32; BUFFER_SIZE],
     buffer_index: usize,
-    sample_rate: u32,
+    sample_rate: NonZero<u32>,
 }
 
 impl<'a> BufferedSource<'a> {
@@ -21,7 +22,7 @@ impl<'a> BufferedSource<'a> {
             // the first 2047 samples came out of the zero-initialised
             // buffer (~46 ms of silence at 44.1 kHz).
             buffer_index: BUFFER_SIZE,
-            sample_rate,
+            sample_rate: NonZero::new(sample_rate).expect("sample_rate must be non-zero"),
         }
     }
 
@@ -40,13 +41,18 @@ impl<'a> BufferedSource<'a> {
 }
 
 impl<'a> Source for BufferedSource<'a> {
-    fn current_frame_len(&self) -> Option<usize> {
+    // rodio 0.21 renamed `current_frame_len` → `current_span_len`
+    // (the renaming is part of their "frames are actually spans" cleanup).
+    fn current_span_len(&self) -> Option<usize> {
         Some(BUFFER_SIZE - self.buffer_index)
     }
-    fn channels(&self) -> u16 {
-        2
+    // rodio 0.21: `channels` and `sample_rate` return NonZero<_>
+    // (null values were always nonsensical — the type now forbids them).
+    fn channels(&self) -> NonZero<u16> {
+        // stereo, checked at compile time.
+        NonZero::new(2).unwrap()
     }
-    fn sample_rate(&self) -> u32 {
+    fn sample_rate(&self) -> NonZero<u32> {
         self.sample_rate
     }
     fn total_duration(&self) -> Option<std::time::Duration> {

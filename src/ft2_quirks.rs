@@ -5,14 +5,24 @@ use micromath::F32Ext;
 #[allow(unused_imports)]
 use num_traits::float::Float;
 
-/// Struct is very small we can clone it everywhere in other structs...
-
+/// Runtime state + lookup tables for FT2-specific replay **bugs**.
+///
+/// Owning an instance of this means the player has opted in to
+/// replicating FT2-era bugs that some XM modules depend on
+/// (arpeggio-table overflow, E60 pattern-loop, K00+note, ...).
+/// These are distinct from `ModuleFormat::Xm` playback *semantics*
+/// — a strictly well-formed XM module plays correctly without any
+/// of these quirks enabled. Only turn quirks on when you actually
+/// want bit-exact FT2 behaviour for period-accurate modules.
+///
+/// The struct is small and `Copy`, so it's cloned into every
+/// channel; mutation goes through the player.
 #[derive(Default, Clone, Copy)]
-pub struct HistoricalHelper {
+pub struct Ft2Quirks {
     pub tempo: usize,
 }
 
-impl HistoricalHelper {
+impl Ft2Quirks {
     pub fn new(tempo: usize) -> Self {
         Self { tempo }
     }

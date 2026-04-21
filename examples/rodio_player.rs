@@ -1,6 +1,5 @@
 use clap::Parser;
 use console::{Key, Term};
-use rodio::Sink;
 use std::sync::{Arc, Mutex};
 
 use xmrs::import::amiga::amiga_module::AmigaModule;
@@ -36,9 +35,9 @@ struct Cli {
     #[arg(short = 'l', long, default_value = "0")]
     loops: usize,
 
-    /// Force historical fT2 replay (default: autodetect)
-    #[arg(short = 't', long, default_value = "false")]
-    historical: bool,
+    /// Force FT2 replay-quirks mode (default: autodetect)
+    #[arg(short = 't', long, alias = "historical", default_value = "false")]
+    ft2_quirks: bool,
 
     /// Start at a specific pattern order table position
     #[arg(short = 'p', long, default_value = "0")]
@@ -86,7 +85,7 @@ fn main() -> Result<(), std::io::Error> {
                                 cli.debug,
                                 cli.ch,
                                 cli.speed,
-                                cli.historical,
+                                cli.ft2_quirks,
                             );
                         }
                         Err(e) => {
@@ -165,30 +164,44 @@ fn rodio_play(
     debug: bool,
     ch: u8,
     speed: usize,
-    historical: bool,
+    ft2_quirks: bool,
 ) {
-    let (_stream, stream_handle) = rodio::OutputStream::try_default().unwrap();
-    let sink: Sink = rodio::Sink::try_new(&stream_handle).unwrap();
+    // rodio 0.22 renamed the API terminology: the old `Sink` (audio track
+    // you append sources to) became `Player`; the old `OutputStream` (the
+    // OS output handle) became `MixerDeviceSink`, obtained via
+    // `DeviceSinkBuilder`. Mechanical rename, identical semantics. See
+    // rodio UPGRADE.md ("Sink terms are replaced with Player and Stream
+    // terms replaced with Sink"). The device-sink must stay alive for
+    // the player to play, hence the `let` binding here.
+    let stream_handle =
+        rodio::DeviceSinkBuilder::open_default_sink().expect("open default audio stream");
+    // Silence rodio's "dropped" log line which would clobber our CLI UI.
+    // Omit this call if you actually want the warning.
+    // stream_handle.log_on_drop(false);
+    let sink = rodio::Player::connect_new(&stream_handle.mixer());
 
-    // try to detect FT2 to play historical bugs
-    let is_ft2 = historical
+    // Auto-enable FT2 quirks for XMs saved from FT2 or ft2-clone (whose
+    // stated goal is bit-exact FT2 replication). See xmrs xmmodule.rs for
+    // how `module.comment` is assembled from the tracker string.
+    let ft2_quirks = ft2_quirks
         || module.comment == "FastTracker v2.00 (1.02)"
         || module.comment == "FastTracker v2.00 (1.03)"
-        || module.comment == "FastTracker v2.00 (1.04)";
+        || module.comment == "FastTracker v2.00 (1.04)"
+        || module.comment.starts_with("Fasttracker II clone ");
 
     let player = Arc::new(Mutex::new(XmrsPlayer::new(
         module,
         SAMPLE_RATE as f32,
         song,
-        is_ft2,
+        ft2_quirks,
     )));
     {
         let mut player_lock = player.lock().unwrap();
         player_lock.amplification = amplification;
         if debug {
             println!("Debug on");
-            if is_ft2 {
-                println!("FT2 Historical XM detected.")
+            if ft2_quirks {
+                println!("FT2 quirks enabled (XM saved from FT2 or ft2-clone).")
             }
         }
         player_lock.debug(debug);

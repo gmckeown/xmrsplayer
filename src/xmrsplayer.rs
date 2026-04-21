@@ -1,5 +1,5 @@
 use crate::channel::Channel;
-use crate::historical_helper::HistoricalHelper;
+use crate::ft2_quirks::Ft2Quirks;
 use crate::triggerkeep::*;
 use alloc::{vec, vec::Vec};
 use xmrs::prelude::*;
@@ -43,16 +43,27 @@ pub struct XmrsPlayer<'a> {
     right_sample: Option<f32>,
     #[cfg(feature = "std")]
     debug: bool,
-    hhelper: Option<HistoricalHelper>,
+    /// `Some` when FT2-era replay bugs are enabled (arpeggio overflow,
+    /// E60 pattern-loop quirk, K00+note quirk, …). `None` disables
+    /// them; canonical `ModuleFormat::Xm` semantics still apply
+    /// independently.
+    ft2_quirks: Option<Ft2Quirks>,
 
     pause: bool,
 }
 
 impl<'a> XmrsPlayer<'a> {
-    pub fn new(module: &'a Module, sample_rate: f32, song: usize, historical: bool) -> Self {
+    /// Build a player for the given module.
+    ///
+    /// `ft2_quirks`: when `true`, replicate known FT2 replay bugs
+    /// (arpeggio table overflow, E60 pattern-loop quirk, K00+note
+    /// quirk, …) in addition to the module's canonical format
+    /// semantics. Canonical XM/IT/S3M/MOD semantics are driven by
+    /// `module.format` and are always applied regardless of this flag.
+    pub fn new(module: &'a Module, sample_rate: f32, song: usize, ft2_quirks: bool) -> Self {
         let num_channels = module.get_num_channels();
-        let hhelper = if historical {
-            Some(HistoricalHelper::new(module.default_tempo))
+        let quirks_state = if ft2_quirks {
+            Some(Ft2Quirks::new(module.default_tempo))
         } else {
             None
         };
@@ -72,7 +83,7 @@ impl<'a> XmrsPlayer<'a> {
             global_volume: 1.0,
             amplification: 1.0,
             row_loop_count: vec![vec![0; MAX_NUM_ROWS]; module.get_song_length(current_song)],
-            hhelper,
+            ft2_quirks: quirks_state,
             effect_volume_slide_speed: 0.0,
             effect_volume_slide_fine: true,
             current_table_index: 0,
@@ -94,7 +105,7 @@ impl<'a> XmrsPlayer<'a> {
             pause: false,
         };
 
-        player.channel = vec![Channel::new(module, sample_rate, hhelper); num_channels];
+        player.channel = vec![Channel::new(module, sample_rate, quirks_state); num_channels];
 
         player
     }
@@ -253,7 +264,7 @@ impl<'a> XmrsPlayer<'a> {
                     } else {
                         // Set loop start point
                         ch.pattern_loop_origin = self.current_row;
-                        if self.hhelper.is_some() {
+                        if self.ft2_quirks.is_some() {
                             // Replicate FT2 E60 bug
                             self.jump_row = ch.pattern_loop_origin;
                         }
@@ -396,8 +407,8 @@ impl<'a> XmrsPlayer<'a> {
                 self.extra_ticks = 0;
             }
 
-            if let Some(hhelper) = &mut self.hhelper {
-                hhelper.set_tempo(self.tempo);
+            if let Some(q) = &mut self.ft2_quirks {
+                q.set_tempo(self.tempo);
             }
             /* FT2 manual says number of ticks / second = BPM * 0.4 */
             self.remaining_samples_in_tick += self.sample_rate / (self.bpm as f32 * 0.4);

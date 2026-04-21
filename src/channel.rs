@@ -9,7 +9,7 @@ use xmrs::waveform::WaveformState;
 use crate::effect::*;
 use crate::effect_arpeggio::EffectArpeggio;
 use crate::effect_vibrato_tremolo::EffectVibratoTremolo;
-use crate::historical_helper::HistoricalHelper;
+use crate::ft2_quirks::Ft2Quirks;
 use crate::triggerkeep::*;
 
 use crate::helper::*;
@@ -27,7 +27,7 @@ struct NoteRetrigState {
 #[derive(Clone)]
 pub struct Channel<'a> {
     module: &'a Module,
-    historical: Option<HistoricalHelper>,
+    ft2_quirks: Option<Ft2Quirks>,
     period_helper: PeriodHelper,
     rate: f32,
 
@@ -74,11 +74,11 @@ pub struct Channel<'a> {
 }
 
 impl<'a> Channel<'a> {
-    pub(crate) fn new(module: &'a Module, rate: f32, historical: Option<HistoricalHelper>) -> Self {
-        let period_helper = PeriodHelper::new(module.frequency_type, historical.is_some());
+    pub(crate) fn new(module: &'a Module, rate: f32, ft2_quirks: Option<Ft2Quirks>) -> Self {
+        let period_helper = PeriodHelper::new(module.frequency_type, ft2_quirks.is_some());
         Self {
             module,
-            historical,
+            ft2_quirks,
             period_helper: period_helper.clone(),
             rate,
             channel_volume: 1.0,
@@ -88,7 +88,7 @@ impl<'a> Channel<'a> {
             current: TrackUnit::default(),
             period: 0.0,
             instr: None,
-            effect_arpeggio: EffectArpeggio::new(historical),
+            effect_arpeggio: EffectArpeggio::new(ft2_quirks),
             effect_note_retrig_backup: NoteRetrigState::default(),
             effect_note_retrig_counter: 0,
             effect_panbrello: EffectVibratoTremolo::new(Waveform::Sine),
@@ -123,36 +123,45 @@ impl<'a> Channel<'a> {
         self.volume = 0.0;
     }
 
-    fn key_off_historical(&mut self, tick: usize) {
-        if let Some(i) = &mut self.instr {
-            i.key_off();
-            // openmpt `key_off.xm`: Key off at tick 0 (K00) is very dodgy command. If there is a note next to it, the note is ignored. If there is a volume column command or instrument next to it and the current instrument has no volume envelope, the note is faded out instead of being cut.
-            if (tick == 0
-                && (i.has_volume_envelope()
-                    || self.current.instrument.is_some()
-                    || self.current.velocity != 0.0))
-                || (tick != 0 && i.has_volume_envelope())
-            {
-                self.trigger_pitch(
-                    TRIGGER_KEEP_VOLUME | TRIGGER_KEEP_PERIOD | TRIGGER_KEEP_ENVELOPE,
-                );
-            } else {
-                self.cut_pitch();
-            }
-        } else {
+    /// Release the currently-sustaining note.
+    ///
+    /// Behaviour depends on the module's canonical format (`module.format`),
+    /// not on the FT2-quirks flag, because "how a note-off should sound" is
+    /// a format-level semantic, not an FT2 bug:
+    ///
+    /// * `ModuleFormat::Xm` — reproduce `ft2_replayer.c:keyOff()`:
+    ///   if the instrument has a volume envelope, flip `sustained` so the
+    ///   envelope enters its release segment and `volume_fadeout` starts
+    ///   counting down; otherwise CUT the channel volume to zero
+    ///   immediately. The FT2 source branches identically on
+    ///   `volEnvFlags & ENV_ENABLED`.
+    ///
+    /// * `ModuleFormat::It` / `Mod` / `S3m` / `Unknown` — rely on
+    ///   `StateInstrDefault::key_off()` which flips `sustained = false`
+    ///   (and cuts iff the instrument has no envelope AND zero fadeout).
+    ///   This is the IT release model and the sensible fallback
+    ///   elsewhere.
+    ///
+    /// The `tick` parameter is kept in the signature so callers (Kxx
+    /// effect at ticks > 0, note-column `===` at tick 0, note-delay
+    /// paths) don't need to case-split. FT2 itself also ignores which
+    /// tick the key-off lands on — the branch on envelope is the only
+    /// real decision.
+    fn key_off(&mut self, _tick: usize) {
+        let Some(i) = &mut self.instr else {
             self.cut_pitch();
-        }
-    }
-
-    fn key_off(&mut self, tick: usize) {
-        if self.historical.is_some() {
-            self.key_off_historical(tick);
             return;
-        }
+        };
 
-        if let Some(i) = &mut self.instr {
-            i.key_off();
-        } else {
+        let had_vol_env = i.has_volume_envelope();
+        i.key_off();
+
+        // XM canonical: FT2's `keyOff()` cuts `realVol` / `outVol`
+        // to zero (quick-ramped, anti-click) when the instrument has
+        // no volume envelope. This is not an FT2 bug — it is how XM
+        // modules are meant to sound — so it is gated on the module's
+        // declared format, not on the FT2-quirks opt-in.
+        if self.module.format == ModuleFormat::Xm && !had_vol_env {
             self.cut_pitch();
         }
     }
@@ -684,8 +693,18 @@ impl<'a> Channel<'a> {
     }
 
     fn tick0_load_instrument_and_pitch(&mut self) {
-        if self.historical.is_some() && self.current.has_note_off() {
-            // Historical Kxy effect bug
+        // FT2 quirk (opt-in): a Kxx NoteOff effect on the same row as a
+        // note in the note column makes the note silent ("K00 eats note",
+        // documented in OpenMPT's `key_off.xm`). Model this by skipping
+        // the tick-0 instrument/pitch load when the slot carries a Kxx
+        // effect — the `TrackEffect::NoteOff` arm in `tickn_effects`
+        // will then be the only thing that fires on this row.
+        //
+        // Must use `has_note_off_effect()` (Kxx only) and NOT
+        // `has_note_off()` (which also matches note-column `===`):
+        // a note-column key-off has different semantics (cf. `key_off`)
+        // and belongs on the normal tick-0 path via `tick0_load_pitch`.
+        if self.ft2_quirks.is_some() && self.current.has_note_off_effect() {
             return;
         }
 

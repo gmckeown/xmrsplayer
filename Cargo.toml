@@ -20,11 +20,11 @@ categories = ["multimedia::audio", "embedded", "no-std"]
 autoexamples = false
 
 [dependencies]
-xmrs = { version = "0.9.10", default-features = false }
+xmrs = { path = "0.9.10", default-features = false }
 clap = { version = "4.5", optional = true, features = ["cargo", "derive"] }
-rodio =  { version = "0.20.1", optional = true }
-console =  { version = "0.15", optional = true }
-cpal =  { version = "0.15", optional = true }
+rodio =  { version = "0.22", optional = true, features = ["playback"] }
+console =  { version = "0.16", optional = true }
+cpal =  { version = "0.17", optional = true }
 num-traits = { version = "0.2",default-features = false, optional=true } # libm wrapper
 micromath = { version = "2.1", optional=true }
 hound = { version = "3.5", optional=true }
@@ -33,6 +33,7 @@ hound = { version = "3.5", optional=true }
 default = ["micromath"]
 # The `demo` feature gates the interactive example players (cpal_player
 # binary and rodio_player example). rodio is needed for rodio_player.
+# To install the player binary: `cargo install xmrsplayer --features demo`.
 demo = ["std", "clap", "console", "cpal", "hound", "rodio", "import", "sid"]
 import = ["xmrs/import", "xmrs/import_sid"]
 libm = ["num-traits/libm", "xmrs/libm"]
