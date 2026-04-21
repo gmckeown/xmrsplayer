@@ -122,18 +122,28 @@ impl<'a> StateSample<'a> {
     #[inline(always)]
     fn increment_position(&mut self) -> u32 {
         if let Some(step) = self.step {
-            self.position.1 += step;
-            if self.position.1 > M_MASK {
-                self.position.0 += self.get_position_trunc();
-                self.position.1 = self.get_position_fraction();
-            }
+            // Split `step` into integer and fractional parts *before*
+            // accumulating, so the fractional register never overflows
+            // u32 on 32-bit targets. With M = 25:
+            //   step & M_MASK   < 2^25
+            //   position.1     <= M_MASK   < 2^25
+            //   → position.1 + (step & M_MASK) < 2^26   (safe u32 add)
+            //
+            // The naive `position.1 += step` panicked whenever `step`
+            // saturated to u32::MAX — which happens as soon as the
+            // `f32 as u32` cast in `set_step` is fed a multi-MHz
+            // frequency (e.g. S3M portamento-up driving the Amiga
+            // period toward zero). Branchless form below keeps the
+            // hot path free of conditional jumps.
+            self.position.1 += step & M_MASK;
+            let carry = self.position.1 >> M; // 0 or 1
+            self.position.0 = self
+                .position
+                .0
+                .wrapping_add((step >> M).wrapping_add(carry));
+            self.position.1 &= M_MASK;
         }
         self.position.0
-    }
-
-    #[inline(always)]
-    fn get_position_trunc(&self) -> u32 {
-        self.position.1 >> M
     }
 
     #[inline(always)]

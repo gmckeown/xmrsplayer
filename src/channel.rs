@@ -489,8 +489,18 @@ impl<'a> Channel<'a> {
                     // time this arm runs `p` is always the final
                     // (non-zero) value — we only need to apply the slide
                     // on non-tick0 ticks, never stash it.
+                    //
+                    // The minimum clamp encodes a format-specific quirk.
+                    //
+                    // For S3M files we clamp the period at 0, which
+                    // replicates the Scream Tracker 3 behaviour
                     if current_tick != 0 {
-                        self.period = (self.period + p).clamp(1.0, 32000.0 - 1.0);
+                        let min_period = if self.module.format == ModuleFormat::S3m {
+                            0.0
+                        } else {
+                            1.0
+                        };
+                        self.period = (self.period + p).clamp(min_period, 32000.0 - 1.0);
                     }
                 }
                 TrackEffect::TonePortamento(p) => {
