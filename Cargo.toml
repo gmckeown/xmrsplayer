@@ -1,6 +1,6 @@
 [package]
 name = "xmrsplayer"
-version = "0.9.10"
+version = "0.9.11"
 edition = "2021"
 description = "XMrsPlayer is a safe no-std soundtracker music player"
 authors = ["Sebastien Bechet"]
@@ -22,7 +22,7 @@ autoexamples = false
 [dependencies]
 # `xmrs` is pulled in without default features; the `std` feature (on by
 # default here) re-enables it below.
-xmrs = { path = "0.9.10", default-features = false }
+xmrs = { path = "0.9.11", default-features = false }
 clap = { version = "4.5", optional = true, features = ["cargo", "derive"] }
 rodio = { version = "0.22", optional = true, features = ["playback"] }
 console = { version = "0.16", optional = true }
