@@ -51,6 +51,18 @@ pub struct Channel<'a> {
     effect_tremor: bool,
     effect_tremor_on: usize,
     effect_tremor_off: usize,
+    /// S3M/ST3 tremor state machine (separate from the formula-based
+    /// FT2/XM path above): number of ticks remaining before the
+    /// on/off state toggles. Negative value = inactive (no Ixy has
+    /// run yet on this channel since the last reset). Persists
+    /// across rows so consecutive Ixy lines form a continuous cycle
+    /// instead of restarting the phase at each row.
+    effect_tremor_counter_s3m: i32,
+    /// Paired with `effect_tremor_counter_s3m`: `true` when the
+    /// current tremor slot is the *silent* half of the cycle (ST3
+    /// `atreon == false`). Drives `effect_tremor` for the volume
+    /// application path.
+    effect_tremor_silent_s3m: bool,
     effect_vibrato: EffectVibratoTremolo,
     /// If `true`, the next note trigger resets the vibrato phase to 0;
     /// otherwise the phase carries over. Set from
@@ -83,7 +95,8 @@ impl<'a> Channel<'a> {
     /// player must subsequently call [`Self::set_tempo`] whenever the
     /// song tempo changes (Fxx effect) to keep the LUT index in sync.
     pub(crate) fn new(module: &'a Module, rate: f32, tempo: usize) -> Self {
-        let period_helper = PeriodHelper::new(module.frequency_type, module.format);
+        let period_helper =
+            PeriodHelper::new(module.frequency_type, module.quirks.ft2_arpeggio_note_clamp);
         Self {
             module,
             period_helper: period_helper.clone(),
@@ -95,7 +108,7 @@ impl<'a> Channel<'a> {
             current: TrackUnit::default(),
             period: 0.0,
             instr: None,
-            effect_arpeggio: EffectArpeggio::new(module.format, tempo),
+            effect_arpeggio: EffectArpeggio::new(module.quirks.ft2_arpeggio_lut, tempo),
             effect_note_retrig_backup: NoteRetrigState::default(),
             effect_note_retrig_counter: 0,
             effect_panbrello: EffectVibratoTremolo::new(Waveform::Sine),
@@ -103,6 +116,8 @@ impl<'a> Channel<'a> {
             effect_tremor: false,
             effect_tremor_on: 0,
             effect_tremor_off: 0,
+            effect_tremor_counter_s3m: -1,
+            effect_tremor_silent_s3m: false,
             effect_vibrato: EffectVibratoTremolo::new(Waveform::Sine),
             vibrato_retrig_on_new_note: true,
             tremolo_retrig_on_new_note: true,
@@ -175,13 +190,23 @@ impl<'a> Channel<'a> {
         // no volume envelope. This is not an FT2 bug — it is how XM
         // modules are meant to sound — so it is gated on the module's
         // declared format, not on the FT2-quirks opt-in.
-        if self.module.format == ModuleFormat::Xm && !had_vol_env {
+        if self.module.quirks.keyoff_cuts_without_vol_env && !had_vol_env {
             self.cut_pitch();
         }
     }
 
     pub(crate) fn trigger_pitch(&mut self, flags: TriggerKeep) {
-        self.effect_tremor = false;
+        // FT2/XM resets the tremor mute on every note trigger; ST3
+        // keeps the tremor state counter persistent (it only advances
+        // when Ixy runs, so a retrigger without Ixy leaves the
+        // counter where it was). The `effect_tremor` field is still
+        // read by the volume path, so for S3M we derive it from the
+        // persistent silent-flag rather than clearing it here.
+        if !self.module.quirks.tremor_state_persists {
+            self.effect_tremor = false;
+        } else {
+            self.effect_tremor = self.effect_tremor_silent_s3m;
+        }
 
         if let Some(instr) = &mut self.instr {
             if !contains(flags, TRIGGER_KEEP_SAMPLE_POSITION) {
@@ -283,14 +308,24 @@ impl<'a> Channel<'a> {
 
     fn tickn_effects(&mut self, current_tick: usize) {
         if current_tick == 0 {
-            // At every row-load tick, clear the tremor mute flag. FT2's Tremor
-            // effect never runs at tickZero (it's only in the TickNonZero jump
-            // table), so the row always begins "playing". If the current row
-            // also carries a Tremor effect, its handler below will overwrite
-            // this; if it doesn't, the previous row's last tremor state
-            // (which might have left us on the "off" half) must not mute the
+            // At every row-load tick, FT2 clears the tremor mute flag:
+            // its Tremor effect never runs at tickZero (only in the
+            // TickNonZero jump table), so the row always begins
+            // "playing". If the current row also carries a Tremor
+            // effect, its handler below will overwrite this; if it
+            // doesn't, the previous row's last tremor state (which
+            // might have left us on the "off" half) must not mute the
             // whole next row.
-            self.effect_tremor = false;
+            //
+            // ST3 does NOT clear at row load: `atreon` and `atremor`
+            // persist across rows, so the cycle continues uninter-
+            // rupted when consecutive rows carry Ixy. For S3M we
+            // therefore skip the clear; the mute flag is driven
+            // exclusively from the state machine in the Tremor arm
+            // below.
+            if !self.module.quirks.tremor_state_persists {
+                self.effect_tremor = false;
+            }
         }
         let len = self.current.effects.len();
         for i in 0..len {
@@ -542,11 +577,6 @@ impl<'a> Channel<'a> {
                         current_tick != 0
                     };
                     if fires {
-                        let min_period = if self.module.format == ModuleFormat::S3m {
-                            0.0
-                        } else {
-                            1.0
-                        };
                         let new_period = self.period + p;
                         // The FT2 signed-overflow quirk is **only** in
                         // pitchSlideDown (p > 0 = period grows). FT2's
@@ -555,7 +585,7 @@ impl<'a> Channel<'a> {
                         // to land in the [32000, 32767] window must
                         // NOT snap to 31999 — it just passes through.
                         // Gated on `p > 0.0`.
-                        if self.module.format == ModuleFormat::Xm && p > 0.0 {
+                        if self.module.quirks.ft2_pitch_slide_overflow && p > 0.0 {
                             let wrapped = (new_period as i32).rem_euclid(65536) as i16;
                             if (32000..=32767).contains(&(wrapped as i32)) {
                                 self.period = 31999.0;
@@ -565,9 +595,32 @@ impl<'a> Channel<'a> {
                                 // wrapped ≥ 32768 (i16-negative):
                                 //   FT2's signed check fails, no clamp
                                 //   fires, period keeps growing.
-                                self.period = new_period.max(min_period);
+                                self.period = new_period.max(1.0);
                             }
+                        } else if let Some((clamp_min, clamp_max)) = self.module.quirks.period_clamp
+                        {
+                            // The module requests a hard period clamp.
+                            // ST3 uses this when `amigalimits` is on in
+                            // the masterflags (`[453, 3424]` in ST3
+                            // units = `[113.25, 856]` in xmrs Amiga
+                            // units — dig.c:setmasterflags, setspd).
+                            // A module authored with a clamp expects
+                            // pitch slides to stop at those bounds
+                            // rather than freewheel into ultrasonic or
+                            // sub-audible territory.
+                            self.period = new_period.clamp(clamp_min, clamp_max);
                         } else {
+                            // No explicit clamp: fall back to the
+                            // conservative `[1, 31999]` range (or
+                            // `[0, 31999]` when the module opts into
+                            // `allow_zero_period`, which lets a pitch
+                            // slide reach "infinitely high note" —
+                            // ST3 convention without amigalimits).
+                            let min_period = if self.module.quirks.allow_zero_period {
+                                0.0
+                            } else {
+                                1.0
+                            };
                             self.period = new_period.clamp(min_period, 32000.0 - 1.0);
                         }
                     }
@@ -603,14 +656,60 @@ impl<'a> Channel<'a> {
                     on_time: on,
                     off_time: off,
                 } => {
-                    if current_tick == 0 {
-                        self.effect_tremor_on = on;
-                        self.effect_tremor_off = off;
-                        self.effect_tremor = false;
+                    if self.module.quirks.tremor_state_persists {
+                        // ST3 tremor (digcmd.c:s_tremor line 803): a
+                        // count-down `atremor` + on/off toggle
+                        // `atreon`, both persistent across rows. On
+                        // every tick where Ixy runs (including tick
+                        // 0), if the counter is > 0 decrement it,
+                        // else toggle the on/off state and reload the
+                        // counter with the corresponding nibble.
+                        //
+                        // The on/off nibble *cache* is refreshed at
+                        // tick 0 (so memory via GET_LAST_NFO is in
+                        // sync) but the state machine is NOT reset —
+                        // consecutive Ixy rows form a continuous
+                        // cycle, matching ST3.
+                        //
+                        // Initial state: counter == -1 (inactive).
+                        // On the first Ixy tick, counter is non-0
+                        // positive? no — we treat -1 as "toggle now"
+                        // and the first toggle lands on "playing"
+                        // (silent=false, which matches ST3's first
+                        // hit where atreon flips from false to true).
+                        if current_tick == 0 {
+                            self.effect_tremor_on = on;
+                            self.effect_tremor_off = off;
+                        }
+                        if self.effect_tremor_counter_s3m > 0 {
+                            self.effect_tremor_counter_s3m -= 1;
+                        } else {
+                            // Toggle on/off (or start "on" from the
+                            // initial inactive state).
+                            self.effect_tremor_silent_s3m = !self.effect_tremor_silent_s3m;
+                            let reload = if self.effect_tremor_silent_s3m {
+                                self.effect_tremor_off
+                            } else {
+                                self.effect_tremor_on
+                            } as i32;
+                            self.effect_tremor_counter_s3m = reload;
+                        }
+                        self.effect_tremor = self.effect_tremor_silent_s3m;
                     } else {
-                        let on = self.effect_tremor_on;
-                        let off = self.effect_tremor_off;
-                        self.effect_tremor = (current_tick - 1) % (on + 1 + off + 1) > on;
+                        // FT2/XM Txy: per-row retrigger with modular
+                        // formula. `current_tick - 1` gives 0 on the
+                        // first effect tick; `(on + off + 2)` is the
+                        // cycle length (FT2 plays for `on + 1`
+                        // ticks then silences for `off + 1`).
+                        if current_tick == 0 {
+                            self.effect_tremor_on = on;
+                            self.effect_tremor_off = off;
+                            self.effect_tremor = false;
+                        } else {
+                            let on = self.effect_tremor_on;
+                            let off = self.effect_tremor_off;
+                            self.effect_tremor = (current_tick - 1) % (on + 1 + off + 1) > on;
+                        }
                     }
                 }
                 TrackEffect::Vibrato { speed: s, depth: d } => {
@@ -629,7 +728,8 @@ impl<'a> Channel<'a> {
                 TrackEffect::VibratoDepth(d) => {
                     if current_tick == 0 {
                         self.effect_vibrato.data.depth = d;
-                    } else if self.module.format == ModuleFormat::Xm && !self.current.has_vibrato()
+                    } else if self.module.quirks.volcol_b_advances_vibrato
+                        && !self.current.has_vibrato()
                     {
                         // FT2 vol-column Bx quirk: when the slot carries a
                         // vol-column vibrato-depth with NO main-effect 4xx
@@ -810,7 +910,7 @@ impl<'a> Channel<'a> {
         //     (see `key_off()`) and belongs on the normal tick-0 path
         //     via `tick0_load_pitch`, hence the helper distinguishes
         //     effect-Kxx from column-keyoff.
-        if self.module.format == ModuleFormat::Xm && self.current.has_note_off_at_tick_zero() {
+        if self.module.quirks.k00_eats_note && self.current.has_note_off_at_tick_zero() {
             return;
         }
 
@@ -857,8 +957,8 @@ impl<'a> Channel<'a> {
                 // we must NOT clear the output — otherwise the vibrato
                 // would audibly cut in and out on every row that only
                 // carries vol-col B.
-                let xm_volcol_b_alone =
-                    self.module.format == ModuleFormat::Xm && self.current.has_vibrato_depth();
+                let xm_volcol_b_alone = self.module.quirks.volcol_b_advances_vibrato
+                    && self.current.has_vibrato_depth();
                 if !xm_volcol_b_alone {
                     // Only clear the output modulation.
                     self.effect_vibrato.clear_output();

@@ -1,6 +1,5 @@
 use crate::effect::EffectPlugin;
 use core::default::Default;
-use xmrs::module::ModuleFormat;
 
 #[derive(Clone, Default)]
 pub struct Arpeggio {
@@ -10,11 +9,11 @@ pub struct Arpeggio {
 
 /// Per-channel arpeggio state + FT2 historical LUT.
 ///
-/// For `ModuleFormat::Xm`, the offset to apply at each tick is picked
-/// from the FT2 historical `arpeggioTab` (reverse-counted to match
-/// FT2's `song.tick`). Non-XM formats fall back to a plain
-/// `tick % 3` rotation, which is what Protracker / Scream Tracker 3 /
-/// Impulse Tracker do.
+/// When `use_ft2_lut` is `true`, the offset to apply at each tick
+/// is picked from FT2's historical `arpeggioTab` (reverse-counted
+/// to match FT2's `song.tick`). Otherwise the effect falls back to
+/// a plain `tick % 3` rotation, which is what Protracker /
+/// Scream Tracker 3 / Impulse Tracker do.
 ///
 /// `tempo` is the current song speed (number of ticks per row). The
 /// FT2 lookup needs it to convert xmrs' forward-counting tick into
@@ -25,16 +24,16 @@ pub struct Arpeggio {
 #[derive(Clone, Default)]
 pub struct EffectArpeggio {
     data: Arpeggio,
-    format: ModuleFormat,
+    use_ft2_lut: bool,
     tempo: usize,
     tick: u8,
     in_progress: bool,
 }
 
 impl EffectArpeggio {
-    pub fn new(format: ModuleFormat, tempo: usize) -> Self {
+    pub fn new(use_ft2_lut: bool, tempo: usize) -> Self {
         Self {
-            format,
+            use_ft2_lut,
             tempo,
             ..Default::default()
         }
@@ -111,12 +110,12 @@ impl EffectPlugin for EffectArpeggio {
     }
 
     fn value(&self) -> f32 {
-        let idx = match self.format {
-            ModuleFormat::Xm => Self::ft2_arpeggio_index(self.tick, self.tempo),
+        let idx = if self.use_ft2_lut {
+            Self::ft2_arpeggio_index(self.tick, self.tempo)
+        } else {
             // Protracker / ST3 / IT all use the simple three-step
-            // rotation with no LUT quirks; `Unknown` falls back to the
-            // same sensible behaviour.
-            _ => self.tick % 3,
+            // rotation with no LUT quirks.
+            self.tick % 3
         };
         match idx {
             1 => self.data.offset1,

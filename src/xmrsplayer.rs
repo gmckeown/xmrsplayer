@@ -257,6 +257,19 @@ impl<'a> XmrsPlayer<'a> {
                         if value == ch.pattern_loop_count {
                             // Loop is over
                             ch.pattern_loop_count = 0;
+                            if self.module.quirks.pattern_loop_resumes {
+                                // ST3 `s_patloop` (digcmd.c:1003):
+                                // when the loop finishes, the next
+                                // row becomes the new loop start. If
+                                // a second SBx appears later in the
+                                // same pattern without a fresh SB0,
+                                // it will naturally loop from just
+                                // after the previous loop's end
+                                // instead of re-using the original
+                                // origin. FT2 doesn't do this; S3M
+                                // modules do rely on it.
+                                ch.pattern_loop_origin = self.current_row + 1;
+                            }
                         } else {
                             // Jump to the beginning of the loop
                             ch.pattern_loop_count += 1;
@@ -267,7 +280,7 @@ impl<'a> XmrsPlayer<'a> {
                     } else {
                         // Set loop start point
                         ch.pattern_loop_origin = self.current_row;
-                        if self.module.format == ModuleFormat::Xm {
+                        if self.module.quirks.e60_leaks_to_next_pattern {
                             // Replicate FT2 E60 bug: in FT2, E60 not
                             // only sets the per-channel loop origin,
                             // it ALSO leaks that row number into the
