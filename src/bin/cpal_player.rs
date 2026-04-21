@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use xmrs::prelude::*;
 use xmrsplayer::prelude::*;
 
-#[cfg(feature = "sid")]
+#[cfg(feature = "import_sid")]
 use xmrs::import::sid::sid_module::SidModule;
 
 #[derive(Parser)]
@@ -49,12 +49,12 @@ struct Cli {
     speed: usize,
 
     /// Test SID player as a Proof of Concept
-    #[cfg(feature = "sid")]
+    #[cfg(feature = "import_sid")]
     #[arg(short = 'z', long, default_value = "false")]
     sid_test_player: bool,
 }
 
-#[cfg(feature = "sid")]
+#[cfg(feature = "import_sid")]
 fn sid_test_player(cli: &Cli) {
     // let sidmodule = SidModule::get_sid_commando();
     // let sidmodule = SidModule::get_sid_crazy_comets();
@@ -98,7 +98,7 @@ fn main() -> Result<(), std::io::Error> {
     println!("Because demo scene can't die :)\n");
 
     // Ugly Hack just for fun
-    #[cfg(feature = "sid")]
+    #[cfg(feature = "import_sid")]
     if cli.sid_test_player {
         sid_test_player(&cli);
         return Ok(());

@@ -33,11 +33,12 @@ micromath = { version = "2.1", optional = true }
 hound = { version = "3.5", optional = true }
 
 [features]
-# `std` is on by default: the common case is a desktop/server build that
-# wants the standard library. Users targeting `no_std` opt out with
-# `default-features = false` and pick a float math backend (`libm` or
-# `micromath`).
-default = ["std"]
+# `std` and `import` are on by default: the common case is a
+# desktop/server build that wants the standard library and every
+# format importer. Users targeting `no_std` or wanting a smaller
+# binary opt out with `default-features = false` and pick only what
+# they need.
+default = ["std", "import"]
 
 # Enable the standard library. Forwarded to `xmrs`. When on, `f32`'s
 # inherent methods are used for float math and no extra math
@@ -46,18 +47,26 @@ std = ["xmrs/std"]
 
 # `demo` gates the interactive example players (cpal_player binary and
 # rodio_player example). It is a convenience feature that also turns on
-# `std` so `--no-default-features --features demo` still builds.
+# `std` and all importers so `--no-default-features --features demo`
+# still builds.
 # To install the player binary: `cargo install xmrsplayer --features demo`.
-demo = ["std", "clap", "console", "cpal", "hound", "rodio", "import", "sid"]
+demo = ["std", "import", "clap", "console", "cpal", "hound", "rodio"]
 
 # ---- Float math backends (only needed when `std` is disabled) ----
 # Pick exactly one of `libm` or `micromath` in `no_std` builds.
 libm = ["dep:num-traits", "num-traits/libm", "xmrs/libm"]
 micromath = ["dep:micromath", "xmrs/micromath"]
 
-# ---- Import / format features (propagate to xmrs) ----
-import = ["xmrs/import", "xmrs/import_sid"]
-sid = ["xmrs/import_sid"]
+# ---- Historical-format importers (propagate to xmrs) ----
+# `import` is an umbrella for all importers. Downstreams that want
+# a smaller binary can disable it and pick only the formats they
+# need, e.g. `features = ["std", "import_xm"]`.
+import = ["xmrs/import"]
+import_mod = ["xmrs/import_mod"]
+import_xm  = ["xmrs/import_xm"]
+import_s3m = ["xmrs/import_s3m"]
+import_it  = ["xmrs/import_it"]
+import_sid = ["xmrs/import_sid"]
 
 [lib]
 name = "xmrsplayer"
