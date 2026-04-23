@@ -154,9 +154,6 @@ fn play_music(
     let config = device
         .default_output_config()
         .expect("failed to get default output config");
-
-    println!("cpal config: {:?}", config);
-
     let sample_rate = config.sample_rate();
 
     let player = Arc::new(Mutex::new(XmrsPlayer::new(

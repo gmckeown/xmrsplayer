@@ -40,6 +40,11 @@ pub mod voices;
 /// Subscription API — `PlayerObserver` trait and event context structs.
 pub mod observer;
 
+/// Audio-side subscription API — `MixObserver` and `ChannelsObserver`
+/// traits for consumers of the produced audio stream (VU-meters,
+/// oscilloscopes, recorders, analyzers).
+pub mod audio_observer;
+
 /// Built-in observer that prints pattern/row changes. Requires `std`.
 #[cfg(feature = "std")]
 pub mod debug_observer;

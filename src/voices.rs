@@ -185,18 +185,55 @@ impl<'a> Voices<'a> {
     /// Hot path: walks channels once with a `(f32, f32)` accumulator and
     /// never allocates. At 48 kHz stereo this is the function that runs
     /// 48 000 times a second.
-    pub(crate) fn mix(&mut self, apply_volume: bool) -> (f32, f32) {
+    ///
+    /// When `per_channel_out` is `Some(buffer)`, each channel's post-mute
+    /// `(left, right)` pair is also written into the buffer at its channel
+    /// index — used by the facade to feed `ChannelsObserver`s without a
+    /// second pass over the channel list. The buffer length must be at
+    /// least `self.channel.len()`; any trailing entries are left untouched.
+    /// Pass `None` to skip the capture (the common path, when no channels
+    /// observer is registered).
+    pub(crate) fn mix(
+        &mut self,
+        apply_volume: bool,
+        per_channel_out: Option<&mut [(f32, f32)]>,
+    ) -> (f32, f32) {
         let (mut left, mut right) = (0.0f32, 0.0f32);
-        for ch in &mut self.channel {
-            if let Some((l, r)) = ch.next() {
-                if !ch.is_muted() {
-                    left += l;
-                    right += r;
+
+        // Split the capture path from the plain path so the no-capture case
+        // keeps its tight loop without a per-iteration `Option` check.
+        match per_channel_out {
+            None => {
+                for ch in &mut self.channel {
+                    if let Some((l, r)) = ch.next() {
+                        if !ch.is_muted() {
+                            left += l;
+                            right += r;
+                        }
+                    }
+                    // `None` from a channel (no active instrument) contributes
+                    // zero; muted channels are advanced (so position tracking
+                    // stays correct when they unmute) but their output is
+                    // discarded.
                 }
             }
-            // `None` from a channel (no active instrument) contributes zero;
-            // muted channels are advanced (so position tracking stays
-            // correct when they unmute) but their output is discarded.
+            Some(buf) => {
+                for (idx, ch) in self.channel.iter_mut().enumerate() {
+                    let val = match ch.next() {
+                        Some((l, r)) if !ch.is_muted() => {
+                            left += l;
+                            right += r;
+                            (l, r)
+                        }
+                        _ => (0.0, 0.0),
+                    };
+                    // Index is bounded by self.channel.len(); the facade
+                    // guarantees the buffer was sized to match.
+                    if idx < buf.len() {
+                        buf[idx] = val;
+                    }
+                }
+            }
         }
 
         if apply_volume {

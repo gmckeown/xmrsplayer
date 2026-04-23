@@ -5,9 +5,11 @@
 /// use xmrsplayer::prelude::*;
 /// ```
 ///
-/// Exports both the top-level `XmrsPlayer` and the subscription API
-/// (`PlayerObserver` + event contexts). The built-in `DebugObserver` is
-/// re-exported too when `std` is available.
+/// Exports both the top-level `XmrsPlayer` and the subscription API —
+/// `PlayerObserver` (song-side events) and `MixObserver` /
+/// `ChannelsObserver` (audio-side events). The built-in `DebugObserver`
+/// is re-exported too when `std` is available.
+pub use crate::audio_observer::{ChannelsContext, ChannelsObserver, MixContext, MixObserver};
 pub use crate::observer::{PatternChangeContext, PlayerObserver, RowContext, TickContext};
 pub use crate::xmrsplayer::XmrsPlayer;
 

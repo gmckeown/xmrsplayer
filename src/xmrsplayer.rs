@@ -18,6 +18,7 @@
 use alloc::{boxed::Box, vec, vec::Vec};
 use xmrs::prelude::*;
 
+use crate::audio_observer::{ChannelsContext, ChannelsObserver, MixContext, MixObserver};
 use crate::observer::{PatternChangeContext, PlayerObserver, RowContext, TickContext};
 use crate::sequencer::{Sequencer, TickOutcome};
 use crate::voices::Voices;
@@ -32,6 +33,21 @@ pub struct XmrsPlayer<'a> {
     voices: Voices<'a>,
 
     observers: Vec<Box<dyn PlayerObserver + Send>>,
+
+    /// Audio observers subscribed to the final (post-sum, pre-gain) stereo
+    /// mix. Called once per produced sample.
+    audio_mix_observers: Vec<Box<dyn MixObserver + Send>>,
+
+    /// Audio observers subscribed to the per-channel pre-sum slice. Called
+    /// once per produced sample, but only if at least one is registered —
+    /// the capture path in `Voices::mix` is gated on this list being
+    /// non-empty to avoid paying the per-channel write cost otherwise.
+    audio_channels_observers: Vec<Box<dyn ChannelsObserver + Send>>,
+
+    /// Scratch buffer that `Voices::mix` fills when the channels-observer
+    /// list is non-empty. Pre-allocated to `num_channels` at construction
+    /// and reused on every `sample()` so the hot path never allocates.
+    per_channel_buffer: Vec<(f32, f32)>,
 
     /// Facade-owned sample clock: fractional samples remaining before the
     /// next song tick boundary. Decremented once per sample; when it
@@ -71,6 +87,7 @@ impl<'a> XmrsPlayer<'a> {
     pub fn new(module: &'a Module, sample_rate: f32, song: usize) -> Self {
         let sequencer = Sequencer::new(module, song);
         let voices = Voices::new(module, sample_rate, module.default_tempo);
+        let num_channels = voices.num_channels();
 
         Self {
             module,
@@ -78,6 +95,9 @@ impl<'a> XmrsPlayer<'a> {
             sequencer,
             voices,
             observers: Vec::new(),
+            audio_mix_observers: Vec::new(),
+            audio_channels_observers: Vec::new(),
+            per_channel_buffer: vec![(0.0, 0.0); num_channels],
             remaining_samples_in_tick: 0.0,
             sample_rate,
             generated_samples: 0,
@@ -112,6 +132,43 @@ impl<'a> XmrsPlayer<'a> {
     /// voices engine).
     pub fn observer_count(&self) -> usize {
         self.observers.len()
+    }
+
+    // --- Audio observer registration ---
+
+    /// Register an observer on the final stereo mix (pre-gain). Called once
+    /// per produced sample. See [`MixObserver`] for the contract.
+    pub fn add_audio_mix_observer(&mut self, observer: Box<dyn MixObserver + Send>) {
+        self.audio_mix_observers.push(observer);
+    }
+
+    /// Remove every registered mix observer.
+    pub fn clear_audio_mix_observers(&mut self) {
+        self.audio_mix_observers.clear();
+    }
+
+    /// Number of currently registered mix observers.
+    pub fn audio_mix_observer_count(&self) -> usize {
+        self.audio_mix_observers.len()
+    }
+
+    /// Register an observer on the per-channel pre-sum slice. Called once
+    /// per produced sample. Registering at least one of these enables the
+    /// per-channel capture path in the mixer — prefer a
+    /// [`MixObserver`](Self::add_audio_mix_observer) if you only need the
+    /// summed mix. See [`ChannelsObserver`] for the contract.
+    pub fn add_audio_channels_observer(&mut self, observer: Box<dyn ChannelsObserver + Send>) {
+        self.audio_channels_observers.push(observer);
+    }
+
+    /// Remove every registered channels observer.
+    pub fn clear_audio_channels_observers(&mut self) {
+        self.audio_channels_observers.clear();
+    }
+
+    /// Number of currently registered channels observers.
+    pub fn audio_channels_observer_count(&self) -> usize {
+        self.audio_channels_observers.len()
     }
 
     // --- Mute helpers (delegated to voices) ---
@@ -341,6 +398,13 @@ impl<'a> XmrsPlayer<'a> {
     /// this function can be used to replace the iterator or the `sample()`
     /// function if you want to control each channel in fine detail — for
     /// example, to create per-channel graphic effects.
+    ///
+    /// Note: this is an **alternative** consumption path to
+    /// [`sample`](Self::sample). Audio observers ([`MixObserver`] /
+    /// [`ChannelsObserver`]) are fired only from `sample()` / the
+    /// `Iterator` impl; they are **not** fired when samples are pulled
+    /// through `samples_from_channels`, to avoid double dispatch if a
+    /// caller mixes both APIs.
     pub fn samples_from_channels(&mut self) -> Option<Vec<(f32, f32)>> {
         if self.pause {
             return Some(vec![(0.0, 0.0); self.voices.num_channels()]);
@@ -376,16 +440,118 @@ impl<'a> XmrsPlayer<'a> {
     /// Semantically identical to `samples_from_channels().map(samples_apply_volume)`,
     /// but walks channels once with an `(f32, f32)` accumulator and never
     /// allocates a per-sample `Vec`.
+    ///
+    /// While paused, returns `Some((0.0, 0.0))` and still fires audio
+    /// observers with zero samples (documented contract — recorders
+    /// capturing silence, oscilloscopes drawing flatlines). Player-side
+    /// observers are not notified during pause because no song events
+    /// happen.
     pub fn sample(&mut self, apply_volume: bool) -> Option<(f32, f32)> {
         if self.pause {
+            self.notify_audio_observers_paused();
             return Some((0.0, 0.0));
         }
         if !self.step() {
             return None;
         }
-        let s = self.voices.mix(apply_volume);
+
+        // Gate per-channel capture on actually having channels observers —
+        // the buffer fill has a cost even when nobody consumes it.
+        let capture = !self.audio_channels_observers.is_empty();
+        let mix_pre_gain = if capture {
+            let buf = self.per_channel_buffer.as_mut_slice();
+            // Pass `false` for apply_volume — we handle gain below and we
+            // want the pre-gain value both for the channels slice and for
+            // the mix observers.
+            self.voices.mix(false, Some(buf))
+        } else {
+            self.voices.mix(false, None)
+        };
+
+        self.notify_audio_observers(mix_pre_gain);
+
+        // Produce the value the caller actually asked for.
+        let s = if apply_volume {
+            let g = self.voices.global_volume() * self.voices.amplification();
+            (mix_pre_gain.0 * g, mix_pre_gain.1 * g)
+        } else {
+            mix_pre_gain
+        };
+
         self.generated_samples += 1;
         Some(s)
+    }
+
+    /// Dispatch audio observers for a real (non-paused) sample.
+    /// Channels observers first, then mix observers. Called only from
+    /// `sample()` — centralised so both the pause path and the normal
+    /// path share the same ordering.
+    fn notify_audio_observers(&mut self, mix: (f32, f32)) {
+        let global_volume = self.voices.global_volume();
+        let amplification = self.voices.amplification();
+
+        if !self.audio_channels_observers.is_empty() {
+            // The buffer was filled during `voices.mix(_, Some(buf))` above.
+            // Borrow immutably for the dispatch loop.
+            let channels: &[(f32, f32)] = self.per_channel_buffer.as_slice();
+            let ctx = ChannelsContext {
+                channels,
+                global_volume,
+                amplification,
+            };
+            for obs in &mut self.audio_channels_observers {
+                obs.on_channels(&ctx);
+            }
+        }
+
+        if !self.audio_mix_observers.is_empty() {
+            let ctx = MixContext {
+                left: mix.0,
+                right: mix.1,
+                global_volume,
+                amplification,
+            };
+            for obs in &mut self.audio_mix_observers {
+                obs.on_mix(&ctx);
+            }
+        }
+    }
+
+    /// Same as `notify_audio_observers` but for the paused path: every
+    /// per-channel entry is zero, and the mix is zero.
+    fn notify_audio_observers_paused(&mut self) {
+        let global_volume = self.voices.global_volume();
+        let amplification = self.voices.amplification();
+
+        if !self.audio_channels_observers.is_empty() {
+            // Zero out the buffer — the contract says paused observers see
+            // silence across all channels. Write in place so we don't
+            // allocate on the hot path.
+            for entry in self.per_channel_buffer.iter_mut() {
+                *entry = (0.0, 0.0);
+            }
+            let channels: &[(f32, f32)] = self.per_channel_buffer.as_slice();
+            let ctx = ChannelsContext {
+                channels,
+                global_volume,
+                amplification,
+            };
+            for obs in &mut self.audio_channels_observers {
+                obs.on_channels(&ctx);
+            }
+        }
+
+        if !self.audio_mix_observers.is_empty() {
+            let ctx = MixContext {
+                left: 0.0,
+                right: 0.0,
+                global_volume,
+                amplification,
+            };
+            for obs in &mut self.audio_mix_observers {
+                obs.on_mix(&ctx);
+            }
+        }
     }
 
     /// Returns samples one after the other, starting with the left channel.
