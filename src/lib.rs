@@ -25,6 +25,7 @@ pub(crate) mod state_auto_vibrato;
 pub(crate) mod state_envelope;
 pub(crate) mod state_instr_default;
 pub(crate) mod state_sample;
+pub(crate) mod voice;
 
 // --- Post-refactor modules (0.10) ---
 

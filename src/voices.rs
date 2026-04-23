@@ -112,6 +112,7 @@ impl<'a> Voices<'a> {
     pub(crate) fn reset_for_goto(&mut self) {
         self.global_volume = 1.0;
         for ch in &mut self.channel {
+            ch.clear_ghosts();
             ch.trigger_pitch(TRIGGER_KEEP_PERIOD);
         }
     }

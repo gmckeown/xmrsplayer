@@ -15,6 +15,7 @@ use crate::triggerkeep::*;
 
 use crate::helper::*;
 use crate::state_instr_default::StateInstrDefault;
+use crate::voice::{Voice, MAX_GHOST_VOICES_PER_CHANNEL};
 use xmrs::prelude::*;
 
 #[derive(Clone, PartialEq, Default)]
@@ -79,6 +80,22 @@ pub struct Channel<'a> {
     pub muted: bool,
 
     actual_volume: [f32; 2],
+
+    // --- IT New Note Action / past-note state ---
+    //
+    // Ghost voices: notes that were playing when a new note fired on
+    // the same pattern channel and whose instrument's `NewNoteAction`
+    // was not `Cut`. They continue to sound (via their own envelope +
+    // fadeout) alongside the live note until they go silent. The
+    // `Vec` is capped by `MAX_GHOST_VOICES_PER_CHANNEL`; when full, the
+    // oldest ghost (index 0) is evicted. No-op on MOD/XM/S3M because
+    // those importers leave NNA at its `NoteCut` default.
+    ghosts: Vec<Voice<'a>>,
+    /// S7x (S73–S76) lets the *pattern* override an instrument's
+    /// stored NNA for the current channel, affecting only subsequent
+    /// triggers on this channel. `None` = use the incoming
+    /// instrument's own NNA value, which is the normal case.
+    nna_override: Option<NewNoteAction>,
 }
 
 impl<'a> Channel<'a> {
@@ -132,6 +149,8 @@ impl<'a> Channel<'a> {
             effect_note_delay: 0,
             muted: false,
             actual_volume: [0.0, 0.0],
+            ghosts: Vec::new(),
+            nna_override: None,
         }
     }
 
@@ -196,6 +215,113 @@ impl<'a> Channel<'a> {
         // declared format, not on the FT2-quirks opt-in.
         if self.module.quirks.keyoff_cuts_without_vol_env && !had_vol_env {
             self.cut_pitch();
+        }
+    }
+
+    /// Drop every ghost voice on this channel. Used by the facade
+    /// when the song is seeked (goto) — stale ghosts from the
+    /// previous playback position must not bleed into the new one.
+    pub(crate) fn clear_ghosts(&mut self) {
+        self.ghosts.clear();
+        self.nna_override = None;
+    }
+
+    // ------------------------------------------------------------------
+    // IT New Note Action helpers
+    // ------------------------------------------------------------------
+
+    /// Resolve which NNA to apply when a new note displaces the
+    /// currently-held voice. `S73`–`S76` override via
+    /// `self.nna_override`; otherwise the NNA comes from the
+    /// *outgoing* instrument (not the incoming one — IT's replay
+    /// reads the old voice's NNA when deciding what happens to it).
+    /// Returns `NoteCut` if no voice is currently held (nothing to
+    /// ghost).
+    fn effective_nna(&self) -> NewNoteAction {
+        if let Some(nna) = self.nna_override {
+            return nna;
+        }
+        let Some(instr) = &self.instr else {
+            return NewNoteAction::NoteCut;
+        };
+        match &instr.duplicate_check {
+            DuplicateCheckType::Off(nna) => *nna,
+            DuplicateCheckType::Note(dca)
+            | DuplicateCheckType::Sample(dca)
+            | DuplicateCheckType::Instrument(dca) => match dca {
+                DuplicateCheckAction::NoteCut(nna)
+                | DuplicateCheckAction::NoteOff(nna)
+                | DuplicateCheckAction::NoteFadeOut(nna) => *nna,
+            },
+        }
+    }
+
+    /// Handle the NNA dispatch for a note that's about to be
+    /// displaced. Called from the replace-instrument path just
+    /// before `self.instr` is overwritten with a fresh voice.
+    ///
+    /// The fork snapshots the channel-level gain / pan at the
+    /// moment of displacement so subsequent tremolo / slides on the
+    /// live channel don't perturb the ghost.
+    fn spawn_ghost_for_outgoing(&mut self) {
+        let nna = self.effective_nna();
+        if matches!(nna, NewNoteAction::NoteCut) {
+            // Legacy / XM / MOD / S3M path: the fresh note cuts the
+            // old one (today's behaviour). No ghost.
+            return;
+        }
+        let Some(old) = self.instr.take() else {
+            return;
+        };
+        let mut ghost = Voice::fork(old, self.volume, self.channel_volume, self.panning);
+        match nna {
+            NewNoteAction::Continue => ghost.apply_nna_continue(),
+            NewNoteAction::NoteOff => ghost.apply_nna_note_off(),
+            NewNoteAction::NoteFadeOut => ghost.apply_nna_note_fade_out(),
+            NewNoteAction::NoteCut => unreachable!(), // handled above
+        }
+        self.push_ghost(ghost);
+    }
+
+    /// Add a voice to the ghost list, evicting the oldest if the
+    /// cap is reached. IT's pool uses a lowest-volume heuristic —
+    /// here we pick the simplest bounded approximation (oldest = FIFO)
+    /// since per-channel lists are small.
+    fn push_ghost(&mut self, v: Voice<'a>) {
+        if self.ghosts.len() >= MAX_GHOST_VOICES_PER_CHANNEL {
+            self.ghosts.remove(0);
+        }
+        self.ghosts.push(v);
+    }
+
+    /// Advance every ghost's envelopes / fadeout by one tick, and
+    /// drop any that have decayed to silence. The resulting
+    /// capacity is naturally bounded — ghosts that have run out of
+    /// sample data or whose envelope * fadeout reached zero are
+    /// reaped here, freeing their slot for future forks.
+    fn tick_ghosts(&mut self) {
+        for g in &mut self.ghosts {
+            g.tick();
+        }
+        self.ghosts.retain(|g| g.is_alive());
+    }
+
+    /// S70 / S71 / S72: apply a past-note effect to every ghost on
+    /// this channel. The live note is unaffected (S7x targets only
+    /// detached voices, per ITTECH).
+    fn past_note_cut_all(&mut self) {
+        for g in &mut self.ghosts {
+            g.past_cut();
+        }
+    }
+    fn past_note_off_all(&mut self) {
+        for g in &mut self.ghosts {
+            g.past_off();
+        }
+    }
+    fn past_note_fade_all(&mut self) {
+        for g in &mut self.ghosts {
+            g.past_fade_out();
         }
     }
 
@@ -309,6 +435,10 @@ impl<'a> Channel<'a> {
             self.tickn_effects(current_tick);
             self.tickn_update_instr();
         }
+        // Advance ghost voices even if the live instrument is gone —
+        // ghosts have independent envelope state and must keep
+        // decaying regardless of what the pattern is doing.
+        self.tick_ghosts();
     }
 
     fn tickn_effects(&mut self, current_tick: usize) {
@@ -350,13 +480,14 @@ impl<'a> Channel<'a> {
                 TrackEffect::ChannelVolume(v) => {
                     self.channel_volume = v.clamp(0.0, 1.0);
                 }
-                TrackEffect::ChannelVolumeSlide {
-                    speed: _s,
-                    fine: _f,
-                } => {
-                    #[cfg(feature = "demo")]
-                    println!("ChannelVolumeSlide");
-                    todo!();
+                TrackEffect::ChannelVolumeSlide { speed, fine } => {
+                    // Same tick scoping as VolumeSlide: fine slides
+                    // fire once at tick 0; non-fine slides fire on
+                    // ticks > 0 only. Channel volume stays clamped
+                    // to [0, 1] (→ 0..64 in IT units).
+                    if fine == (current_tick == 0) {
+                        self.channel_volume = (self.channel_volume + speed).clamp(0.0, 1.0);
+                    }
                 }
                 TrackEffect::Glissando(glissando) => {
                     if current_tick == 0 {
@@ -373,10 +504,15 @@ impl<'a> Channel<'a> {
                         }
                     }
                 }
-                TrackEffect::InstrumentNewNoteAction(_nna) => {
-                    #[cfg(feature = "demo")]
-                    println!("InstrumentNewNoteAction");
-                    todo!();
+                TrackEffect::InstrumentNewNoteAction(nna) => {
+                    // S73 / S74 / S75 / S76 — override the NNA that
+                    // will govern the NEXT trigger on this channel.
+                    // Applied at tick 0 only; the override is single-
+                    // shot and cleared inside `tick0_change_instr`
+                    // the first time a new instrument is loaded.
+                    if current_tick == 0 {
+                        self.nna_override = Some(nna);
+                    }
                 }
                 TrackEffect::InstrumentPanningEnvelopePosition(position) => {
                     if current_tick == 0 {
@@ -425,10 +561,17 @@ impl<'a> Channel<'a> {
                         }
                     }
                 }
-                TrackEffect::NoteCut { tick: t, past: _p } => {
-                    // TODO: past
+                TrackEffect::NoteCut { tick: t, past } => {
                     if current_tick == t {
-                        self.cut_pitch();
+                        if past {
+                            // S70: cut all ghost voices on this
+                            // channel. Live voice is untouched per
+                            // ITTECH (S7x targets only detached
+                            // notes).
+                            self.past_note_cut_all();
+                        } else {
+                            self.cut_pitch();
+                        }
                     }
                 }
                 TrackEffect::NoteDelay(delay) => {
@@ -462,15 +605,28 @@ impl<'a> Channel<'a> {
                         }
                     }
                 }
-                TrackEffect::NoteFadeOut { tick: _t, past: _p } => {
-                    #[cfg(feature = "demo")]
-                    println!("NoteFadeOut");
-                    todo!();
-                }
-                TrackEffect::NoteOff { tick: t, past: _p } => {
-                    // TODO: past
+                TrackEffect::NoteFadeOut { tick: t, past } => {
                     if current_tick == t {
-                        self.key_off(t);
+                        if past {
+                            // S72: fade all ghost voices.
+                            self.past_note_fade_all();
+                        } else if let Some(i) = &mut self.instr {
+                            // Unsustain the live voice so its
+                            // `volume_fadeout` starts ticking down.
+                            // `key_off` is the existing entry point
+                            // for "release envelope + start fadeout".
+                            i.key_off();
+                        }
+                    }
+                }
+                TrackEffect::NoteOff { tick: t, past } => {
+                    if current_tick == t {
+                        if past {
+                            // S71: key-off all ghost voices.
+                            self.past_note_off_all();
+                        } else {
+                            self.key_off(t);
+                        }
                     }
                 }
                 TrackEffect::NoteRetrig {
@@ -791,12 +947,21 @@ impl<'a> Channel<'a> {
                         i.replace_instr(id);
                     }
                 } else {
+                    // IT NNA: if the outgoing voice's NNA is anything
+                    // but `Cut`, fork it into a ghost before we blow
+                    // it away with the new trigger. On non-IT
+                    // modules this is a cheap no-op because their
+                    // importers leave NNA = NoteCut (the default).
+                    self.spawn_ghost_for_outgoing();
                     self.instr = Some(StateInstrDefault::new(
                         id,
                         instrnr,
                         self.period_helper.clone(),
                         self.rate,
                     ));
+                    // Consume any one-shot S73–S76 override — it
+                    // only affects this one trigger.
+                    self.nna_override = None;
                 }
             }
 
@@ -972,6 +1137,11 @@ impl<'a> Channel<'a> {
 
             self.tickn_update_instr();
         }
+        // Tick ghosts every frame, whether the live voice is present,
+        // delayed, or absent. Ghosts are driven purely by their own
+        // envelope / fadeout state and must not stall just because
+        // the live note is muted or dormant.
+        self.tick_ghosts();
     }
 }
 
@@ -979,16 +1149,39 @@ impl<'a> Iterator for Channel<'a> {
     type Item = (f32, f32);
 
     // Was next_of_sample()
+    //
+    // Folds the live voice's output (if any) together with every
+    // still-sounding ghost voice. Returns `None` only when BOTH are
+    // silent, so a channel whose live note has cut but whose NNA=
+    // Continue ghosts are still singing keeps producing audio.
     fn next(&mut self) -> Option<Self::Item> {
-        match &mut self.instr {
-            Some(i) => match i.next() {
-                Some(fval) => Some((
-                    fval.0 * self.actual_volume[0],
-                    fval.1 * self.actual_volume[1],
-                )),
-                None => None,
-            },
-            None => None,
+        let mut left = 0.0f32;
+        let mut right = 0.0f32;
+        let mut any = false;
+
+        // Live voice.
+        if let Some(i) = &mut self.instr {
+            if let Some((l, r)) = i.next() {
+                left += l * self.actual_volume[0];
+                right += r * self.actual_volume[1];
+                any = true;
+            }
+        }
+
+        // Ghost voices. Each ghost owns its frozen gain / pan, so
+        // we just accumulate.
+        for g in &mut self.ghosts {
+            if let Some((l, r)) = g.next() {
+                left += l;
+                right += r;
+                any = true;
+            }
+        }
+
+        if any {
+            Some((left, right))
+        } else {
+            None
         }
     }
 }
