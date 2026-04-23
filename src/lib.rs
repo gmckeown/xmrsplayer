@@ -47,8 +47,18 @@ pub mod observer;
 /// oscilloscopes, recorders, analyzers).
 pub mod audio_observer;
 
+/// MIDI-side subscription API — `MidiObserver` trait for consumers
+/// of MIDI events emitted by the IT macro interpreter (`Zxx` macros
+/// that encode Note On/Off, CC, Program Change, SysEx, etc.).
+pub mod midi_observer;
+
 /// Built-in observer that prints pattern/row changes. Requires `std`.
 #[cfg(feature = "std")]
 pub mod debug_observer;
+
+/// Built-in MIDI observer that prints MIDI events to stdout. Requires
+/// `std`. Mirrors `debug_observer` but for the `MidiObserver` trait.
+#[cfg(feature = "std")]
+pub mod debug_midi_observer;
 
 pub mod xmrsplayer;

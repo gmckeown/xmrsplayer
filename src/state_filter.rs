@@ -50,6 +50,19 @@ use num_traits::float::Float;
 
 use core::f32::consts::PI;
 
+/// Filter response shape. IT's MIDI-macro `F0 F0 02 xx` selects
+/// between low-pass (default, `xx` bit 4 clear) and high-pass
+/// (`xx` bit 4 set). Bit 5 of `xx` disables the filter entirely
+/// (bypass regardless of cutoff/resonance values).
+///
+/// OpenMPT / Schism support a few more variants (extended filter
+/// modes) that aren't implemented here; they decay to `LowPass`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FilterMode {
+    LowPass,
+    HighPass,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct StateFilter {
     /// Sample rate in Hz.
@@ -57,6 +70,9 @@ pub(crate) struct StateFilter {
     /// `true` when the biquad path is active. When `false`, `process`
     /// returns the input untouched (pass-through).
     pub enabled: bool,
+    /// Response shape — `LowPass` (default) or `HighPass`. Affects
+    /// how `recompute_coefficients` derives the biquad numerator.
+    mode: FilterMode,
     /// Last cutoff register written (0..127). Cached so we can skip
     /// the coefficient recompute when nothing moved.
     cutoff_reg: u8,
@@ -88,6 +104,7 @@ impl StateFilter {
         Self {
             rate,
             enabled: false,
+            mode: FilterMode::LowPass,
             cutoff_reg: 127,
             resonance_reg: 0,
             b0: 1.0,
@@ -170,6 +187,40 @@ impl StateFilter {
         self.recompute_coefficients();
     }
 
+    /// Apply a filter-mode macro byte (`F0 F0 02 xx`).
+    ///
+    /// Bit layout of `xx`:
+    ///   bit 4 (0x10) — high-pass mode when set
+    ///   bit 5 (0x20) — disable filter (bypass)
+    ///
+    /// All other bits are reserved and ignored. Cleared mode bits
+    /// default to low-pass, which is the IT canonical default.
+    ///
+    /// Unlike `set_cutoff_reg` / `set_resonance_reg`, this does NOT
+    /// force-enable the filter — the caller's `xx` can explicitly
+    /// disable via bit 5.
+    pub fn set_mode_from_macro(&mut self, xx: u8) {
+        let disable = xx & 0x20 != 0;
+        let hp = xx & 0x10 != 0;
+
+        if disable {
+            self.enabled = false;
+            return;
+        }
+
+        let new_mode = if hp {
+            FilterMode::HighPass
+        } else {
+            FilterMode::LowPass
+        };
+        if new_mode != self.mode {
+            self.mode = new_mode;
+            if self.enabled {
+                self.recompute_coefficients();
+            }
+        }
+    }
+
     /// Recompute biquad coefficients from the cached `cutoff_reg` /
     /// `resonance_reg`. Called only when those registers change; the
     /// per-sample path never reaches this.
@@ -184,15 +235,25 @@ impl StateFilter {
         let d = powf(10.0, -(self.resonance_reg as f32) * 24.0 / (128.0 * 20.0));
         let q = (1.0 / (2.0 * d)).max(0.707);
 
-        // RBJ cookbook LPF.
+        // RBJ cookbook — shared poles (a1, a2 and the normalising
+        // a0). The numerator (b0..b2) switches on mode: LPF uses
+        // `(1 - cos_w) * {0.5, 1.0, 0.5}`, HPF uses `(1 + cos_w) *
+        // {0.5, -1.0, 0.5}`.
         let omega = 2.0 * PI * fc / self.rate;
         let sin_w = sinf(omega);
         let cos_w = cosf(omega);
         let alpha = sin_w / (2.0 * q);
 
-        let b0 = (1.0 - cos_w) * 0.5;
-        let b1 = 1.0 - cos_w;
-        let b2 = (1.0 - cos_w) * 0.5;
+        let (b0, b1, b2) = match self.mode {
+            FilterMode::LowPass => {
+                let k = (1.0 - cos_w) * 0.5;
+                (k, 1.0 - cos_w, k)
+            }
+            FilterMode::HighPass => {
+                let k = (1.0 + cos_w) * 0.5;
+                (k, -(1.0 + cos_w), k)
+            }
+        };
         let a0 = 1.0 + alpha;
         let a1 = -2.0 * cos_w;
         let a2 = 1.0 - alpha;

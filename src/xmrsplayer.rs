@@ -19,6 +19,7 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use xmrs::prelude::*;
 
 use crate::audio_observer::{ChannelsContext, ChannelsObserver, MixContext, MixObserver};
+use crate::midi_observer::MidiObserver;
 use crate::observer::{PatternChangeContext, PlayerObserver, RowContext, TickContext};
 use crate::sequencer::{Sequencer, TickOutcome};
 use crate::voices::Voices;
@@ -43,6 +44,12 @@ pub struct XmrsPlayer<'a> {
     /// the capture path in `Voices::mix` is gated on this list being
     /// non-empty to avoid paying the per-channel write cost otherwise.
     audio_channels_observers: Vec<Box<dyn ChannelsObserver + Send>>,
+
+    /// MIDI observers subscribed to MIDI events emitted by the macro
+    /// interpreter. Called per-event during `process_row` dispatch.
+    /// Per-row frequency is very low (at most a handful of macros
+    /// per row); no hot-path gating needed.
+    midi_observers: Vec<Box<dyn MidiObserver + Send>>,
 
     /// Scratch buffer that `Voices::mix` fills when the channels-observer
     /// list is non-empty. Pre-allocated to `num_channels` at construction
@@ -97,6 +104,7 @@ impl<'a> XmrsPlayer<'a> {
             observers: Vec::new(),
             audio_mix_observers: Vec::new(),
             audio_channels_observers: Vec::new(),
+            midi_observers: Vec::new(),
             per_channel_buffer: vec![(0.0, 0.0); num_channels],
             remaining_samples_in_tick: 0.0,
             sample_rate,
@@ -169,6 +177,30 @@ impl<'a> XmrsPlayer<'a> {
     /// Number of currently registered channels observers.
     pub fn audio_channels_observer_count(&self) -> usize {
         self.audio_channels_observers.len()
+    }
+
+    // --- MIDI observer registration ---
+
+    /// Register an observer for MIDI events emitted by the macro
+    /// interpreter. Called once per event, in order, after each row
+    /// has been processed. See [`MidiObserver`] for the contract.
+    ///
+    /// MIDI events are generated only by IT modules that embed MIDI
+    /// macros and trigger them via `Zxx` / `SFx`. Registering an
+    /// observer on a non-IT module or an IT module without macros
+    /// costs nothing at runtime — the buffer stays empty.
+    pub fn add_midi_observer(&mut self, observer: Box<dyn MidiObserver + Send>) {
+        self.midi_observers.push(observer);
+    }
+
+    /// Remove every registered MIDI observer.
+    pub fn clear_midi_observers(&mut self) {
+        self.midi_observers.clear();
+    }
+
+    /// Number of currently registered MIDI observers.
+    pub fn midi_observer_count(&self) -> usize {
+        self.midi_observers.len()
     }
 
     // --- Mute helpers (delegated to voices) ---
@@ -316,6 +348,25 @@ impl<'a> XmrsPlayer<'a> {
 
                     // 1. Voices (the built-in row consumer) processes the row.
                     self.voices.process_row(cells);
+
+                    // 1b. Drain MIDI events the macro interpreter
+                    //     produced during the row and dispatch to
+                    //     any registered MIDI observers. Done here
+                    //     (not per-tick) because macros only fire
+                    //     at row-start.
+                    if !self.midi_observers.is_empty() {
+                        for (src_ch, event) in self.voices.drain_midi_events() {
+                            for obs in &mut self.midi_observers {
+                                obs.on_midi_event(&event, src_ch);
+                            }
+                        }
+                    } else {
+                        // Still drain so the buffer doesn't grow —
+                        // `process_row` clears at entry too, but an
+                        // unsubscribed drain here keeps the two
+                        // paths consistent.
+                        self.voices.drain_midi_events().for_each(drop);
+                    }
 
                     // 2. User observers: on_pattern_change first (if
                     //    applicable), then on_row.

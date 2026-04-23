@@ -14,6 +14,7 @@ use crate::effect_vibrato_tremolo::EffectVibratoTremolo;
 use crate::triggerkeep::*;
 
 use crate::helper::*;
+use crate::midi_observer::MidiEvent;
 use crate::state_instr_default::StateInstrDefault;
 use crate::voice::{Voice, MAX_GHOST_VOICES_PER_CHANNEL};
 use xmrs::prelude::*;
@@ -284,21 +285,22 @@ impl<'a> Channel<'a> {
     ///
     /// # What's interpreted
     ///
-    /// Only IT's internal filter-control frames are recognised:
-    ///
-    /// ```text
-    /// F0 F0 00 xx   — set filter cutoff to xx
-    /// F0 F0 01 xx   — set filter resonance to xx
-    /// ```
+    /// IT's internal filter-control frames (`F0 F0 00/01 xx`) drive
+    /// the per-voice resonant filter directly. Standard MIDI channel
+    /// messages (`8n..En` status bytes) are packaged as
+    /// [`MidiEvent`]s and pushed into `out_events`; the facade then
+    /// drains that buffer to any subscribed [`MidiObserver`]. SysEx
+    /// (`F0 .. F7`, except the IT-internal `F0 F0` prefix) is passed
+    /// through as [`MidiEvent::SysEx`].
     ///
     /// The literal byte `z` (0x7A) anywhere in a macro is replaced
-    /// by the `Zxx` parameter before frame parsing — that's how a
-    /// macro like "F0 F0 00 z" becomes "set cutoff to Zxx's param".
-    ///
-    /// Everything else in the macro (MIDI OUT, SysEx, user-defined
-    /// non-filter commands) is silently ignored — the xmrsplayer
-    /// engine has no MIDI-out bus.
-    pub(crate) fn apply_midi_macro(&mut self, macro_type: MidiMacroType) {
+    /// by the `Zxx` parameter before frame parsing.
+    pub(crate) fn apply_midi_macro(
+        &mut self,
+        macro_type: MidiMacroType,
+        ch_index: usize,
+        out_events: &mut alloc::vec::Vec<(usize, MidiEvent)>,
+    ) {
         match macro_type {
             MidiMacroType::SelectParametric(idx) => {
                 // SFx — just stash the selector. The macro only
@@ -313,7 +315,7 @@ impl<'a> Channel<'a> {
                 let Some(bytes) = macros.parametric.get(self.midi_parametric_selector) else {
                     return;
                 };
-                self.interpret_macro_bytes(bytes.clone(), z);
+                self.interpret_macro_bytes(bytes.clone(), z, ch_index, out_events);
             }
             MidiMacroType::Fixed { idx, z } => {
                 let Some(macros) = &self.module.midi_macros else {
@@ -322,15 +324,23 @@ impl<'a> Channel<'a> {
                 let Some(bytes) = macros.fixed.get(idx) else {
                     return;
                 };
-                self.interpret_macro_bytes(bytes.clone(), z);
+                self.interpret_macro_bytes(bytes.clone(), z, ch_index, out_events);
             }
         }
     }
 
     /// Walk the macro byte stream, substituting `z` (0x7A) with the
-    /// Zxx parameter, and interpret any 4-byte filter frame we
-    /// recognise. Non-frame bytes are skipped.
-    fn interpret_macro_bytes(&mut self, mut bytes: alloc::vec::Vec<u8>, z_value: u8) {
+    /// Zxx parameter, and interpret each recognised message.
+    /// `F0 F0 sub val` is consumed for internal filter control;
+    /// standard MIDI channel messages and SysEx are packaged into
+    /// `out_events` for external dispatch.
+    fn interpret_macro_bytes(
+        &mut self,
+        mut bytes: alloc::vec::Vec<u8>,
+        z_value: u8,
+        ch_index: usize,
+        out_events: &mut alloc::vec::Vec<(usize, MidiEvent)>,
+    ) {
         // In-place `z` substitution — the macro byte 0x7A is the
         // ASCII letter `z`, which Schism Tracker / OpenMPT / IT use
         // as a parameter placeholder inside a macro string.
@@ -340,34 +350,185 @@ impl<'a> Channel<'a> {
             }
         }
 
-        // Scan for recognised 4-byte frames starting with F0 F0.
-        // IT's default filter macros are exactly this shape:
-        //   F0 F0 00 cutoff
-        //   F0 F0 01 resonance
         let mut i = 0;
-        while i + 3 < bytes.len() {
-            if bytes[i] == 0xF0 && bytes[i + 1] == 0xF0 {
-                let sub = bytes[i + 2];
-                let val = bytes[i + 3];
-                match sub {
-                    0x00 => {
-                        if let Some(instr) = &mut self.instr {
-                            instr.filter.set_cutoff_reg(val);
-                        }
+        while i < bytes.len() {
+            let b = bytes[i];
+            match b {
+                // IT internal filter command: `F0 F0 sub val`. The
+                // `F0 F0` prefix is distinctive because real MIDI
+                // SysEx is `F0 .. F7`, never `F0 F0` back-to-back.
+                0xF0 if i + 1 < bytes.len() && bytes[i + 1] == 0xF0 => {
+                    if i + 3 >= bytes.len() {
+                        break; // incomplete frame
                     }
-                    0x01 => {
-                        if let Some(instr) = &mut self.instr {
-                            instr.filter.set_resonance_reg(val);
+                    let sub = bytes[i + 2];
+                    let val = bytes[i + 3];
+                    match sub {
+                        0x00 => {
+                            if let Some(instr) = &mut self.instr {
+                                instr.filter.set_cutoff_reg(val);
+                            }
                         }
+                        0x01 => {
+                            if let Some(instr) = &mut self.instr {
+                                instr.filter.set_resonance_reg(val);
+                            }
+                        }
+                        0x02 => {
+                            // Filter mode: bit 4 = HPF, bit 5 =
+                            // disable. Implementation details in
+                            // `StateFilter::set_mode_from_macro`.
+                            if let Some(instr) = &mut self.instr {
+                                instr.filter.set_mode_from_macro(val);
+                            }
+                        }
+                        // 0x03..0x7F reserved.
+                        _ => {}
                     }
-                    // 0x02 = filter mode, 0x03..0x7F = reserved /
-                    // extended. Not handled yet — the most common
-                    // macros are cutoff + resonance above.
-                    _ => {}
+                    i += 4;
                 }
-                i += 4;
-            } else {
-                i += 1;
+
+                // 8n nn vv — Note Off (3 bytes)
+                0x80..=0x8F => {
+                    if i + 2 >= bytes.len() {
+                        break;
+                    }
+                    out_events.push((
+                        ch_index,
+                        MidiEvent::NoteOff {
+                            channel: b & 0x0F,
+                            note: bytes[i + 1] & 0x7F,
+                            velocity: bytes[i + 2] & 0x7F,
+                        },
+                    ));
+                    i += 3;
+                }
+
+                // 9n nn vv — Note On (3 bytes). Velocity 0 collapses
+                // to Note Off per MIDI convention.
+                0x90..=0x9F => {
+                    if i + 2 >= bytes.len() {
+                        break;
+                    }
+                    let vel = bytes[i + 2] & 0x7F;
+                    let note = bytes[i + 1] & 0x7F;
+                    let channel = b & 0x0F;
+                    let ev = if vel == 0 {
+                        MidiEvent::NoteOff {
+                            channel,
+                            note,
+                            velocity: 0,
+                        }
+                    } else {
+                        MidiEvent::NoteOn {
+                            channel,
+                            note,
+                            velocity: vel,
+                        }
+                    };
+                    out_events.push((ch_index, ev));
+                    i += 3;
+                }
+
+                // An nn pp — Polyphonic Aftertouch (3 bytes)
+                0xA0..=0xAF => {
+                    if i + 2 >= bytes.len() {
+                        break;
+                    }
+                    out_events.push((
+                        ch_index,
+                        MidiEvent::PolyAftertouch {
+                            channel: b & 0x0F,
+                            note: bytes[i + 1] & 0x7F,
+                            pressure: bytes[i + 2] & 0x7F,
+                        },
+                    ));
+                    i += 3;
+                }
+
+                // Bn cc vv — Control Change (3 bytes)
+                0xB0..=0xBF => {
+                    if i + 2 >= bytes.len() {
+                        break;
+                    }
+                    out_events.push((
+                        ch_index,
+                        MidiEvent::ControlChange {
+                            channel: b & 0x0F,
+                            controller: bytes[i + 1] & 0x7F,
+                            value: bytes[i + 2] & 0x7F,
+                        },
+                    ));
+                    i += 3;
+                }
+
+                // Cn pp — Program Change (2 bytes)
+                0xC0..=0xCF => {
+                    if i + 1 >= bytes.len() {
+                        break;
+                    }
+                    out_events.push((
+                        ch_index,
+                        MidiEvent::ProgramChange {
+                            channel: b & 0x0F,
+                            program: bytes[i + 1] & 0x7F,
+                        },
+                    ));
+                    i += 2;
+                }
+
+                // Dn pp — Channel Aftertouch (2 bytes)
+                0xD0..=0xDF => {
+                    if i + 1 >= bytes.len() {
+                        break;
+                    }
+                    out_events.push((
+                        ch_index,
+                        MidiEvent::ChannelAftertouch {
+                            channel: b & 0x0F,
+                            pressure: bytes[i + 1] & 0x7F,
+                        },
+                    ));
+                    i += 2;
+                }
+
+                // En ll mm — Pitch Bend (3 bytes, 14-bit assembled)
+                0xE0..=0xEF => {
+                    if i + 2 >= bytes.len() {
+                        break;
+                    }
+                    let lsb = (bytes[i + 1] & 0x7F) as u16;
+                    let msb = (bytes[i + 2] & 0x7F) as u16;
+                    out_events.push((
+                        ch_index,
+                        MidiEvent::PitchBend {
+                            channel: b & 0x0F,
+                            value: lsb | (msb << 7),
+                        },
+                    ));
+                    i += 3;
+                }
+
+                // F0 .. F7 — SysEx (non-IT-internal; `F0 F0` handled
+                // above). Collect bytes until F7 or end of macro.
+                0xF0 => {
+                    // Accumulate the SysEx including the leading F0
+                    // but stopping before F7.
+                    let start = i;
+                    let mut end = start + 1;
+                    while end < bytes.len() && bytes[end] != 0xF7 {
+                        end += 1;
+                    }
+                    let payload = bytes[start..end].to_vec();
+                    out_events.push((ch_index, MidiEvent::SysEx(payload)));
+                    // Skip past F7 if present, else end-of-stream.
+                    i = if end < bytes.len() { end + 1 } else { end };
+                }
+
+                // Non-status bytes (< 0x80) or unrecognised — skip
+                // one byte forward. Some macros use arbitrary data
+                // bytes as padding between commands.
+                _ => i += 1,
             }
         }
     }

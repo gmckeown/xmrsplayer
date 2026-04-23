@@ -16,6 +16,7 @@
 //! leaves those alone because they belong to the mixer, not to navigation.
 
 use crate::channel::Channel;
+use crate::midi_observer::MidiEvent;
 use crate::triggerkeep::TRIGGER_KEEP_PERIOD;
 use alloc::{vec, vec::Vec};
 use xmrs::prelude::*;
@@ -49,6 +50,12 @@ pub struct Voices<'a> {
     /// `process_tick` to decide whether to apply the rolling slide. The
     /// fine/non-fine distinction is handled through `volume_slide_fine`.
     row_has_global_volume_slide: bool,
+
+    /// MIDI events emitted by macros on the current row. Filled during
+    /// `apply_row_global_effects` and drained by the facade, which
+    /// dispatches to any registered [`MidiObserver`]. The buffer is
+    /// re-used across rows — cleared on entry to each `process_row`.
+    pending_midi_events: Vec<(usize, MidiEvent)>,
 }
 
 impl<'a> Voices<'a> {
@@ -62,6 +69,7 @@ impl<'a> Voices<'a> {
             volume_slide_speed: 0.0,
             volume_slide_fine: true,
             row_has_global_volume_slide: false,
+            pending_midi_events: Vec::new(),
         }
     }
 
@@ -131,6 +139,11 @@ impl<'a> Voices<'a> {
         // sliding on subsequent ticks.
         self.row_has_global_volume_slide = cells.iter().any(|cell| cell.has_global_volume_slide());
 
+        // MIDI event buffer is per-row — the facade drains it after
+        // processing. Clearing here so leftovers from a previous row
+        // don't re-emit.
+        self.pending_midi_events.clear();
+
         let n = self.channel.len().min(cells.len());
         for i in 0..n {
             let cell = &cells[i];
@@ -165,13 +178,21 @@ impl<'a> Voices<'a> {
                 }
                 GlobalEffect::MidiMacro(macro_type) => {
                     if let Some(ch) = self.channel.get_mut(ch_index) {
-                        ch.apply_midi_macro(macro_type);
+                        ch.apply_midi_macro(macro_type, ch_index, &mut self.pending_midi_events);
                     }
                 }
                 // Everything else is owned by the sequencer.
                 _ => {}
             }
         }
+    }
+
+    /// Drain all MIDI events emitted during the most recent row.
+    /// Returns an iterator yielding `(source_channel, event)` tuples.
+    /// The facade calls this after `process_row` and forwards each
+    /// event to every registered [`MidiObserver`].
+    pub(crate) fn drain_midi_events(&mut self) -> alloc::vec::Drain<'_, (usize, MidiEvent)> {
+        self.pending_midi_events.drain(..)
     }
 
     /// Advance every channel by one sustained (non-row-start) tick.
