@@ -179,12 +179,12 @@ fn rodio_play(
     )));
     {
         let mut player_lock = player.lock().unwrap();
-        player_lock.amplification = amplification;
+        player_lock.set_amplification(amplification);
         if debug {
             println!("Debug on");
             println!("Module format: {:?}", module.format);
+            player_lock.add_observer(Box::new(DebugObserver::new()));
         }
-        player_lock.debug(debug);
         if ch != 0 {
             player_lock.mute_all(true);
             player_lock.set_mute_channel((ch - 1).into(), false);

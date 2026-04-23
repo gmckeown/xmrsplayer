@@ -1,55 +1,62 @@
-use crate::channel::Channel;
-use crate::triggerkeep::*;
-use alloc::{vec, vec::Vec};
+//! Top-level player facade.
+//!
+//! `XmrsPlayer` is a thin wrapper that glues three orthogonal pieces together:
+//!
+//! * a [`Sequencer`] — owns the song cursor, the tick clock, and every
+//!   navigation/tempo effect;
+//! * a [`Voices`] engine — owns the per-channel audio state and the
+//!   mixer. Structurally it is the *default row observer*, but it's held
+//!   concretely (not through `dyn`) so the audio hot path keeps every
+//!   opportunity for the compiler to inline;
+//! * a vector of user-registered [`PlayerObserver`] trait objects — the
+//!   "anyone can subscribe" slot: UI synchronisers, MIDI bridges, probes…
+//!
+//! The public API mirrors pre-0.10 `XmrsPlayer` method-for-method so existing
+//! callers don't need to change anything beyond a handful of field accesses
+//! that have moved to accessors (see `OBSERVERS.md`).
+
+use alloc::{boxed::Box, vec, vec::Vec};
 use xmrs::prelude::*;
 
+use crate::observer::{PatternChangeContext, PlayerObserver, RowContext, TickContext};
+use crate::sequencer::{Sequencer, TickOutcome};
+use crate::voices::Voices;
+
 pub struct XmrsPlayer<'a> {
+    /// The module being played. Kept public because it's an immutable
+    /// borrow supplied by the caller — `&Module` has no invariant the
+    /// player owns, so there's nothing to guard.
     pub module: &'a Module,
-    pub current_song: usize,
+
+    sequencer: Sequencer<'a>,
+    voices: Voices<'a>,
+
+    observers: Vec<Box<dyn PlayerObserver + Send>>,
+
+    /// Facade-owned sample clock: fractional samples remaining before the
+    /// next song tick boundary. Decremented once per sample; when it
+    /// reaches 0 we step the sequencer.
+    remaining_samples_in_tick: f32,
     sample_rate: f32,
 
-    tempo: usize,
-    bpm: usize,
-    /// Global volume: 0.0 to 1.0
-    pub global_volume: f32,
-    effect_volume_slide_speed: f32,
-    effect_volume_slide_fine: bool,
-    /// Global amplification (default 1.0)
-    pub amplification: f32,
-    current_table_index: usize,
-    current_row: usize,
-    current_tick: usize,
-    /// sample rate / (BPM * 0.4)
-    remaining_samples_in_tick: f32,
-    /// +1 for a (left,right) sample
-    pub generated_samples: u64,
+    /// Running total of stereo samples produced. Exposed read-only — writing
+    /// it from outside would desync the internal clock, which is why the
+    /// pre-0.10 public field has become an accessor.
+    generated_samples: u64,
 
-    position_jump: bool,
-    pattern_break: bool,
-    jump_dest: usize,
-    jump_row: usize,
-
-    /// Extra ticks to be played before going to the next row - Used for EEy effect
-    extra_ticks: usize,
-
-    pub channel: Vec<Channel<'a>>,
-
-    /// Last tempo value propagated to per-channel state
-    /// (`EffectArpeggio`). Tracked so the per-step propagation loop is
-    /// skipped when tempo has not actually changed — which is the
-    /// common case, since Fxx landing on a row is rare.
+    /// Last tempo value propagated to per-channel arpeggio state. The per-
+    /// step propagation loop is skipped when tempo has not actually changed.
     last_propagated_tempo: usize,
 
-    row_loop_count: Vec<Vec<usize>>,
-    loop_count: usize,
-    max_loop_count: usize,
-
-    /// None if next-one is a left sample, else right sample
+    /// `None` when the next `Iterator::next()` should pull a new stereo
+    /// sample; `Some(r)` when we already produced the left half and owe
+    /// the caller the right.
     right_sample: Option<f32>,
-    #[cfg(feature = "std")]
-    debug: bool,
 
     pause: bool,
+
+    /// `on_song_end` must fire at most once per song-termination event.
+    song_end_notified: bool,
 }
 
 impl<'a> XmrsPlayer<'a> {
@@ -60,490 +67,325 @@ impl<'a> XmrsPlayer<'a> {
     /// overflow, K00-eats-note, vol-col `Bx` advancing the vibrato —
     /// is driven entirely by `module.format`. `ModuleFormat::Xm`
     /// activates the canonical FT2 reference behaviour, all other
-    /// formats use their own native semantics. There is no longer a
-    /// separate `ft2_quirks` flag: the format IS the switch.
-    ///
-    /// If you want FT2-style playback on a module carrying a non-Xm
-    /// format tag (unusual — typically a hand-authored module against
-    /// an FT2-style player), just set `module.format = ModuleFormat::Xm`
-    /// before constructing the player.
+    /// formats use their own native semantics.
     pub fn new(module: &'a Module, sample_rate: f32, song: usize) -> Self {
-        let num_channels = module.get_num_channels();
+        let sequencer = Sequencer::new(module, song);
+        let voices = Voices::new(module, sample_rate, module.default_tempo);
 
-        let current_song = if song < module.pattern_order.len() {
-            song
-        } else {
-            0
-        };
-
-        let mut player = Self {
+        Self {
             module,
-            current_song,
-            sample_rate,
-            tempo: module.default_tempo,
-            bpm: module.default_bpm,
-            global_volume: 1.0,
-            amplification: 1.0,
-            row_loop_count: vec![vec![0; MAX_NUM_ROWS]; module.get_song_length(current_song)],
-            effect_volume_slide_speed: 0.0,
-            effect_volume_slide_fine: true,
-            current_table_index: 0,
-            current_row: 0,
-            current_tick: 0,
+            last_propagated_tempo: sequencer.tempo(),
+            sequencer,
+            voices,
+            observers: Vec::new(),
             remaining_samples_in_tick: 0.0,
+            sample_rate,
             generated_samples: 0,
-            position_jump: false,
-            pattern_break: false,
-            jump_dest: 0,
-            jump_row: 0,
-            extra_ticks: 0,
-            channel: vec![],
-            last_propagated_tempo: module.default_tempo,
-            loop_count: 0,
-            max_loop_count: 0,
             right_sample: None,
-            #[cfg(feature = "std")]
-            debug: false,
             pause: false,
-        };
-
-        player.channel =
-            vec![Channel::new(module, sample_rate, module.default_tempo); num_channels];
-
-        player
+            song_end_notified: false,
+        }
     }
 
-    #[cfg(feature = "std")]
-    pub fn debug(&mut self, debug: bool) {
-        self.debug = debug;
+    // --- Observer registration ---
+
+    /// Register an observer that will receive row/tick/pattern-change events
+    /// until the player is dropped or [`clear_observers`](Self::clear_observers)
+    /// is called. Observers are invoked in registration order.
+    ///
+    /// The `Send` bound comes from the typical deployment pattern — the
+    /// player is wrapped in `Arc<Mutex<_>>` and shared with an audio
+    /// callback thread — which requires every owned field to cross thread
+    /// boundaries. See the `PlayerObserver` trait docs for details.
+    pub fn add_observer(&mut self, observer: Box<dyn PlayerObserver + Send>) {
+        self.observers.push(observer);
     }
+
+    /// Remove every registered observer. Does not affect the built-in voices
+    /// engine, which is not an observer from the type system's perspective —
+    /// it is always driven directly by the facade.
+    pub fn clear_observers(&mut self) {
+        self.observers.clear();
+    }
+
+    /// Number of currently registered observers (excluding the built-in
+    /// voices engine).
+    pub fn observer_count(&self) -> usize {
+        self.observers.len()
+    }
+
+    // --- Mute helpers (delegated to voices) ---
 
     pub fn set_mute_channel(&mut self, channel_num: usize, mute: bool) {
-        if channel_num < self.channel.len() {
-            self.channel[channel_num].muted = mute;
-        }
+        self.voices.set_mute_channel(channel_num, mute);
     }
 
     pub fn mute_all(&mut self, mute: bool) {
-        for c in &mut self.channel {
-            c.muted = mute;
-        }
+        self.voices.mute_all(mute);
     }
 
+    // --- Loop / pause ---
+
     pub fn set_max_loop_count(&mut self, max_loop_count: usize) {
-        self.max_loop_count = max_loop_count;
+        self.sequencer.set_max_loop_count(max_loop_count);
     }
 
     pub fn get_loop_count(&self) -> usize {
-        self.loop_count
+        self.sequencer.loop_count()
     }
+
+    /// Force pause, returning (0.0, 0.0) samples. While paused, neither the
+    /// sequencer nor voices advance, so observers see no events.
+    pub fn pause(&mut self, pause: bool) {
+        self.pause = pause;
+    }
+
+    // --- Clock / cursor accessors (preserve pre-0.10 API) ---
 
     pub fn get_sample_rate(&self) -> f32 {
         self.sample_rate
     }
 
     pub fn get_tempo(&self) -> usize {
-        self.tempo
+        self.sequencer.tempo()
     }
 
     pub fn get_bpm(&self) -> usize {
-        self.bpm
+        self.sequencer.bpm()
     }
 
-    /// Jump to row at index table_position in pattern_order at speed
-    /// if speed == 0, resets to default speed
-    pub fn goto(&mut self, table_position: usize, row: usize, speed: usize) -> bool {
-        if table_position < self.module.get_song_length(self.current_song) {
-            let num_row = self.module.pattern_order[self.current_song][table_position];
-            if row < self.module.get_num_rows(num_row) {
-                // Create a position jump
-                self.jump_dest = table_position;
-                self.jump_row = row;
-                self.position_jump = true;
-
-                // Cleanup self
-                self.tempo = if speed == 0 {
-                    self.module.default_tempo
-                } else {
-                    speed
-                };
-                self.bpm = self.module.default_bpm;
-                self.global_volume = 1.0;
-
-                // Cleanup channels
-                let num_channels = self.module.get_num_channels();
-                for i in 0..num_channels {
-                    self.channel[i].trigger_pitch(TRIGGER_KEEP_PERIOD); // clean what we can
-                }
-
-                // next() must call tick() then row()
-                self.remaining_samples_in_tick = 0.0;
-                self.current_tick = 0;
-
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    }
-
-    /// Returns current pattern number in pattern_order
+    /// Returns current pattern number in pattern_order.
     pub fn get_current_pattern(&self) -> usize {
-        self.module.pattern_order[self.current_song][self.current_table_index]
+        self.sequencer.current_pattern()
     }
 
-    /// Returns current index in pattern_order
+    /// Returns current index in pattern_order.
     pub fn get_current_table_index(&self) -> usize {
-        self.current_table_index
+        self.sequencer.current_table_index()
     }
 
-    /// Returns current row
+    /// Returns current row (matches pre-0.10 off-by-one semantic: this is
+    /// the index of the *next* row to load once the current row's tick
+    /// cycle wraps. For the row currently sounding, use
+    /// [`playing_row`](Self::playing_row) instead).
     pub fn get_current_row(&self) -> usize {
-        self.current_row
+        self.sequencer.current_row()
     }
 
-    /// Force pause, returning (0.0, 0.0) samples
-    pub fn pause(&mut self, pause: bool) {
-        self.pause = pause;
+    /// Row currently sounding — stable for the duration of the row's tick
+    /// cycle. Prefer this over `get_current_row` when you want what the
+    /// listener is hearing *right now*.
+    pub fn playing_row(&self) -> usize {
+        self.sequencer.playing_row()
     }
 
-    fn post_pattern_change(&mut self) {
-        /* Loop if necessary */
-        if self.current_table_index >= self.module.pattern_order[self.current_song].len() {
-            self.current_table_index = self.module.restart_position;
-        }
-
-        #[cfg(feature = "std")]
-        if self.debug {
-            println!(
-                "pattern_order[0x{:03x}] = 0x{:03x}",
-                self.current_table_index,
-                self.module.pattern_order[self.current_song][self.current_table_index]
-            );
-        }
+    /// Pattern of the row currently sounding.
+    pub fn playing_pattern(&self) -> usize {
+        self.sequencer.playing_pattern()
     }
 
-    fn tick0_global_effects(&mut self, ch_index: usize) {
-        let ch = &mut self.channel[ch_index];
-        let pattern_slot = &ch.current;
-
-        for gfx in pattern_slot.global_effects.clone() {
-            match gfx {
-                GlobalEffect::Bpm(bpm) => {
-                    self.bpm = bpm;
-                }
-                GlobalEffect::BpmSlide(_value) => {
-                    #[cfg(feature = "demo")]
-                    println!("BpmSlide");
-                    todo!();
-                }
-                GlobalEffect::MidiMacro(_m) => {
-                    #[cfg(feature = "demo")]
-                    println!("MidiMacro");
-                    todo!();
-                }
-                GlobalEffect::PatternBreak(position) => {
-                    self.pattern_break = true;
-                    self.jump_row = position;
-                }
-                GlobalEffect::PatternDelay {
-                    quantity: q,
-                    tempo: t,
-                } => self.extra_ticks = if t { q * self.tempo } else { q },
-                GlobalEffect::PatternLoop(value) => {
-                    if value != 0 {
-                        if value == ch.pattern_loop_count {
-                            // Loop is over
-                            ch.pattern_loop_count = 0;
-                            if self.module.quirks.pattern_loop_resumes {
-                                // ST3 `s_patloop` (digcmd.c:1003):
-                                // when the loop finishes, the next
-                                // row becomes the new loop start. If
-                                // a second SBx appears later in the
-                                // same pattern without a fresh SB0,
-                                // it will naturally loop from just
-                                // after the previous loop's end
-                                // instead of re-using the original
-                                // origin. FT2 doesn't do this; S3M
-                                // modules do rely on it.
-                                ch.pattern_loop_origin = self.current_row + 1;
-                            }
-                        } else {
-                            // Jump to the beginning of the loop
-                            ch.pattern_loop_count += 1;
-                            self.position_jump = true;
-                            self.jump_row = ch.pattern_loop_origin;
-                            self.jump_dest = self.current_table_index;
-                        }
-                    } else {
-                        // Set loop start point
-                        ch.pattern_loop_origin = self.current_row;
-                        if self.module.quirks.e60_leaks_to_next_pattern {
-                            // Replicate FT2 E60 bug: in FT2, E60 not
-                            // only sets the per-channel loop origin,
-                            // it ALSO leaks that row number into the
-                            // song's pBreakPos. When the pattern then
-                            // ends naturally, the next pattern starts
-                            // at pBreakPos instead of row 0. Some XM
-                            // modules rely on this; canonical XM
-                            // playback needs to reproduce it.
-                            self.jump_row = ch.pattern_loop_origin;
-                        }
-                    }
-                }
-                GlobalEffect::PositionJump(position) => {
-                    if position < self.module.pattern_order[self.current_song].len() {
-                        self.position_jump = true;
-                        self.jump_dest = position;
-                        self.jump_row = 0;
-                    }
-                }
-                GlobalEffect::Speed(speed) => {
-                    self.tempo = speed;
-                }
-                GlobalEffect::Volume(volume) => {
-                    self.global_volume = volume.clamp(0.0, 1.0);
-                }
-                GlobalEffect::VolumeSlide { speed: s, fine: f } => {
-                    if f {
-                        // Fine slide: apply once at tick 0.
-                        self.global_volume = (self.global_volume + s).clamp(0.0, 1.0);
-                    }
-                    // Save speed for non-fine application during subsequent ticks.
-                    self.effect_volume_slide_speed = s;
-                    self.effect_volume_slide_fine = f;
-                }
-            }
-        }
+    pub fn current_song(&self) -> usize {
+        self.sequencer.current_song()
     }
 
-    fn tick0(&mut self) {
-        if self.position_jump {
-            self.current_table_index = self.jump_dest;
-            self.current_row = self.jump_row;
-            self.position_jump = false;
-            self.pattern_break = false;
-            self.jump_row = 0;
-            self.post_pattern_change();
-        } else if self.pattern_break {
-            self.current_table_index += 1;
-            self.current_row = self.jump_row;
-            self.pattern_break = false;
-            self.jump_row = 0;
-            self.post_pattern_change();
-        }
-
-        let pat_idx_temp = self.module.pattern_order[self.current_song][self.current_table_index];
-        let pat_idx = if pat_idx_temp < self.module.pattern.len() {
-            pat_idx_temp
-        } else {
-            // empty pattern, returning to zero
-            self.current_table_index = 0;
-            self.module.pattern_order[self.current_song][self.current_table_index]
-        };
-
-        let num_channels = self.module.get_num_channels();
-        let mut in_a_loop = false;
-
-        let current_row = self.current_row;
-        #[cfg(feature = "std")]
-        if self.debug {
-            print!("{:03X} ", current_row);
-        }
-        for ch_index in 0..num_channels {
-            let ps = &self.module.pattern[pat_idx][current_row][ch_index];
-            #[cfg(feature = "std")]
-            if self.debug {
-                print!("{:?} ", ps.note);
-            }
-            self.channel[ch_index].tick0(ps);
-            self.tick0_global_effects(ch_index);
-            if !in_a_loop && self.channel[ch_index].pattern_loop_count > 0 {
-                in_a_loop = true;
-            }
-        }
-        #[cfg(feature = "std")]
-        if self.debug {
-            println!();
-        }
-
-        if !in_a_loop {
-            /* No E6y loop is in effect (or we are in the first pass) */
-            self.loop_count = self.row_loop_count[self.current_table_index][self.current_row];
-            self.row_loop_count[self.current_table_index][self.current_row] += 1;
-        }
-
-        // `current_row` is a `usize`, so the wrap-to-0 branch below cannot
-        // fire in practice (pattern lengths are bounded well below usize::MAX).
-        // A previous comment speculated about shrinking this field to `u8`
-        // and wanted the wrap to push us into the next pattern; if that ever
-        // happens, reintroduce the `== 0` guard in the condition below.
-        self.current_row += 1;
-        let pattern_len = self.module.pattern[pat_idx].len();
-
-        if !self.position_jump && !self.pattern_break && self.current_row >= pattern_len {
-            self.current_table_index += 1;
-            self.current_row = self.jump_row; /* This will be 0 most of
-                                               * the time, except when E60
-                                               * is used */
-            self.jump_row = 0;
-            self.post_pattern_change();
-        }
+    pub fn generated_samples(&self) -> u64 {
+        self.generated_samples
     }
 
-    fn tick(&mut self) {
-        // Detect whether any channel carries a global volume slide this row.
-        // The global slide must be applied at most once per tick, not once per channel.
-        let any_global_slide = self
-            .channel
-            .iter()
-            .any(|ch| ch.current.has_global_volume_slide());
+    // --- Global gain accessors (replace pre-0.10 `pub` fields) ---
 
-        for ch in &mut self.channel {
-            ch.tick(self.current_tick);
-        }
-
-        // tick() is only called for current_tick != 0, so no extra guard needed here.
-        // Fine slides were already applied in tick0_global_effects.
-        if any_global_slide && !self.effect_volume_slide_fine {
-            self.global_volume =
-                (self.global_volume + self.effect_volume_slide_speed).clamp(0.0, 1.0);
-        }
+    pub fn global_volume(&self) -> f32 {
+        self.voices.global_volume()
     }
 
-    fn step(&mut self) {
+    pub fn set_global_volume(&mut self, v: f32) {
+        self.voices.set_global_volume(v);
+    }
+
+    pub fn amplification(&self) -> f32 {
+        self.voices.amplification()
+    }
+
+    pub fn set_amplification(&mut self, a: f32) {
+        self.voices.set_amplification(a);
+    }
+
+    // --- Navigation (goto) ---
+
+    /// Jump to row at index `table_position` in pattern_order, at `speed`.
+    /// If `speed == 0`, resets to the module's default speed.
+    ///
+    /// Returns `false` if the target is out of range.
+    pub fn goto(&mut self, table_position: usize, row: usize, speed: usize) -> bool {
+        if !self.sequencer.goto(table_position, row, speed) {
+            return false;
+        }
+        self.voices.reset_for_goto();
+        // Force next()/sample() to re-tick immediately.
+        self.remaining_samples_in_tick = 0.0;
+        // Clear the "song end" latch so a post-song goto re-enables playback
+        // (if `max_loop_count` still gates it, SongEnd will re-fire; that's OK).
+        self.song_end_notified = false;
+        true
+    }
+
+    // --- Sample generation hot path ---
+
+    /// Advance one sample's worth of time: stepping the sequencer when a
+    /// tick boundary is due, forwarding row/tick events to voices and
+    /// observers, and decrementing the sample clock.
+    ///
+    /// Returns `false` to signal end-of-song.
+    fn step(&mut self) -> bool {
         if self.remaining_samples_in_tick <= 0.0 {
-            if self.current_tick == 0 {
-                self.tick0();
-            } else {
-                self.tick();
-            }
-
-            self.current_tick += 1;
-            // `F00` (speed = 0) halts row advance: tick() keeps firing so
-            // sustained effects continue, but tick0() never runs again
-            // until the tempo is set to a non-zero value.
-            if self.tempo != 0 && self.current_tick >= self.tempo + self.extra_ticks {
-                self.current_tick = 0;
-                self.extra_ticks = 0;
-            }
-
-            // Propagate the current song speed to each channel so the
-            // arpeggio FT2 LUT indexes from the live tempo, not the
-            // default copy stashed at construction. Fxx (speed
-            // change) can land anywhere in a pattern, but most
-            // tick-boundaries see no change — gate the N-channel
-            // loop on an actual tempo delta to keep the common case
-            // at a single compare.
-            if self.tempo != self.last_propagated_tempo {
-                for ch in &mut self.channel {
-                    ch.set_tempo(self.tempo);
+            match self.sequencer.advance_tick() {
+                TickOutcome::SongEnd => {
+                    if !self.song_end_notified {
+                        for obs in &mut self.observers {
+                            obs.on_song_end();
+                        }
+                        self.song_end_notified = true;
+                    }
+                    return false;
                 }
-                self.last_propagated_tempo = self.tempo;
+                TickOutcome::RowStart {
+                    pattern,
+                    row,
+                    pattern_changed,
+                } => {
+                    // Fetch cells ONCE — voices and every observer share the
+                    // same borrow.
+                    let cells: &[TrackUnit] = &self.module.pattern[pattern][row];
+
+                    // 1. Voices (the built-in row consumer) processes the row.
+                    self.voices.process_row(cells);
+
+                    // 2. User observers: on_pattern_change first (if
+                    //    applicable), then on_row.
+                    if pattern_changed && !self.observers.is_empty() {
+                        let pc_ctx = PatternChangeContext {
+                            module: self.module,
+                            song: self.sequencer.current_song(),
+                            new_table_index: self.sequencer.current_table_index(),
+                            new_pattern: pattern,
+                        };
+                        for obs in &mut self.observers {
+                            obs.on_pattern_change(&pc_ctx);
+                        }
+                    }
+
+                    if !self.observers.is_empty() {
+                        let ctx = RowContext {
+                            module: self.module,
+                            song: self.sequencer.current_song(),
+                            pattern,
+                            row,
+                            cells,
+                            tempo: self.sequencer.tempo(),
+                            bpm: self.sequencer.bpm(),
+                        };
+                        for obs in &mut self.observers {
+                            obs.on_row(&ctx);
+                        }
+                    }
+                }
+                TickOutcome::Tick { tick } => {
+                    // 1. Voices run per-tick effects.
+                    self.voices.process_tick(tick);
+
+                    // 2. Observers that opt in get an on_tick callback.
+                    //    Walk the list twice only when at least one subscribes —
+                    //    a cheap short-circuit when the common case (UI
+                    //    observers on rows only) dominates.
+                    if self.observers.iter().any(|obs| obs.subscribes_to_ticks()) {
+                        let pat = self.sequencer.playing_pattern();
+                        let row = self.sequencer.playing_row();
+                        let cells: &[TrackUnit] = &self.module.pattern[pat][row];
+                        let ctx = TickContext {
+                            module: self.module,
+                            song: self.sequencer.current_song(),
+                            pattern: pat,
+                            row,
+                            tick,
+                            cells,
+                        };
+                        for obs in &mut self.observers {
+                            if obs.subscribes_to_ticks() {
+                                obs.on_tick(&ctx);
+                            }
+                        }
+                    }
+                }
             }
-            /* FT2 manual says number of ticks / second = BPM * 0.4 */
-            self.remaining_samples_in_tick += self.sample_rate / (self.bpm as f32 * 0.4);
+
+            // Propagate tempo change to voices if any global effect (or the
+            // initial tempo on the very first tick) just shifted it.
+            let cur_tempo = self.sequencer.tempo();
+            if cur_tempo != self.last_propagated_tempo {
+                self.voices.set_tempo(cur_tempo);
+                self.last_propagated_tempo = cur_tempo;
+            }
+
+            /* FT2 manual: number of ticks / second = BPM * 0.4 */
+            self.remaining_samples_in_tick += self.sample_rate / self.sequencer.ticks_per_second();
         }
         self.remaining_samples_in_tick -= 1.0;
+        true
     }
 
-    /// Returns samples from each channel before applying global volume and amplification.
-    /// If the function returns None, no more samples are available.
+    /// Returns samples from each channel before applying global volume and
+    /// amplification. If the function returns `None`, no more samples are
+    /// available (end of song reached).
     ///
-    /// In conjunction with the samples_apply_volume() function, this function can be used to replace the iterator or the sample() function if you want to control each channel in fine detail, for example, to create beautiful graphic effects.
+    /// In conjunction with [`samples_apply_volume`](Self::samples_apply_volume),
+    /// this function can be used to replace the iterator or the `sample()`
+    /// function if you want to control each channel in fine detail — for
+    /// example, to create per-channel graphic effects.
     pub fn samples_from_channels(&mut self) -> Option<Vec<(f32, f32)>> {
         if self.pause {
-            return Some(vec![(0.0, 0.0); self.channel.len()]);
+            return Some(vec![(0.0, 0.0); self.voices.num_channels()]);
         }
-
-        self.step();
-
-        if self.max_loop_count > 0 && self.loop_count >= self.max_loop_count {
+        if !self.step() {
             return None;
         }
-
-        let samples: Vec<(f32, f32)> = self
-            .channel
-            .iter_mut()
-            .map(|ch| match ch.next() {
-                Some(fval) => {
-                    if ch.is_muted() {
-                        (0.0, 0.0)
-                    } else {
-                        fval
-                    }
-                }
-                None => (0.0, 0.0),
-            })
-            .collect();
-
+        let samples = self.voices.samples_from_channels();
         self.generated_samples += 1;
         Some(samples)
     }
 
-    pub fn samples_to_sample(&mut self, samples: &[(f32, f32)]) -> (f32, f32) {
-        let sample = samples
+    /// Sum per-channel samples into a stereo pair, without gain.
+    pub fn samples_to_sample(&self, samples: &[(f32, f32)]) -> (f32, f32) {
+        samples
             .iter()
-            .fold((0.0, 0.0), |(acc_left, acc_right), (left, right)| {
-                (acc_left + left, acc_right + right)
-            });
-        (sample.0, sample.1)
+            .fold((0.0, 0.0), |(acc_l, acc_r), (l, r)| (acc_l + l, acc_r + r))
     }
 
-    /// This function applies volume and amplification to the various channel samples. It is applied to the result of the `samples_from_channels()` function.
-    pub fn samples_apply_volume(&mut self, samples: &[(f32, f32)]) -> (f32, f32) {
-        let fgvol = self.global_volume * self.amplification;
-        let sample = self.samples_to_sample(samples);
-        (sample.0 * fgvol, sample.1 * fgvol)
+    /// Apply `global_volume * amplification` to a per-channel sample set and
+    /// fold to a single stereo pair. Intended to be paired with
+    /// [`samples_from_channels`](Self::samples_from_channels).
+    pub fn samples_apply_volume(&self, samples: &[(f32, f32)]) -> (f32, f32) {
+        let g = self.voices.global_volume() * self.voices.amplification();
+        let (l, r) = self.samples_to_sample(samples);
+        (l * g, r * g)
     }
 
-    /// Returns the sum of the samples from all channels, optionally
-    /// scaled by `global_volume * amplification`. This is the hot
-    /// path used by the `Iterator` impl: unlike
-    /// [`Self::samples_from_channels`] + [`Self::samples_apply_volume`],
-    /// it walks channels once with an `(f32, f32)` accumulator and
-    /// never allocates a per-sample `Vec`. At 48 kHz stereo that saves
-    /// ~96 k allocations/second.
+    /// Return the sum of the samples from all channels, optionally scaled by
+    /// `global_volume * amplification`. This is the hot path used by the
+    /// `Iterator` impl.
     ///
-    /// Semantically identical to the older
-    /// `samples_from_channels().map(samples_apply_volume_or_sum)`
-    /// composition — the three explicit stages are still available
-    /// for callers that need per-channel inspection.
+    /// Semantically identical to `samples_from_channels().map(samples_apply_volume)`,
+    /// but walks channels once with an `(f32, f32)` accumulator and never
+    /// allocates a per-sample `Vec`.
     pub fn sample(&mut self, apply_volume: bool) -> Option<(f32, f32)> {
         if self.pause {
             return Some((0.0, 0.0));
         }
-
-        self.step();
-
-        if self.max_loop_count > 0 && self.loop_count >= self.max_loop_count {
+        if !self.step() {
             return None;
         }
-
-        let (mut left, mut right) = (0.0f32, 0.0f32);
-        for ch in &mut self.channel {
-            if let Some((l, r)) = ch.next() {
-                if !ch.is_muted() {
-                    left += l;
-                    right += r;
-                }
-            }
-            // `None` from a channel (no active instrument) contributes
-            // zero; muted channels are advanced (so position tracking
-            // stays correct when they unmute) but their output is
-            // discarded.
-        }
-
+        let s = self.voices.mix(apply_volume);
         self.generated_samples += 1;
-
-        if apply_volume {
-            let g = self.global_volume * self.amplification;
-            Some((left * g, right * g))
-        } else {
-            Some((left, right))
-        }
+        Some(s)
     }
 
     /// Returns samples one after the other, starting with the left channel.
@@ -553,17 +395,13 @@ impl<'a> XmrsPlayer<'a> {
                 self.right_sample = None;
                 Some(right)
             }
-            None => {
-                let next_samples = self.sample(true);
-                match next_samples {
-                    Some((left, right)) => {
-                        self.right_sample = Some(right);
-
-                        Some(left)
-                    }
-                    None => None,
+            None => match self.sample(true) {
+                Some((left, right)) => {
+                    self.right_sample = Some(right);
+                    Some(left)
                 }
-            }
+                None => None,
+            },
         }
     }
 }
@@ -572,10 +410,6 @@ impl<'a> Iterator for XmrsPlayer<'a> {
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.max_loop_count > 0 && self.loop_count >= self.max_loop_count {
-            None
-        } else {
-            self.sample_one()
-        }
+        self.sample_one()
     }
 }

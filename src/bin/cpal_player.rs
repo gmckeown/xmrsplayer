@@ -154,6 +154,9 @@ fn play_music(
     let config = device
         .default_output_config()
         .expect("failed to get default output config");
+
+    println!("cpal config: {:?}", config);
+
     let sample_rate = config.sample_rate();
 
     let player = Arc::new(Mutex::new(XmrsPlayer::new(
@@ -164,12 +167,14 @@ fn play_music(
 
     {
         let mut player_lock = player.lock().unwrap();
-        player_lock.amplification = amplification;
+        player_lock.set_amplification(amplification);
         if debug {
             println!("Debug on");
             println!("Module format: {:?}", module.format);
+            // In 0.10+ the inline `debug(bool)` toggle has been replaced by a
+            // standalone observer — register it explicitly.
+            player_lock.add_observer(Box::new(DebugObserver::new()));
         }
-        player_lock.debug(debug);
         if ch != 0 {
             player_lock.mute_all(true);
             player_lock.set_mute_channel((ch - 1).into(), false);
@@ -260,7 +265,7 @@ fn play_music(
                         println!(
                             "speed={}, generated samples:{}, loop count:{}",
                             player_lock.get_tempo(),
-                            player_lock.generated_samples,
+                            player_lock.generated_samples(),
                             player_lock.get_loop_count()
                         );
                         for (i, instr) in player_lock.module.instrument.iter().enumerate() {

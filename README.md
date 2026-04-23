@@ -34,7 +34,7 @@ let bytes = std::fs::read("song.xm")?;
 let module = Module::load(&bytes)?;
 
 let mut player = XmrsPlayer::new(&module, 48_000.0, /* song */ 0);
-player.amplification = 0.25;          // lower to avoid clipping on busy modules
+player.set_amplification(0.25);       // lower to avoid clipping on busy modules
 player.set_max_loop_count(1);         // 0 = loop forever
 
 // The player is an Iterator<Item = f32> producing interleaved L/R samples.

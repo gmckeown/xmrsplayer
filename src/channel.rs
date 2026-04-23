@@ -75,10 +75,6 @@ pub struct Channel<'a> {
     tremolo_retrig_on_new_note: bool,
     effect_semitone: bool,
     effect_note_delay: usize,
-    /// Where to restart a E6y loop
-    pub(crate) pattern_loop_origin: usize,
-    /// How many loop passes have been done
-    pub(crate) pattern_loop_count: usize,
 
     pub muted: bool,
 
@@ -134,8 +130,6 @@ impl<'a> Channel<'a> {
             effect_tone_portamento_goal: 0.0,
             effect_semitone: false,
             effect_note_delay: 0,
-            pattern_loop_origin: 0,
-            pattern_loop_count: 0,
             muted: false,
             actual_volume: [0.0, 0.0],
         }

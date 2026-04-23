@@ -26,4 +26,22 @@ pub(crate) mod state_envelope;
 pub(crate) mod state_instr_default;
 pub(crate) mod state_sample;
 
+// --- Post-refactor modules (0.10) ---
+
+/// Song cursor and tick clock. Consumes navigation-side global effects
+/// (`Fxx`, `Bxx`, `Dxx`, `E6y`, `EEy`, `BPM`, `BPMSlide`) directly from
+/// pattern cells, without going through channels.
+pub mod sequencer;
+
+/// Audio engine: per-channel state, mixer gain, and sample generation.
+/// Consumes volume-side global effects (`Volume`, `VolumeSlide`).
+pub mod voices;
+
+/// Subscription API — `PlayerObserver` trait and event context structs.
+pub mod observer;
+
+/// Built-in observer that prints pattern/row changes. Requires `std`.
+#[cfg(feature = "std")]
+pub mod debug_observer;
+
 pub mod xmrsplayer;
