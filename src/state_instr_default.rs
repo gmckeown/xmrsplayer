@@ -180,7 +180,15 @@ impl<'a> StateInstrDefault<'a> {
     }
 
     pub fn get_volume(&self) -> f32 {
-        self.volume_fadeout * self.envelope_volume.value * self.volume
+        // `instr.global_volume` is IT's per-instrument scalar (0..1,
+        // populated from the IT instrument header's global-volume
+        // byte / 128). For formats without the concept (XM / S3M)
+        // it stays at 1.0, making this a no-op. Previously ignored —
+        // which threw off any IT module where the author balanced
+        // instruments via the per-instrument GV (common on drums vs
+        // leads, or for pad voices dialled down to sit under the
+        // melody).
+        self.volume_fadeout * self.envelope_volume.value * self.volume * self.instr.global_volume
     }
 
     /// Current pitch-envelope contribution, in semitones.
@@ -294,7 +302,22 @@ impl<'a> StateInstrDefault<'a> {
         if num < self.instr.sample.len() {
             if let Some(sample) = &self.instr.sample[num] {
                 let state_sample = StateSample::new(sample, self.rate);
-                self.panning = state_sample.get_panning();
+                // IT's pan cascade: sample override → instrument
+                // default_pan → channel initial pan. The IT
+                // importer stores exactly `0.5` in Sample.panning
+                // when the sample's own bit-7-"use-pan" flag is
+                // clear (i.e., "not set, defer to instrument"). We
+                // can't distinguish that from an author's explicit
+                // centre-pan, but treating exact-0.5 as "unset" is
+                // the right heuristic — authors rarely place a
+                // deliberate centre override, and the fallback to
+                // `instr.default_pan` is what the module expects.
+                let sample_pan = state_sample.get_panning();
+                self.panning = if sample_pan == 0.5 {
+                    self.instr.default_pan
+                } else {
+                    sample_pan
+                };
                 self.volume = state_sample.get_volume();
                 self.volume_orig = self.volume;
                 self.state_sample = Some(state_sample);

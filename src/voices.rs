@@ -56,6 +56,15 @@ pub struct Voices<'a> {
     /// dispatches to any registered [`MidiObserver`]. The buffer is
     /// re-used across rows — cleared on entry to each `process_row`.
     pending_midi_events: Vec<(usize, MidiEvent)>,
+
+    /// Song-level mix-volume scalar (0..1). Cached from the module
+    /// at construction time and applied as a constant final-mix
+    /// multiplier in `mix()`. Separate from `global_volume` (which
+    /// is Vxx-animated) and `amplification` (user-controlled).
+    /// Non-IT modules carry `1.0` (identity). IT modules carry
+    /// `header.mix_volume / 128` — typically 0.375 for an IT-default
+    /// MV=48.
+    mix_volume: f32,
 }
 
 impl<'a> Voices<'a> {
@@ -70,6 +79,9 @@ impl<'a> Voices<'a> {
             volume_slide_fine: true,
             row_has_global_volume_slide: false,
             pending_midi_events: Vec::new(),
+            // IT's MV is the only format-specific source today;
+            // everyone else defaults to 1.0 via `Module::default`.
+            mix_volume: module.mix_volume.clamp(0.0, 1.0),
         }
     }
 
@@ -269,7 +281,10 @@ impl<'a> Voices<'a> {
         }
 
         if apply_volume {
-            let g = self.global_volume * self.amplification;
+            // `mix_volume` is an IT-specific constant headroom
+            // multiplier (see field doc). For non-IT modules it's
+            // 1.0 so this is free.
+            let g = self.global_volume * self.amplification * self.mix_volume;
             (left * g, right * g)
         } else {
             (left, right)
