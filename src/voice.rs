@@ -35,6 +35,7 @@ use micromath::F32Ext;
 use num_traits::float::Float;
 
 use crate::state_instr_default::StateInstrDefault;
+use xmrs::prelude::Pitch;
 
 /// The maximum number of concurrent ghost voices per pattern channel.
 ///
@@ -66,6 +67,26 @@ pub(crate) struct Voice<'a> {
     pub channel_volume_frozen: f32,
     /// Panning at the moment of detachment.
     pub panning_frozen: f32,
+
+    /// The note (integer semitone, ignoring finetune) this voice
+    /// was triggered on. Used by DCT::Note matching. `None` when
+    /// the originating trigger was a keyoff / cut / invalid note —
+    /// such voices never match a DCT::Note check.
+    pub note: Option<Pitch>,
+    /// The sample index within the current instrument that this
+    /// voice is playing. Used by DCT::Sample matching. `None` when
+    /// no sample is currently selected.
+    pub sample_num: Option<usize>,
+
+    /// The channel's `period` value at the moment of detachment.
+    /// Used by [`Voice::tick`] to re-run `update_frequency` each
+    /// tick with the current pitch-envelope contribution folded in
+    /// — so a ghost voice with `NNA = Continue` and an active pitch
+    /// envelope gets the right pitch modulation even though the
+    /// envelope's live channel has moved on. Without this,
+    /// envelope-driven pitch drift stops at the moment the voice
+    /// becomes a ghost.
+    pub period_at_fork: f32,
 }
 
 impl<'a> Voice<'a> {
@@ -75,17 +96,26 @@ impl<'a> Voice<'a> {
     /// [`apply_nna_note_fade_out`]. Apply-functions live on this type
     /// so the NNA dispatch table is co-located with the voice it
     /// affects.
+    ///
+    /// `note` / `sample_num` carry the identity tags used by DCT
+    /// matching on subsequent triggers.
     pub fn fork(
         instr: StateInstrDefault<'a>,
         vol_frozen: f32,
         channel_volume_frozen: f32,
         panning_frozen: f32,
+        note: Option<Pitch>,
+        sample_num: Option<usize>,
+        period_at_fork: f32,
     ) -> Self {
         Self {
             instr,
             vol_frozen,
             channel_volume_frozen,
             panning_frozen,
+            note,
+            sample_num,
+            period_at_fork,
         }
     }
 
@@ -139,6 +169,17 @@ impl<'a> Voice<'a> {
     #[inline]
     pub fn tick(&mut self) {
         self.instr.tick();
+        // Re-run frequency computation with the stored period so
+        // the pitch envelope's contribution reaches the sample step
+        // each tick. Without this the envelope would tick internally
+        // but the voice's playback rate would stay frozen at fork.
+        // `arp_pitch = 0` / `finetune = 0` / `semitone = false`:
+        // arpeggio and the channel's vibrato belong to the live
+        // voice, not to detached ghosts — those stop at detachment.
+        // Pitch envelope is folded in by `update_frequency` itself
+        // via `get_pitch_envelope_offset_semitones`.
+        self.instr
+            .update_frequency(self.period_at_fork, 0.0, 0.0, false);
     }
 
     /// `true` while the voice is still audible. A voice is considered

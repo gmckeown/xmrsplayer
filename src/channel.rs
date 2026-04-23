@@ -18,6 +18,31 @@ use crate::state_instr_default::StateInstrDefault;
 use crate::voice::{Voice, MAX_GHOST_VOICES_PER_CHANNEL};
 use xmrs::prelude::*;
 
+/// Simplified DCT tag, extracted once from the nested
+/// [`DuplicateCheckType`] enum so the per-voice match loop can test
+/// a plain three-way variant without re-pattern-matching on every
+/// iteration.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dct {
+    Note,
+    Sample,
+    Instrument,
+}
+
+/// The note identity for a live voice, for DCT::Note matching. The
+/// live voice doesn't carry an `Option<Pitch>` field of its own
+/// (that's only materialised onto ghosts at fork time), so we read
+/// the channel's tracked `current_note`. Separate free function to
+/// side-step a borrow-conflict with the caller's `&mut self` in
+/// `apply_dct` (the live-match check there holds an `&self.instr`
+/// borrow simultaneously).
+fn live_voice_identity_note(
+    _live: &StateInstrDefault<'_>,
+    current_note: Option<Pitch>,
+) -> Option<Pitch> {
+    current_note
+}
+
 #[derive(Clone, PartialEq, Default)]
 struct NoteRetrigState {
     note: Pitch,
@@ -33,6 +58,24 @@ pub struct Channel<'a> {
     rate: f32,
 
     note: f32,
+    /// The last Pitch enum value triggered on this channel. Parallels
+    /// `note` (which is a float that bakes in finetune); this one
+    /// keeps the clean integer-semitone identity used by DCT::Note.
+    /// `None` until the channel has seen any valid note trigger.
+    current_note: Option<Pitch>,
+
+    /// IT MIDI-macro selector: which parametric macro slot (0..15)
+    /// is "active" on this channel. Modified by `SFx`; read by
+    /// `Zxx` with `xx < 0x80`. Defaults to 0 (the `SF0` macro,
+    /// typically the default filter-cutoff macro in IT files).
+    midi_parametric_selector: usize,
+
+    /// S91/S90 surround flag. When set, the right channel output
+    /// is phase-inverted — the classic IT pseudo-stereo trick that
+    /// folds to silence in mono and sounds spatially wide in stereo.
+    /// Persists until explicitly toggled; not reset by note
+    /// triggers.
+    surround: bool,
 
     pub current: TrackUnit,
 
@@ -120,6 +163,9 @@ impl<'a> Channel<'a> {
             volume: 1.0,
             panning: 0.5,
             note: 0.0,
+            current_note: None,
+            midi_parametric_selector: 0,
+            surround: false,
             current: TrackUnit::default(),
             period: 0.0,
             instr: None,
@@ -227,6 +273,106 @@ impl<'a> Channel<'a> {
     }
 
     // ------------------------------------------------------------------
+    // IT MIDI-macro dispatch
+    // ------------------------------------------------------------------
+
+    /// Apply a MIDI-macro effect (`SFx` / `Zxx`) to this channel.
+    ///
+    /// Macro strings live on `module.midi_macros` — `None` on non-IT
+    /// modules or IT files without an embedded macro table, in
+    /// which case this is a silent no-op.
+    ///
+    /// # What's interpreted
+    ///
+    /// Only IT's internal filter-control frames are recognised:
+    ///
+    /// ```text
+    /// F0 F0 00 xx   — set filter cutoff to xx
+    /// F0 F0 01 xx   — set filter resonance to xx
+    /// ```
+    ///
+    /// The literal byte `z` (0x7A) anywhere in a macro is replaced
+    /// by the `Zxx` parameter before frame parsing — that's how a
+    /// macro like "F0 F0 00 z" becomes "set cutoff to Zxx's param".
+    ///
+    /// Everything else in the macro (MIDI OUT, SysEx, user-defined
+    /// non-filter commands) is silently ignored — the xmrsplayer
+    /// engine has no MIDI-out bus.
+    pub(crate) fn apply_midi_macro(&mut self, macro_type: MidiMacroType) {
+        match macro_type {
+            MidiMacroType::SelectParametric(idx) => {
+                // SFx — just stash the selector. The macro only
+                // fires when a subsequent Zxx<0x80 picks it up.
+                self.midi_parametric_selector = idx;
+                return;
+            }
+            MidiMacroType::Parametric(z) => {
+                let Some(macros) = &self.module.midi_macros else {
+                    return;
+                };
+                let Some(bytes) = macros.parametric.get(self.midi_parametric_selector) else {
+                    return;
+                };
+                self.interpret_macro_bytes(bytes.clone(), z);
+            }
+            MidiMacroType::Fixed { idx, z } => {
+                let Some(macros) = &self.module.midi_macros else {
+                    return;
+                };
+                let Some(bytes) = macros.fixed.get(idx) else {
+                    return;
+                };
+                self.interpret_macro_bytes(bytes.clone(), z);
+            }
+        }
+    }
+
+    /// Walk the macro byte stream, substituting `z` (0x7A) with the
+    /// Zxx parameter, and interpret any 4-byte filter frame we
+    /// recognise. Non-frame bytes are skipped.
+    fn interpret_macro_bytes(&mut self, mut bytes: alloc::vec::Vec<u8>, z_value: u8) {
+        // In-place `z` substitution — the macro byte 0x7A is the
+        // ASCII letter `z`, which Schism Tracker / OpenMPT / IT use
+        // as a parameter placeholder inside a macro string.
+        for b in bytes.iter_mut() {
+            if *b == b'z' {
+                *b = z_value;
+            }
+        }
+
+        // Scan for recognised 4-byte frames starting with F0 F0.
+        // IT's default filter macros are exactly this shape:
+        //   F0 F0 00 cutoff
+        //   F0 F0 01 resonance
+        let mut i = 0;
+        while i + 3 < bytes.len() {
+            if bytes[i] == 0xF0 && bytes[i + 1] == 0xF0 {
+                let sub = bytes[i + 2];
+                let val = bytes[i + 3];
+                match sub {
+                    0x00 => {
+                        if let Some(instr) = &mut self.instr {
+                            instr.filter.set_cutoff_reg(val);
+                        }
+                    }
+                    0x01 => {
+                        if let Some(instr) = &mut self.instr {
+                            instr.filter.set_resonance_reg(val);
+                        }
+                    }
+                    // 0x02 = filter mode, 0x03..0x7F = reserved /
+                    // extended. Not handled yet — the most common
+                    // macros are cutoff + resonance above.
+                    _ => {}
+                }
+                i += 4;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // IT New Note Action helpers
     // ------------------------------------------------------------------
 
@@ -273,12 +419,58 @@ impl<'a> Channel<'a> {
         let Some(old) = self.instr.take() else {
             return;
         };
-        let mut ghost = Voice::fork(old, self.volume, self.channel_volume, self.panning);
+        let sample_num = old.current_sample_num;
+        let mut ghost = Voice::fork(
+            old,
+            self.volume,
+            self.channel_volume,
+            self.panning,
+            self.current_note,
+            sample_num,
+            self.period,
+        );
         match nna {
             NewNoteAction::Continue => ghost.apply_nna_continue(),
             NewNoteAction::NoteOff => ghost.apply_nna_note_off(),
             NewNoteAction::NoteFadeOut => ghost.apply_nna_note_fade_out(),
             NewNoteAction::NoteCut => unreachable!(), // handled above
+        }
+        self.push_ghost(ghost);
+    }
+
+    /// Ghost-note variant: clone the live voice into a ghost
+    /// WITHOUT taking ownership, because `self.instr` is about to
+    /// be retriggered in place (note column carries a fresh pitch
+    /// with no accompanying instrument column, so the same
+    /// `StateInstrDefault` is reused).
+    ///
+    /// Called from `tick0_load_pitch` on the note-only path.
+    /// Default NNA = Cut → no-op (matches XM/MOD/S3M ghost-note
+    /// semantics: retrigger cuts the old sound).
+    fn spawn_ghost_clone(&mut self) {
+        let nna = self.effective_nna();
+        if matches!(nna, NewNoteAction::NoteCut) {
+            return;
+        }
+        let Some(live) = &self.instr else {
+            return;
+        };
+        let sample_num = live.current_sample_num;
+        let cloned = live.clone();
+        let mut ghost = Voice::fork(
+            cloned,
+            self.volume,
+            self.channel_volume,
+            self.panning,
+            self.current_note,
+            sample_num,
+            self.period,
+        );
+        match nna {
+            NewNoteAction::Continue => ghost.apply_nna_continue(),
+            NewNoteAction::NoteOff => ghost.apply_nna_note_off(),
+            NewNoteAction::NoteFadeOut => ghost.apply_nna_note_fade_out(),
+            NewNoteAction::NoteCut => unreachable!(),
         }
         self.push_ghost(ghost);
     }
@@ -325,6 +517,93 @@ impl<'a> Channel<'a> {
         }
     }
 
+    /// Apply the Duplicate Check Type / Action pair from the
+    /// *incoming* instrument's header to existing voices on this
+    /// channel (live + ghosts). Called at trigger time, **before**
+    /// the NNA ghost-spawn path — so a DCA that cuts / off / fades
+    /// a duplicate runs first, and NNA then makes its own decision
+    /// about the (now potentially already-affected) outgoing voice.
+    ///
+    /// The new-note identity tuple `(note, new_instrument_index,
+    /// new_sample_index)` is taken from the pattern cell being
+    /// processed; it is what DCT tests existing voices against.
+    fn apply_dct(
+        &mut self,
+        new_instrument_index: usize,
+        new_note: Option<Pitch>,
+        new_sample_index: Option<usize>,
+    ) {
+        // Resolve the incoming instrument's DCT/DCA pair. `Off` is
+        // the early-exit (most common) case — no duplicate check.
+        let Some(incoming) = self.module.instrument.get(new_instrument_index) else {
+            return;
+        };
+        let InstrumentType::Default(id) = &incoming.instr_type else {
+            return;
+        };
+        let (dct, dca) = match &id.duplicate_check {
+            DuplicateCheckType::Off(_) => return,
+            DuplicateCheckType::Note(dca) => (Dct::Note, dca.clone()),
+            DuplicateCheckType::Sample(dca) => (Dct::Sample, dca.clone()),
+            DuplicateCheckType::Instrument(dca) => (Dct::Instrument, dca.clone()),
+        };
+
+        // --- Live voice check. ---
+        // Applying DCA to the live voice is equivalent to the usual
+        // note-cut / key-off / fade semantics — just triggered by
+        // DCT match rather than by effect column.
+        let live_matches = self.instr.as_ref().is_some_and(|live| match dct {
+            Dct::Note => match (live_voice_identity_note(live, self.current_note), new_note) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            },
+            Dct::Sample => {
+                live.num == new_instrument_index
+                    && live.current_sample_num == new_sample_index
+                    && new_sample_index.is_some()
+            }
+            Dct::Instrument => live.num == new_instrument_index,
+        });
+        if live_matches {
+            match &dca {
+                DuplicateCheckAction::NoteCut(_) => self.cut_pitch(),
+                DuplicateCheckAction::NoteOff(_) => {
+                    if let Some(i) = &mut self.instr {
+                        i.key_off();
+                    }
+                }
+                DuplicateCheckAction::NoteFadeOut(_) => {
+                    if let Some(i) = &mut self.instr {
+                        i.key_off();
+                    }
+                }
+            }
+        }
+
+        // --- Ghost voices. ---
+        for ghost in &mut self.ghosts {
+            let matches = match dct {
+                Dct::Note => match (ghost.note, new_note) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => false,
+                },
+                Dct::Sample => {
+                    ghost.instr.num == new_instrument_index
+                        && ghost.sample_num == new_sample_index
+                        && new_sample_index.is_some()
+                }
+                Dct::Instrument => ghost.instr.num == new_instrument_index,
+            };
+            if matches {
+                match &dca {
+                    DuplicateCheckAction::NoteCut(_) => ghost.past_cut(),
+                    DuplicateCheckAction::NoteOff(_) => ghost.past_off(),
+                    DuplicateCheckAction::NoteFadeOut(_) => ghost.past_fade_out(),
+                }
+            }
+        }
+    }
+
     pub(crate) fn trigger_pitch(&mut self, flags: TriggerKeep) {
         // A new note always starts un-muted: in both FT2 (resets
         // `realVol` from the instrument) and ST3 (`avol = aorgvol`
@@ -355,7 +634,14 @@ impl<'a> Channel<'a> {
                 self.volume = instr.volume;
             }
 
-            // TODO
+            // Panning reset on every retrigger. IT would strictly
+            // only reset panning when an instrument column is
+            // present (a ghost-note trigger keeps the channel's
+            // current pan). In practice the distinction is audibly
+            // minor on real modules — Pxx slides kicked in mid-note
+            // are rare — so we accept the simpler unconditional
+            // reset here. Revisit if specific modules show pan
+            // regressions.
             self.panning = instr.panning;
 
             if !contains(flags, TRIGGER_KEEP_PERIOD) {
@@ -528,24 +814,62 @@ impl<'a> Channel<'a> {
                         }
                     }
                 }
-                TrackEffect::InstrumentPitchEnvelope(_pe) => {
-                    #[cfg(feature = "demo")]
-                    println!("InstrumentPitchEnvelope");
-                    todo!()
+                TrackEffect::InstrumentPitchEnvelope(pe) => {
+                    // S7B / S7C: enable / disable the instrument's
+                    // pitch envelope on this channel. Same tick-0
+                    // scoping as the volume / panning envelope
+                    // toggles above. Takes effect on the next tick
+                    // via `StateInstrDefault::envelopes()`.
+                    if current_tick == 0 {
+                        if let Some(instr) = &mut self.instr {
+                            instr.envelope_pitch.enabled = pe;
+                        }
+                    }
                 }
                 TrackEffect::InstrumentSampleOffset(seek) => {
                     if current_tick == 0 && self.current.note.is_valid() {
                         if let Some(instr) = &mut self.instr {
                             if let Some(sample) = &mut instr.state_sample {
-                                sample.set_position(seek);
+                                let sample_len = sample.sample_len();
+                                if seek >= sample_len {
+                                    // Past-end behaviour branches on
+                                    // the IT "Old Effects" flag
+                                    // (ITTECH: "Oxx past the sample
+                                    // end will be ignored, unless
+                                    // 'Old Effects' is ON, in which
+                                    // case the Oxx will play from
+                                    // the end of the sample."). The
+                                    // XM / MOD / S3M paths behave
+                                    // like IT-default (ignore); a
+                                    // proper-IT module with
+                                    // old_effects ON will clamp.
+                                    if self.module.quirks.it_old_effects && sample_len > 0 {
+                                        sample.set_position(sample_len - 1);
+                                    }
+                                    // else: ignore the offset; leave
+                                    // the position where the natural
+                                    // note trigger put it.
+                                } else {
+                                    sample.set_position(seek);
+                                }
                             }
                         }
                     }
                 }
-                TrackEffect::InstrumentSurround(_s) => {
-                    #[cfg(feature = "demo")]
-                    println!("InstrumentSurround");
-                    todo!()
+                TrackEffect::InstrumentSurround(surround) => {
+                    // S91 (surround) / S90 (off). Pseudo-stereo
+                    // "surround" in IT is classically implemented by
+                    // inverting the phase of the right channel's
+                    // output — the inverted pair folds to silence in
+                    // mono (a characteristic IT fingerprint) and
+                    // sounds spatially wider than pure stereo in a
+                    // two-speaker field. The actual inversion lives
+                    // in `Channel::next`; this arm just toggles the
+                    // flag. Persists until explicitly toggled;
+                    // note triggers do NOT reset it.
+                    if current_tick == 0 {
+                        self.surround = surround;
+                    }
                 }
                 TrackEffect::InstrumentVolumeEnvelopePosition(position) => {
                     if current_tick == 0 {
@@ -633,7 +957,15 @@ impl<'a> Channel<'a> {
                     speed: s,
                     volume_modifier: m,
                 } => {
-                    //TODO: check if NoteDelay then check with current_tick - delay
+                    // NoteDelay interaction: when a row carries both
+                    // `SDx` (NoteDelay) and `Qxy` (NoteRetrig), the
+                    // retrig cadence is measured from the delayed
+                    // trigger, not from tick 0. Before the delay
+                    // fires, we simply don't count — the voice
+                    // hasn't actually started yet.
+                    if current_tick < self.effect_note_delay {
+                        continue;
+                    }
 
                     let current_state = NoteRetrigState {
                         note: self.current.note,
@@ -642,7 +974,14 @@ impl<'a> Channel<'a> {
                         volume_modifier: m.clone(),
                     };
 
-                    if current_tick == 0 && self.effect_note_retrig_backup != current_state {
+                    // Reset the retrig counter at the moment the
+                    // effect becomes active on a new row — for a
+                    // plain row that's tick 0, for a SDx-delayed
+                    // row it's the tick the delay fires.
+                    let counter_reset_tick = self.effect_note_delay;
+                    if current_tick == counter_reset_tick
+                        && self.effect_note_retrig_backup != current_state
+                    {
                         self.effect_note_retrig_counter = 0;
                         self.effect_note_retrig_backup = current_state;
                     }
@@ -846,12 +1185,18 @@ impl<'a> Channel<'a> {
                             self.effect_tremor_counter_s3m -= 1;
                         } else {
                             // Toggle on/off (or start "on" from the
-                            // initial inactive state).
+                            // initial inactive state). ITTECH: the
+                            // counter reloads with nibble + 1 so
+                            // that `Ix0` still produces a one-tick
+                            // on phase (reload = 1, fires once,
+                            // toggles next tick). Parser stores raw
+                            // nibble; we apply the `+1` here to
+                            // keep import conventions simple.
                             self.effect_tremor_silent_s3m = !self.effect_tremor_silent_s3m;
                             let reload = if self.effect_tremor_silent_s3m {
-                                self.effect_tremor_off
+                                self.effect_tremor_off + 1
                             } else {
-                                self.effect_tremor_on
+                                self.effect_tremor_on + 1
                             } as i32;
                             self.effect_tremor_counter_s3m = reload;
                         }
@@ -874,9 +1219,29 @@ impl<'a> Channel<'a> {
                     }
                 }
                 TrackEffect::Vibrato { speed: s, depth: d } => {
+                    // IT "Old Effects" quirk: with the flag ON, Hxy
+                    // and Uxy depth is doubled (`depth <<= 1` per
+                    // IT_MUSIC.ASM's Hxy handler in ITTECH). The
+                    // importer emits the normal-mode value; apply
+                    // the 2× scale here on replay so the same
+                    // pattern data sounds right in both modes.
+                    let d = if self.module.quirks.it_old_effects {
+                        d * 2.0
+                    } else {
+                        d
+                    };
                     if current_tick == 0 {
                         self.effect_vibrato.data.speed = s;
                         self.effect_vibrato.data.depth = d;
+                        // ITTECH: in normal IT mode (NOT old-effects)
+                        // the vibrato LFO is updated EVERY tick,
+                        // including tick 0. Other formats (XM/MOD/
+                        // S3M, and IT with old-effects on) tick only
+                        // on non-row ticks. This one-liner adds the
+                        // tick-0 advance under the right gate.
+                        if self.module.format.is_it() && !self.module.quirks.it_old_effects {
+                            self.effect_vibrato.tick();
+                        }
                     } else {
                         self.effect_vibrato.tick();
                     }
@@ -947,6 +1312,25 @@ impl<'a> Channel<'a> {
                         i.replace_instr(id);
                     }
                 } else {
+                    // IT DCT: the INCOMING instrument may ask the
+                    // replayer to apply a Duplicate Check Action
+                    // (cut / off / fade) to any already-playing
+                    // voice whose identity clashes with the new
+                    // trigger per its DCT axis (Note / Sample /
+                    // Instrument). DCT runs BEFORE NNA: the new
+                    // note's "clash preferences" are resolved first,
+                    // then NNA decides what happens to whatever live
+                    // voice is still standing afterwards.
+                    let new_note = if self.current.note.is_valid() {
+                        Some(self.current.note)
+                    } else {
+                        None
+                    };
+                    let new_sample_index = new_note
+                        .and_then(|n| id.sample_for_pitch.get(n.value() as usize).copied())
+                        .flatten();
+                    self.apply_dct(instrnr, new_note, new_sample_index);
+
                     // IT NNA: if the outgoing voice's NNA is anything
                     // but `Cut`, fork it into a ghost before we blow
                     // it away with the new trigger. On non-IT
@@ -967,7 +1351,14 @@ impl<'a> Channel<'a> {
 
             was_same
         } else {
-            // TODO
+            // Non-Default instrument variant (InstrMidi / InstrOpl /
+            // InstrSid / InstrRobSid / InstrEkn). xmrsplayer's
+            // sample engine only handles `InstrumentType::Default`;
+            // the specialised synth / MIDI-out paths are the
+            // responsibility of downstream code that wraps the
+            // player. Silently skipping here keeps playback running
+            // on mixed-type modules — the voice just stays on
+            // whatever sampled instrument was previously loaded.
             false
         }
     }
@@ -1031,6 +1422,7 @@ impl<'a> Channel<'a> {
                 if let Some(s) = &instr.state_sample {
                     if s.is_enabled() {
                         self.note = self.current.note.value() as f32 + s.get_finetuned_pitch();
+                        self.current_note = Some(self.current.note);
                         return;
                     }
                 }
@@ -1038,20 +1430,40 @@ impl<'a> Channel<'a> {
                 return;
             }
 
-            // SetNote
-            if instr.set_pitch(self.current.note) {
-                if let Some(s) = &instr.state_sample {
-                    self.note = self.current.note.value() as f32 + s.get_finetuned_pitch();
-                }
+            // IT ghost-note NNA. When a note column fires without an
+            // instrument column, the live voice gets retriggered in
+            // place with `TRIGGER_KEEP_VOLUME` — sample reset +
+            // envelope reset happens inside `trigger_pitch`. For
+            // NNA != Cut we need to snapshot the pre-retrigger state
+            // now, before `set_pitch` below calls `select_sample`
+            // (which can overwrite `state_sample`). XM/MOD/S3M reach
+            // this path with NNA=Cut (the default) so `spawn_ghost_
+            // clone` is an inert early return there.
+            //
+            // Gate on `instrument.is_none()` so the instrument-change
+            // path (which already ran `spawn_ghost_for_outgoing` in
+            // `tick0_change_instr`) doesn't double-ghost.
+            if self.current.instrument.is_none() {
+                self.spawn_ghost_clone();
+            }
 
-                let trigger_flag = if self.current.instrument.is_some() {
-                    TRIGGER_KEEP_NONE
-                } else {
-                    /* Ghost note: keep old volume */
-                    TRIGGER_KEEP_VOLUME
-                };
-                self.trigger_pitch(trigger_flag);
-                return;
+            // SetNote
+            if let Some(instr) = &mut self.instr {
+                if instr.set_pitch(self.current.note) {
+                    if let Some(s) = &instr.state_sample {
+                        self.note = self.current.note.value() as f32 + s.get_finetuned_pitch();
+                    }
+                    self.current_note = Some(self.current.note);
+
+                    let trigger_flag = if self.current.instrument.is_some() {
+                        TRIGGER_KEEP_NONE
+                    } else {
+                        /* Ghost note: keep old volume */
+                        TRIGGER_KEEP_VOLUME
+                    };
+                    self.trigger_pitch(trigger_flag);
+                    return;
+                }
             }
         }
 
@@ -1099,8 +1511,15 @@ impl<'a> Channel<'a> {
         self.current = pattern_slot.clone();
 
         let delay = self.current.get_delay();
+        // Always write `effect_note_delay` — whether 0 or the row's
+        // SDx value. Without this, a delay latched on a previous
+        // row would linger and bias downstream code that keys off
+        // "is this row delayed" (see `TrackEffect::NoteRetrig`'s
+        // pre-delay skip).
+        self.effect_note_delay = delay;
         if delay != 0 {
-            self.effect_note_delay = delay;
+            // Delayed row: tick0 loads nothing; the delay fires in
+            // tickn when current_tick reaches `delay`.
         } else {
             /* load instrument then note */
             self.tick0_load_instrument_and_pitch();
@@ -1179,6 +1598,14 @@ impl<'a> Iterator for Channel<'a> {
         }
 
         if any {
+            // S91 surround: invert the right channel's phase. This
+            // is IT's canonical pseudo-stereo trick — the signal
+            // folds to silence in mono and reads as unusually wide
+            // in a stereo field. Applied post-mix so it covers both
+            // live and ghost contributions with the same phase.
+            if self.surround {
+                right = -right;
+            }
             Some((left, right))
         } else {
             None

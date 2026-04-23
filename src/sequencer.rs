@@ -75,6 +75,11 @@ pub struct Sequencer<'a> {
     /// Extra ticks before advancing to the next row — used for `EEy`
     /// pattern-delay. Consumed once per row.
     extra_ticks: usize,
+    /// IT `Txx` BPM slide: the signed delta latched on the last row
+    /// that carried a `GlobalEffect::BpmSlide`. Applied on every
+    /// subsequent non-row-start tick until the next row either
+    /// re-latches or clears it. Zero when inactive.
+    bpm_slide_delta: isize,
 
     // --- Cursor ---
     current_table_index: usize,
@@ -127,6 +132,7 @@ impl<'a> Sequencer<'a> {
             bpm: module.default_bpm,
             current_tick: 0,
             extra_ticks: 0,
+            bpm_slide_delta: 0,
             current_table_index: 0,
             current_row: 0,
             playing_row: 0,
@@ -231,6 +237,7 @@ impl<'a> Sequencer<'a> {
             speed
         };
         self.bpm = self.module.default_bpm;
+        self.bpm_slide_delta = 0;
 
         // Force the next advance_tick to be treated as a row-start tick.
         self.current_tick = 0;
@@ -265,6 +272,18 @@ impl<'a> Sequencer<'a> {
             // and observers need the value of the tick they're currently
             // processing, not the next one.
             let tick_processed = self.current_tick;
+
+            // Apply the per-tick BPM slide if one's latched. Each
+            // non-row-start tick bumps the BPM by the stored delta,
+            // clamped to the tracker-legal range. When the next row
+            // arrives with no BpmSlide the latch is cleared in
+            // `apply_row_navigation_effects` — until then, the slide
+            // keeps ramping.
+            if self.bpm_slide_delta != 0 {
+                let new_bpm = (self.bpm as isize + self.bpm_slide_delta).clamp(32, 255) as usize;
+                self.bpm = new_bpm;
+            }
+
             self.advance_tick_counter();
             TickOutcome::Tick {
                 tick: tick_processed,
@@ -367,6 +386,11 @@ impl<'a> Sequencer<'a> {
         let num_channels = self.pattern_loop.len();
         let mut in_a_loop = false;
 
+        // Reset the BPM-slide latch before processing the new row.
+        // A slide is only active on the row that carries it; the
+        // next row either re-latches a new delta or stays silent.
+        self.bpm_slide_delta = 0;
+
         for ch_index in 0..num_channels {
             // Defensive indexing: some malformed modules have short rows
             // relative to their declared channel count.
@@ -383,15 +407,27 @@ impl<'a> Sequencer<'a> {
                     GlobalEffect::Bpm(bpm) => {
                         self.bpm = bpm;
                     }
-                    GlobalEffect::BpmSlide(_value) => {
-                        #[cfg(feature = "demo")]
-                        println!("BpmSlide");
-                        todo!();
+                    GlobalEffect::BpmSlide(delta) => {
+                        // IT Txy with x=0 is "slide BPM down by y", x=1
+                        // is "slide BPM up by y". The xmrs importer
+                        // normalises both into a single signed delta
+                        // (positive = up). The slide fires on every
+                        // non-row-start tick of the row; here we latch
+                        // the delta, and `apply_per_tick_effects`
+                        // applies it each tick.
+                        //
+                        // Note the latch is also reset just above the
+                        // `for ch_index` loop (at row-start), so a
+                        // slide on row N doesn't bleed into row N+1.
+                        self.bpm_slide_delta = delta;
                     }
                     GlobalEffect::MidiMacro(_m) => {
-                        #[cfg(feature = "demo")]
-                        println!("MidiMacro");
-                        todo!();
+                        // MIDI macros are per-channel-scoped despite
+                        // the `GlobalEffect` typing. `Voices` picks
+                        // them up in `apply_row_global_effects` with
+                        // the channel index in hand — see
+                        // `Channel::apply_midi_macro`. The sequencer
+                        // ignores them here.
                     }
                     GlobalEffect::PatternBreak(position) => {
                         self.pattern_break = true;

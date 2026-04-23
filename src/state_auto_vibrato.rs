@@ -36,14 +36,23 @@ impl<'a> StateAutoVibrato<'a> {
         self.current_modulation = 0.0;
     }
 
-    pub fn tick(&mut self, sustain: bool) {
+    pub fn tick(&mut self, _sustain: bool) {
         self.phase += self.vibrato.speed;
 
-        let current_depth = if self.phase < self.vibrato.sweep && !sustain {
-            // sweep can't be zero
-            (self.phase / self.vibrato.sweep) * self.vibrato.depth
-        } else {
+        // Sweep-in: auto-vibrato depth ramps from 0 to `depth`
+        // over the first `sweep` units of phase accumulation. Once
+        // `phase >= sweep` the LFO runs at full depth for the rest
+        // of the voice's life — including after key-off (sustain =
+        // false). Previously the `!sustain` gate made the ramp
+        // only apply during release, which was exactly backwards.
+        //
+        // `sweep == 0` means "no ramp, go straight to full depth"
+        // in IT (ITTECH) — handled explicitly to avoid a division
+        // that would NaN out `current_modulation`.
+        let current_depth = if self.vibrato.sweep <= 0.0 || self.phase >= self.vibrato.sweep {
             self.vibrato.depth
+        } else {
+            (self.phase / self.vibrato.sweep) * self.vibrato.depth
         };
 
         self.current_modulation = current_depth * self.wfs.value(self.phase);

@@ -23,6 +23,7 @@ pub(crate) mod helper;
 pub mod prelude;
 pub(crate) mod state_auto_vibrato;
 pub(crate) mod state_envelope;
+pub(crate) mod state_filter;
 pub(crate) mod state_instr_default;
 pub(crate) mod state_sample;
 pub(crate) mod voice;

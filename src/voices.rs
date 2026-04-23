@@ -135,15 +135,20 @@ impl<'a> Voices<'a> {
         for i in 0..n {
             let cell = &cells[i];
             self.channel[i].tick0(cell);
-            self.apply_row_volume_effects(cell);
+            self.apply_row_global_effects(i, cell);
         }
     }
 
-    /// Consume the volume-side entries of `cell.global_effects` for a single
-    /// channel. Mirrors the old `tick0_global_effects` arms dealing with
-    /// `Volume` and `VolumeSlide`; the navigation-side arms have all moved
-    /// to the sequencer.
-    fn apply_row_volume_effects(&mut self, cell: &TrackUnit) {
+    /// Consume the channel-routed entries of `cell.global_effects` for
+    /// a single channel. Covers:
+    /// * `Volume` / `VolumeSlide` — mix-level gain control
+    /// * `MidiMacro` — filter automation (per-channel, despite the
+    ///   `GlobalEffect` typing — see `Channel::apply_midi_macro`)
+    ///
+    /// The navigation-side arms (`Bpm`, `BpmSlide`, `PatternBreak`,
+    /// `PatternLoop`, `PatternDelay`) are owned by the sequencer and
+    /// skipped here.
+    fn apply_row_global_effects(&mut self, ch_index: usize, cell: &TrackUnit) {
         for gfx in cell.global_effects.clone() {
             match gfx {
                 GlobalEffect::Volume(volume) => {
@@ -157,6 +162,11 @@ impl<'a> Voices<'a> {
                     // Latch the speed so non-fine slides apply on subsequent ticks.
                     self.volume_slide_speed = s;
                     self.volume_slide_fine = f;
+                }
+                GlobalEffect::MidiMacro(macro_type) => {
+                    if let Some(ch) = self.channel.get_mut(ch_index) {
+                        ch.apply_midi_macro(macro_type);
+                    }
                 }
                 // Everything else is owned by the sequencer.
                 _ => {}

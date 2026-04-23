@@ -121,6 +121,13 @@ impl<'a> StateSample<'a> {
         self.position.1 = 0;
     }
 
+    /// Length of the underlying sample in sample frames. Used by the
+    /// channel's Oxx-past-end branch to decide whether to clamp
+    /// (IT old-effects) or drop the offset (IT default / XM / etc.).
+    pub fn sample_len(&self) -> usize {
+        self.sample.len()
+    }
+
     #[inline(always)]
     fn increment_position(&mut self) -> u32 {
         if let Some(step) = self.step {
