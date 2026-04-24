@@ -792,7 +792,17 @@ impl<'a> Channel<'a> {
 
             if !contains(flags, TRIGGER_KEEP_VOLUME) {
                 instr.volume_reset();
-                self.volume = instr.volume;
+                // IT's volume cascade at note-trigger time:
+                //   voice_start = Sample.volume * default_note_volume
+                //                 (i.e., GvL * Vol in IT terms)
+                // A V-column override later in effect processing
+                // replaces `self.volume` wholesale, at which point
+                // Vol is cleanly gone but GvL still scales the sample
+                // on every sample-mixer tick via `StateInstrDefault`.
+                // For non-IT formats, default_note_volume is 1.0 so
+                // this folds to the previous behaviour.
+                let dnv = instr.current_sample_default_note_volume();
+                self.volume = (instr.volume * dnv).clamp(0.0, 1.0);
             }
 
             // Panning reset on every retrigger. IT would strictly

@@ -460,3 +460,200 @@ it is considered an alternative to `sample()` / the `Iterator` impl,
 and firing observers on both would cause double dispatch if the two
 paths were interleaved. Pick one path or the other for a given player
 instance.
+
+## MIDI observers
+
+Impulse Tracker modules can embed MIDI macros that, when triggered via
+`Zxx` (parametric / fixed macro) or `SFx` (macro selector), emit MIDI
+data. xmrsplayer's internal interpreter handles the `F0 F0 nn xx`
+"filter control" frames natively (they drive the per-voice resonant
+filter) but everything else — standard channel messages (Note On/Off,
+CC, Program Change, Pitch Bend, Aftertouch) and SysEx — has no internal
+meaning to attach, so the bytes are emitted as `MidiEvent`s to any
+subscribed `MidiObserver`.
+
+This is the third subscription trait, parallel to `PlayerObserver`
+(song events) and the audio observers (produced samples). The use case
+is different: bridging a module to real MIDI hardware, routing to a
+soft synth, logging, or just inspecting what a given IT file's macros
+actually emit.
+
+### The trait
+
+```rust
+pub trait MidiObserver: Send {
+    fn on_midi_event(&mut self, event: &MidiEvent, source_channel: usize);
+}
+```
+
+### The event
+
+```rust
+pub enum MidiEvent {
+    NoteOff       { channel: u8, note: u8, velocity: u8 },
+    NoteOn        { channel: u8, note: u8, velocity: u8 },
+    PolyAftertouch{ channel: u8, note: u8, pressure: u8 },
+    ControlChange { channel: u8, controller: u8, value: u8 },
+    ProgramChange { channel: u8, program: u8 },
+    ChannelAftertouch { channel: u8, pressure: u8 },
+    PitchBend     { channel: u8, value: u16 },  // 14-bit, centre = 8192
+    SysEx(Vec<u8>),
+    Raw(Vec<u8>),
+}
+```
+
+`NoteOn` with velocity 0 is aliased to `NoteOff` before dispatch (per
+MIDI convention), so `NoteOn { velocity: 0 }` never reaches the
+callback.
+
+`SysEx` carries the leading `F0` but strips the terminating `F7` —
+consumers that need the raw wire stream append the `F7` themselves.
+The IT-internal `F0 F0 nn xx` frames are consumed by the filter and
+never reach this variant.
+
+`Raw` is a fallback for byte sequences that look like MIDI data but
+don't parse cleanly (truncated message, unknown status byte). Most
+consumers can ignore it; forwarders that want to pass everything
+through reuse the payload verbatim.
+
+### Two different "channels"
+
+The trait signature carries two channel-like parameters that are
+**independent**:
+
+- `source_channel: usize` (the callback's second argument) is the
+  **tracker pattern channel** the macro was triggered on. Range:
+  `0..module.get_num_channels()`. Use this to associate the event
+  with its origin (e.g., route tracker channel 3 to MIDI port A,
+  channel 5 to port B).
+
+- `channel: u8` (inside each event variant) is the **MIDI channel**
+  encoded in the low nibble of the status byte. Range: `0..16`. This
+  is what the macro's author wrote in the macro string (`9n nn vv`
+  where `n` is the MIDI channel).
+
+The two can differ freely: a macro on tracker channel 3 can address
+MIDI channel 7, or MIDI channel 0, or whatever the author encoded.
+
+### Registration
+
+```rust
+use xmrsplayer::prelude::*;
+
+let mut player = XmrsPlayer::new(&module, 48_000.0, 0);
+player.add_midi_observer(Box::new(MyMidiBridge::new(port)));
+
+// Symmetric clear / count methods:
+player.clear_midi_observers();
+let n = player.midi_observer_count();
+```
+
+### Dispatch timing
+
+MIDI events are dispatched **once per row**, immediately after the
+row's effects have been processed and before the row's first tick
+produces audio. This is because `Zxx` / `SFx` are row-start effects:
+the macro fires at tick 0, and queuing events until row-end would
+collapse distinct macro invocations from different channels into a
+single batch.
+
+If no observer is registered, the internal event buffer is still
+drained (to bound memory) but no allocation or dispatch happens. Cost
+of registering the trait is one `Vec<Box<dyn MidiObserver + Send>>`
+on the player and one vtable dispatch per emitted event.
+
+### Cost model
+
+Very cheap: a macro emits at most a handful of events per row, and
+rows fire at a few Hz — the aggregate is orders of magnitude below
+the audio observers. No hot-path gating is needed.
+
+Modules without embedded MIDI macros (every XM / MOD / S3M, and IT
+files without the macro flag) never enter the dispatch path at all —
+the buffer stays empty because the interpreter is only invoked for
+`Zxx` / `SFx`.
+
+### Pause behaviour
+
+When the player is paused, row advancement stops, so no `Zxx` macros
+fire and no events are emitted. This is the correct behaviour: MIDI
+hardware that received a Note On before the pause keeps sounding
+unless the observer itself emits a compensating Note Off.
+
+If your bridge needs "all notes off" on pause, track `player.pause()`
+transitions externally and send the All-Notes-Off CC (controller 123)
+to every MIDI channel your module uses.
+
+### The `DebugMidiObserver`
+
+The crate ships a built-in MIDI observer that prints every emitted
+event to stdout, mirroring `DebugObserver` for song events:
+
+```rust
+use xmrsplayer::prelude::*;
+
+player.add_midi_observer(Box::new(DebugMidiObserver::new()));
+```
+
+Output is one line per event, prefixed with the tracker channel:
+
+```text
+ch03 NoteOn        midi_ch=0 note=60 vel=100
+ch05 ControlChange midi_ch=0 cc=74 val=64
+ch07 SysEx         len=6 data=[F0, 7E, 7F, 09, 01, ...]
+```
+
+Long SysEx payloads can be truncated for readability:
+
+```rust
+player.add_midi_observer(
+    Box::new(DebugMidiObserver::new().with_truncate_sysex(true))
+);
+```
+
+Only available when the `std` feature is on.
+
+### Example — bridge to `midir`
+
+```rust
+use midir::{MidiOutput, MidiOutputConnection};
+
+struct MidirBridge {
+    conn: MidiOutputConnection,
+}
+
+impl MidiObserver for MidirBridge {
+    fn on_midi_event(&mut self, event: &MidiEvent, _src_ch: usize) {
+        // Serialise the event back to wire bytes and send.
+        let bytes: Vec<u8> = match event {
+            MidiEvent::NoteOn { channel, note, velocity } =>
+                vec![0x90 | (channel & 0x0F), *note, *velocity],
+            MidiEvent::NoteOff { channel, note, velocity } =>
+                vec![0x80 | (channel & 0x0F), *note, *velocity],
+            MidiEvent::ControlChange { channel, controller, value } =>
+                vec![0xB0 | (channel & 0x0F), *controller, *value],
+            MidiEvent::ProgramChange { channel, program } =>
+                vec![0xC0 | (channel & 0x0F), *program],
+            MidiEvent::PitchBend { channel, value } => {
+                let lsb = (*value & 0x7F) as u8;
+                let msb = ((*value >> 7) & 0x7F) as u8;
+                vec![0xE0 | (channel & 0x0F), lsb, msb]
+            }
+            MidiEvent::SysEx(data) => {
+                let mut v = data.clone();
+                v.push(0xF7);
+                v
+            }
+            // Aftertouch, Raw — omitted for brevity.
+            _ => return,
+        };
+        let _ = self.conn.send(&bytes);
+    }
+}
+```
+
+Real deployments should probably post events to a ring buffer read by a
+dedicated MIDI thread rather than calling `conn.send` on the audio
+thread — the dispatch runs on the sample-producing thread (same as the
+other observer traits), and `midir`'s `send` can block briefly
+depending on the backend.

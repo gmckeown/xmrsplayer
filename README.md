@@ -45,7 +45,7 @@ for sample in player.by_ref().take(48_000 * 2) {
 
 See the `examples/` directory for complete players built on `cpal` and `rodio`.
 
-The player also exposes a subscription API — hook into row/tick changes with `PlayerObserver`, or into the produced audio stream with `MixObserver` / `ChannelsObserver` (VU-meters, WAV recorders, visualisers). See [OBSERVERS.md](OBSERVERS.md).
+The player also exposes a subscription API — hook into row/tick changes with `PlayerObserver`, into the produced audio stream with `MixObserver` / `ChannelsObserver` (VU-meters, WAV recorders, visualisers), or into MIDI events emitted by IT `Zxx` macros with `MidiObserver` (bridge to external synths or hardware). See [OBSERVERS.md](OBSERVERS.md).
 
 ## Cargo features
 

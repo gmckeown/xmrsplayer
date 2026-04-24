@@ -191,6 +191,24 @@ impl<'a> StateInstrDefault<'a> {
         self.volume_fadeout * self.envelope_volume.value * self.volume * self.instr.global_volume
     }
 
+    /// The current sample's `default_note_volume` — IT's per-sample
+    /// Vol register normalised to 0..1. For non-IT formats this is
+    /// always 1.0 (identity). Returns 1.0 when no sample is currently
+    /// selected.
+    ///
+    /// Used by the channel-level trigger path to apply Vol at note-
+    /// on time on top of the always-applied `Sample.volume` (GvL).
+    /// A V-column override later in effect processing replaces the
+    /// resulting `self.volume` wholesale, cleanly superseding Vol
+    /// without also discarding the GvL scaling.
+    pub fn current_sample_default_note_volume(&self) -> f32 {
+        self.current_sample_num
+            .and_then(|n| self.instr.sample.get(n))
+            .and_then(|s| s.as_ref())
+            .map(|s| s.default_note_volume)
+            .unwrap_or(1.0)
+    }
+
     /// Current pitch-envelope contribution, in semitones.
     ///
     /// The xmrs signed-normalised envelope stores the IT node
