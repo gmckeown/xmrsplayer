@@ -294,6 +294,33 @@ impl<'a> Channel<'a> {
         }
     }
 
+    /// IT-only "note fade" (`~~~` in the pattern, raw byte 246).
+    /// Distinct from `key_off`: a fade starts the volume-fadeout
+    /// counter without entering the envelope's release segment, so
+    /// envelopes keep ticking from where they were and only
+    /// `volume_fadeout` decays. Schism (`effects.c:1508`) treats
+    /// any unknown / out-of-range note byte as fade too, which is
+    /// why the IT pattern decoder folds 120..=252 here.
+    ///
+    /// Implementation note: this reuses `instr.key_off()` because
+    /// the player's `key_off` already does the right thing for
+    /// "fade behaviour" — clears `sustained`, which is what makes
+    /// `volume_fadeout` tick down. The release segment of the
+    /// volume envelope, which `key_off` also enters, is benign for
+    /// instruments without an explicit release branch (it just
+    /// continues from the current point); for instruments with one,
+    /// it produces an audible difference vs schism that would need
+    /// a finer-grained API to fix. Acceptable rendering compromise
+    /// — IT NOTE_FADE is used overwhelmingly to fade out tails on
+    /// instruments without dedicated release shapes.
+    fn note_fade(&mut self) {
+        let Some(i) = &mut self.instr else {
+            self.cut_pitch();
+            return;
+        };
+        i.key_off();
+    }
+
     /// Drop every ghost voice on this channel. Used by the facade
     /// when the song is seeked (goto) — stale ghosts from the
     /// previous playback position must not bleed into the new one.
@@ -1029,8 +1056,15 @@ impl<'a> Channel<'a> {
                     if current_tick == 0 && self.current.note.is_valid() {
                         if let Some(instr) = &mut self.instr {
                             instr.set_finetune(finetune);
-                            self.note =
-                                self.current.note.value() as f32 + instr.get_finetuned_pitch();
+                            // Recomputing the playback frequency
+                            // after a finetune change must use the
+                            // remapped output note, same as the
+                            // initial trigger. Otherwise a finetune
+                            // event on a drum-kit voice would jump
+                            // to the input-note pitch and break the
+                            // remap.
+                            let played = instr.played_pitch_for(self.current.note);
+                            self.note = played.value() as f32 + instr.get_finetuned_pitch();
                             self.period = self.period_helper.note_to_period(self.note);
                         }
                     }
@@ -1644,6 +1678,14 @@ impl<'a> Channel<'a> {
             return true; // Keyoff does not change instrument
         }
 
+        // IT note-fade `~~~` (Pitch::Fade): same instrument-handling
+        // rule as Off — the fade cell is not a "new note" and must
+        // not load a different instrument or retrigger. The actual
+        // fadeout work is done in `tick0_load_pitch::note_fade`.
+        if self.current.note.is_fade() {
+            return true;
+        }
+
         self.tick0_change_instr(false)
     }
 
@@ -1656,6 +1698,14 @@ impl<'a> Channel<'a> {
                 } else {
                     self.trigger_pitch(TRIGGER_KEEP_PERIOD | TRIGGER_KEEP_ENVELOPE);
                 }
+            } else if self.current.note.is_fade() {
+                // IT note-column `~~~`: start fadeout without
+                // releasing the envelope. Falls through any
+                // instrument change because fade has the same
+                // semantics whether the instrument cell is set or
+                // not — schism doesn't gate on `row_instr` for
+                // NOTE_FADE either.
+                self.note_fade();
             }
             return;
         }
@@ -1666,7 +1716,17 @@ impl<'a> Channel<'a> {
             if self.current.has_tone_portamento() {
                 if let Some(s) = &instr.state_sample {
                     if s.is_enabled() {
-                        self.note = self.current.note.value() as f32 + s.get_finetuned_pitch();
+                        // Same input/output split as in the SetNote
+                        // branch below: the porta target's input
+                        // note (`current.note`) is what `current_
+                        // note` records for DCT comparisons, but
+                        // the period the slide aims at lives in
+                        // frequency space, so it must use the
+                        // remapped output pitch. Without this, a
+                        // Gxx targeting a remapped key on a drum
+                        // kit would slide to the wrong pitch.
+                        let played = instr.played_pitch_for(self.current.note);
+                        self.note = played.value() as f32 + s.get_finetuned_pitch();
                         self.current_note = Some(self.current.note);
                         return;
                     }
@@ -1696,7 +1756,31 @@ impl<'a> Channel<'a> {
             if let Some(instr) = &mut self.instr {
                 if instr.set_pitch(self.current.note) {
                     if let Some(s) = &instr.state_sample {
-                        self.note = self.current.note.value() as f32 + s.get_finetuned_pitch();
+                        // Two distinct notes are in play here:
+                        //
+                        //  - `self.current.note` is the **input
+                        //    note** the pattern asked for. It stays
+                        //    in `self.current_note` because that's
+                        //    what DCT, NNA and porta-target lookups
+                        //    compare against — pressing C-5 and D-5
+                        //    on the same drum kit must produce
+                        //    distinct voices even if both transpose
+                        //    to the same output pitch.
+                        //
+                        //  - `played_pitch_for(input)` resolves the
+                        //    IT keyboard-table remap to the **output
+                        //    note** — the pitch the sample is
+                        //    actually played at. That's what feeds
+                        //    the period / frequency calculation, so
+                        //    it goes into `self.note`.
+                        //
+                        // For non-IT formats, and for IT
+                        // instruments without a remap on this key,
+                        // `played_pitch_for` returns the input note
+                        // unchanged and this matches the previous
+                        // behaviour byte-for-byte.
+                        let played = instr.played_pitch_for(self.current.note);
+                        self.note = played.value() as f32 + s.get_finetuned_pitch();
                     }
                     self.current_note = Some(self.current.note);
 

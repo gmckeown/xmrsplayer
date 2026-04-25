@@ -284,16 +284,49 @@ impl<'a> StateInstrDefault<'a> {
             // isn't double-modulated; here we complete the routing
             // by pushing the envelope value through to the filter.
             //
-            // Value mapping: the envelope's 0..1 range (0.5 = no
-            // offset) is remapped linearly to 0..127 cutoff-register
-            // units. The instrument's static cutoff setting (set
-            // via the header bytes at trigger time) is overwritten
-            // on every tick the envelope is alive — matching the
-            // intent of the flag, which is "let the envelope run
-            // the filter".
+            // Schism's reference implementation
+            // (`sndmix.c::rn_pitch_filter_envelope` +
+            // `filters.c::setup_channel_filter`) treats the pitch
+            // envelope as a *modulator* of the cutoff posed by the
+            // instrument header, not a substitute:
+            //
+            //   modifier  = (env_value_signed - 32) * 8     // -256..+256
+            //   cutoff    = base_cutoff * (modifier + 256) / 256
+            //
+            // In xmrs, `envelope_pitch.value` arrives already
+            // normalised to 0..1 by `to_envelope_points_signed`,
+            // with 0.5 corresponding to the IT-signed 0 (neutral).
+            // Substituting:
+            //
+            //   modifier   = (value - 0.5) * 512
+            //   new_cutoff = base * (modifier + 256) / 256
+            //              = base * (value * 512) / 256
+            //              = base * value * 2
+            //
+            // Cases:
+            //   value = 0.0 → cutoff = 0       (filter fully closed)
+            //   value = 0.5 → cutoff = base    (no change)
+            //   value = 1.0 → cutoff = 2*base  (clamped at 127)
+            //
+            // The base cutoff comes from the instrument header byte
+            // — the bottom 7 bits of `initial_filter_cutoff` (bit 7
+            // is the enable flag and is consumed elsewhere). xmrs's
+            // cutoff register is clamped to 0..=127 by
+            // `set_cutoff_reg`, so the modulated value clamps there
+            // even though schism allows 0..255. That's a property
+            // of xmrs's filter coefficient table, unrelated to the
+            // modulation logic.
+            //
+            // The previous code substituted `value * 127` as the
+            // cutoff outright, which: (a) ignored the instrument's
+            // base cutoff entirely, and (b) silenced any sample at
+            // envelope-value 0.5 (true neutral) by setting cutoff
+            // to ~63 regardless of intent.
             if self.instr.pitch_envelope_as_low_pass_filter {
-                let cutoff = (self.envelope_pitch.value.clamp(0.0, 1.0) * 127.0) as u8;
-                self.filter.set_cutoff_reg(cutoff);
+                let base = (self.instr.initial_filter_cutoff & 0x7F) as f32;
+                let v = self.envelope_pitch.value.clamp(0.0, 1.0);
+                let modulated = (base * v * 2.0).min(127.0) as u8;
+                self.filter.set_cutoff_reg(modulated);
             }
         }
     }
@@ -331,6 +364,29 @@ impl<'a> StateInstrDefault<'a> {
                 semitone,
             );
             s.set_step(f);
+        }
+    }
+
+    /// Resolve the *output* pitch for a given input note, applying
+    /// the instrument's keyboard remap if any.
+    ///
+    /// IT drum-kit instruments wire each input key to an absolute
+    /// output note via `note_for_pitch`. When the entry is `Some`,
+    /// the sample is played at that output pitch regardless of which
+    /// key the user pressed. When it's `None` (the identity case),
+    /// or for any other format that doesn't populate the array, the
+    /// played pitch is the input note itself.
+    ///
+    /// Used by the channel at trigger time to compute the frequency
+    /// the sample should play at, while the input note is preserved
+    /// for DCT / NNA / portamento-target comparisons.
+    pub fn played_pitch_for(&self, input: Pitch) -> Pitch {
+        if !input.is_valid() {
+            return input;
+        }
+        match self.instr.note_for_pitch[input.value() as usize] {
+            Some(out) => Pitch::try_from(out).unwrap_or(input),
+            None => input,
         }
     }
 
@@ -399,5 +455,77 @@ impl<'a> Iterator for StateInstrDefault<'a> {
         // without either register's bit-7 set), this is a no-op
         // pass-through — checked once at the top of `process`.
         raw.map(|(l, r)| self.filter.process(l, r))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xmrs::prelude::*;
+
+    fn make_instr_with_remap(remap: &[(usize, u8)]) -> InstrDefault {
+        let mut instr = InstrDefault::default();
+        for (input, output) in remap {
+            instr.note_for_pitch[*input] = Some(*output);
+        }
+        instr
+    }
+
+    fn state_for(instr: &InstrDefault) -> StateInstrDefault<'_> {
+        // Use linear-frequency period helper; played_pitch_for
+        // doesn't actually consult the period helper, but
+        // StateInstrDefault::new requires one.
+        let ph = PeriodHelper::new(FrequencyType::LinearFrequencies, false);
+        StateInstrDefault::new(instr, 0, ph, 44100.0)
+    }
+
+    #[test]
+    fn played_pitch_identity_when_no_remap() {
+        // XM/MOD/S3M-style instruments: every note_for_pitch entry
+        // is None. played_pitch_for must echo the input untouched.
+        let instr = InstrDefault::default();
+        let state = state_for(&instr);
+        for raw in 0u8..=119 {
+            if let Ok(p) = Pitch::try_from(raw) {
+                assert_eq!(state.played_pitch_for(p), p);
+            }
+        }
+    }
+
+    #[test]
+    fn played_pitch_applies_remap() {
+        // Drum-kit style: input D-5 (62) is wired to output C-5
+        // (60, transposed down 2 semitones); input E-5 (64) is
+        // wired to output G-5 (67).
+        let instr = make_instr_with_remap(&[(62, 60), (64, 67)]);
+        let state = state_for(&instr);
+
+        assert_eq!(
+            state.played_pitch_for(Pitch::D5),
+            Pitch::C5,
+            "input D-5 transposes to output C-5"
+        );
+        assert_eq!(
+            state.played_pitch_for(Pitch::E5),
+            Pitch::G5,
+            "input E-5 transposes to output G-5"
+        );
+        // Untouched keys: identity.
+        assert_eq!(state.played_pitch_for(Pitch::C5), Pitch::C5);
+        assert_eq!(state.played_pitch_for(Pitch::F5), Pitch::F5);
+    }
+
+    #[test]
+    fn played_pitch_passes_through_invalid_notes() {
+        // Pitch::None / Off / Fade / Cut have value() ≥ 120 and
+        // are not valid lookups in the keyboard table. The helper
+        // must return them untouched so the caller's downstream
+        // is_keyoff() / is_fade() checks still see the original.
+        let instr = make_instr_with_remap(&[(60, 67)]);
+        let state = state_for(&instr);
+        assert_eq!(state.played_pitch_for(Pitch::None), Pitch::None);
+        assert_eq!(state.played_pitch_for(Pitch::Off), Pitch::Off);
+        assert_eq!(state.played_pitch_for(Pitch::Fade), Pitch::Fade);
+        assert_eq!(state.played_pitch_for(Pitch::Cut), Pitch::Cut);
     }
 }
