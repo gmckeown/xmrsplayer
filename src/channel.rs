@@ -140,6 +140,13 @@ pub struct Channel<'a> {
     /// triggers on this channel. `None` = use the incoming
     /// instrument's own NNA value, which is the normal case.
     nna_override: Option<NewNoteAction>,
+    /// PRNG for IT humanisation (random volume / pan variation).
+    /// Seeded deterministically per-channel by `Voices::new` so the
+    /// same module always produces the same WAV — IT humanisation
+    /// is meant to de-robot static samples, not to introduce non-
+    /// determinism into the render pipeline. Updated at every
+    /// note-trigger that consults `random_*_variation`.
+    rng: xmrs::xorshift::XorShift32,
 }
 
 impl<'a> Channel<'a> {
@@ -198,7 +205,29 @@ impl<'a> Channel<'a> {
             actual_volume: [0.0, 0.0],
             ghosts: Vec::new(),
             nna_override: None,
+            // `XorShift32::default()` uses the type's canonical
+            // non-zero seed (4294967291). `Voices::new` re-seeds
+            // each channel with a per-channel-unique value after
+            // construction so the streams stay independent.
+            rng: xmrs::xorshift::XorShift32::default(),
         }
+    }
+
+    /// Signed uniform random in `[-1.0, 1.0]`. Wraps
+    /// `XorShift32::next_f32` (which is `[0, 1]`) and centres.
+    #[inline]
+    fn rng_bipolar(&mut self) -> f32 {
+        self.rng.next_f32() * 2.0 - 1.0
+    }
+
+    /// Re-seed the channel's PRNG. Called by `Voices::new` with a
+    /// per-channel value so each channel gets an independent (but
+    /// deterministic) humanisation stream. Zero is rejected by
+    /// `XorShift32::new` — the caller is responsible for passing
+    /// a non-zero seed.
+    pub(crate) fn reseed_rng(&mut self, seed: u32) {
+        let seed = if seed == 0 { 0xDEADBEEF } else { seed };
+        self.rng = xmrs::xorshift::XorShift32::new(Some(seed));
     }
 
     /// Forward a tempo change to the arpeggio effect. Called by the
@@ -805,15 +834,34 @@ impl<'a> Channel<'a> {
                 self.volume = (instr.volume * dnv).clamp(0.0, 1.0);
             }
 
-            // Panning reset on every retrigger. IT would strictly
-            // only reset panning when an instrument column is
-            // present (a ghost-note trigger keeps the channel's
-            // current pan). In practice the distinction is audibly
-            // minor on real modules — Pxx slides kicked in mid-note
-            // are rare — so we accept the simpler unconditional
-            // reset here. Revisit if specific modules show pan
-            // regressions.
-            self.panning = instr.panning;
+            // Panning reset: IT is selective (only when the cell
+            // carries an instrument column — a ghost-note retrigger
+            // keeps the channel's current pan so in-flight Pxx
+            // slides / panning envelope persist). Other formats
+            // reset unconditionally on every retrigger; that's
+            // canonical XM/S3M and we don't change it here.
+            //
+            // Pitch-pan separation goes inside the same branch: it's
+            // a per-note offset relative to the instrument's stored
+            // pan, so it makes sense only when we just landed on
+            // that stored pan. A ghost retrigger inherits whatever
+            // pps the previous note baked in.
+            let do_pan_reset = if self.module.format.is_it() {
+                self.current.instrument.is_some()
+            } else {
+                true
+            };
+            if do_pan_reset {
+                self.panning = instr.panning;
+
+                let pps = instr.pitch_pan_separation();
+                if pps != 0.0 {
+                    let note_i = self.note as i32;
+                    let ppc = instr.pitch_pan_center_semitones();
+                    let shift = pps * ((note_i - ppc) as f32) / 60.0;
+                    self.panning = (self.panning + shift).clamp(0.0, 1.0);
+                }
+            }
 
             if !contains(flags, TRIGGER_KEEP_PERIOD) {
                 self.period = self.period_helper.note_to_period(self.note);
@@ -836,6 +884,32 @@ impl<'a> Channel<'a> {
                     self.effect_vibrato.value(),
                     self.effect_semitone,
                 );
+            }
+        }
+
+        // IT humanisation (random_volume_variation /
+        // random_pan_variation). Applied AFTER the main instr block
+        // closes so we can freely use `&mut self` for the PRNG
+        // without the borrow checker fighting the `instr` read. Done
+        // only on fresh triggers (not when `TRIGGER_KEEP_VOLUME` is
+        // set — ghost-note retrigs and tone-portamento should not
+        // re-roll). Non-IT formats have both variations at zero, so
+        // this path is a measured no-op there.
+        if !contains(flags, TRIGGER_KEEP_VOLUME) {
+            let (rvv, rpv) = match &self.instr {
+                Some(instr) => (
+                    instr.random_volume_variation(),
+                    instr.random_pan_variation(),
+                ),
+                None => (0.0, 0.0),
+            };
+            if rvv > 0.0 {
+                let d = self.rng_bipolar() * rvv;
+                self.volume = (self.volume * (1.0 + d)).clamp(0.0, 1.0);
+            }
+            if rpv > 0.0 {
+                let d = self.rng_bipolar() * rpv;
+                self.panning = (self.panning + d).clamp(0.0, 1.0);
             }
         }
     }

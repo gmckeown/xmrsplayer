@@ -70,9 +70,17 @@ pub struct Voices<'a> {
 impl<'a> Voices<'a> {
     pub(crate) fn new(module: &'a Module, sample_rate: f32, initial_tempo: usize) -> Self {
         let num_channels = module.get_num_channels();
+        let mut channels = vec![Channel::new(module, sample_rate, initial_tempo); num_channels];
+        // Deterministic per-channel seed so each channel has an
+        // independent IT-humanisation stream while the whole render
+        // stays bit-reproducible. High bits give us a non-zero base;
+        // low bits distinguish channels.
+        for (i, ch) in channels.iter_mut().enumerate() {
+            ch.reseed_rng(0xA5A5_0000 | (i as u32 + 1));
+        }
         Self {
             sample_rate,
-            channel: vec![Channel::new(module, sample_rate, initial_tempo); num_channels],
+            channel: channels,
             global_volume: 1.0,
             amplification: 1.0,
             volume_slide_speed: 0.0,

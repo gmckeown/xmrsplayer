@@ -209,6 +209,33 @@ impl<'a> StateInstrDefault<'a> {
             .unwrap_or(1.0)
     }
 
+    /// Instrument-level random volume variation (IT humanisation).
+    /// IT stores this as 0..100 percent of the starting volume; the
+    /// importer normalises to 0..1. Zero for non-IT formats.
+    pub fn random_volume_variation(&self) -> f32 {
+        self.instr.random_volume_variation
+    }
+
+    /// Instrument-level random pan variation (IT humanisation).
+    /// Same range / normalisation as `random_volume_variation`.
+    pub fn random_pan_variation(&self) -> f32 {
+        self.instr.random_pan_variation
+    }
+
+    /// Instrument-level pitch-pan separation (IT). Positive values
+    /// spread the pan as the played note moves away from
+    /// `pitch_pan_center`. The importer normalises IT's signed
+    /// -32..+32 byte to -1..+1. Zero for non-IT formats.
+    pub fn pitch_pan_separation(&self) -> f32 {
+        self.instr.pitch_pan_separation
+    }
+
+    /// The reference note for `pitch_pan_separation`, returned as a
+    /// semitone index (0 = C0). Non-IT: `Pitch::C4` (= 48).
+    pub fn pitch_pan_center_semitones(&self) -> i32 {
+        self.instr.pitch_pan_center as i32
+    }
+
     /// Current pitch-envelope contribution, in semitones.
     ///
     /// The xmrs signed-normalised envelope stores the IT node
