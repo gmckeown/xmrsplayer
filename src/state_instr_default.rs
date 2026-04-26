@@ -57,6 +57,25 @@ pub struct StateInstrDefault<'a> {
 
     // Volume sustained?
     pub sustained: bool,
+    /// Whether the voice is in its "fadeout" phase (schism's
+    /// `CHN_NOTEFADE`). Independent from [`sustained`] because IT
+    /// distinguishes two stages after a key-off:
+    ///   1. release — sustain is gone but the envelope is still
+    ///      walking through its release section. Fadeout has NOT
+    ///      started yet; the voice plays at whatever level the
+    ///      envelope dictates.
+    ///   2. fadeout — either the envelope reached its last point
+    ///      with no loop to wrap it back, or the instrument has no
+    ///      envelope at all, or NNA = NoteFade was applied. The
+    ///      `volume_fadeout` register starts decaying.
+    ///
+    /// Set by [`Self::envelopes`] when the volume envelope walks
+    /// past its last point, by [`Self::key_off`] in the no-envelope
+    /// / loop+fadeout branches (mirroring schism's `fx_key_off`),
+    /// and by [`Self::start_fadeout`] for NNA NoteFade. Cleared by
+    /// [`Self::envelopes_reset`] / [`Self::volume_reset`] on a fresh
+    /// trigger.
+    pub volume_fading_out: bool,
     /// Volume fadeout value
     pub volume_fadeout: f32,
 
@@ -104,6 +123,7 @@ impl<'a> StateInstrDefault<'a> {
             envelope_panning: StateEnvelope::new(pe, 0.5),
             envelope_pitch: StateEnvelope::new(pie, 0.5),
             sustained: true,
+            volume_fading_out: false,
             volume_fadeout: 1.0,
             volume: 1.0,
             volume_orig: 1.0,
@@ -146,6 +166,7 @@ impl<'a> StateInstrDefault<'a> {
 
     pub fn envelopes_reset(&mut self) {
         self.sustained = true;
+        self.volume_fading_out = false;
         self.volume_fadeout = 1.0;
         self.envelope_volume.reset();
         self.envelope_panning.reset();
@@ -155,6 +176,7 @@ impl<'a> StateInstrDefault<'a> {
     pub fn volume_reset(&mut self) {
         self.volume = self.volume_orig;
         self.volume_fadeout = 1.0;
+        self.volume_fading_out = false;
         self.sustained = true;
     }
 
@@ -167,16 +189,77 @@ impl<'a> StateInstrDefault<'a> {
     }
 
     pub fn key_off(&mut self) {
-        /* Key Off */
+        /* Key Off — the user's "===" cell, or NNA NoteOff. Releases
+        sustain (the envelope's sustain loop stops wrapping; the
+        release section starts walking through). Whether fadeout
+        ALSO starts now or waits for the envelope to finish its
+        release is decided here, mirroring schism's `fx_key_off`
+        (`effects.c:140-167`). */
         self.sustained = false;
 
         if let Some(ss) = &mut self.state_sample {
             ss.set_sustained(false);
         }
 
-        if !self.envelope_volume.has_volume_envelope() && self.instr.voice.volume_fadeout == 0.0 {
-            self.cut_pitch();
+        let has_env = self.envelope_volume.has_volume_envelope();
+        let env = &self.instr.voice.volume_envelope;
+
+        if !has_env {
+            // No volume envelope: schism takes the alternate render
+            // path (`sndmix.c:1158-1164`) where CHN_NOTEFADE is the
+            // sole control on whether the voice keeps playing. To
+            // get the same behaviour we engage fadeout immediately.
+            // Schism's `fx_key_off` line 142-144 sets CHN_NOTEFADE
+            // for the same reason in the same case.
+            self.volume_fading_out = true;
+            if self.instr.voice.volume_fadeout == 0.0 {
+                // No envelope AND no fadeout amount: nothing keeps
+                // the voice alive past key-off. Cut the pitch (silence
+                // the sample) and force the fadeout register to zero
+                // so `Voice::is_alive()` reports the voice as dead on
+                // the next pool sweep.
+                self.cut_pitch();
+                self.volume_fadeout = 0.0;
+            }
+        } else if env.loop_enabled && self.instr.voice.volume_fadeout > 0.0 {
+            // Looped envelope with non-zero fadeout: schism's
+            // `fx_key_off` line 166-167 also engages CHN_NOTEFADE
+            // here. Without this trigger the looped envelope would
+            // hold the voice forever after key-off; with it, fadeout
+            // runs in parallel and the voice eventually dies.
+            //
+            // FT2/XM modules reach this branch by construction —
+            // the XM importer emulates schism's `xm.c:703-712`
+            // trick (loop pinned to last node, ENV_VOLLOOP forced
+            // on) so any XM voice with a volume envelope takes this
+            // path on key-off, matching FT2's "fadeout starts
+            // immediately, in parallel with the release section"
+            // behaviour.
+            self.volume_fading_out = true;
         }
+        // else: envelope has sustain and a real release section but
+        // no loop. This is the IT-typical pad / lead shape. We
+        // deliberately leave `volume_fading_out` unchanged; the
+        // envelope tick in `envelopes()` will set it the moment the
+        // counter walks past the last point. That's IT's "release
+        // section plays out, THEN fade" semantics.
+        //
+        // The previous unconditional `volume_fadeout` decrement on
+        // every `!sustained` tick — i.e. as soon as key-off fired —
+        // is what made any IT pad/sustain "stop too early": the
+        // fade was running while the release section was still
+        // playing, so the voice went silent before the envelope
+        // finished its decay.
+    }
+
+    /// Engage the fadeout register without releasing sustain.
+    /// Mirrors schism's NNA_NOTEFADE branch (`effects.c:1791-1792`):
+    /// the voice keeps wrapping in its sustain loop while the
+    /// fadeout register decays it to silence. Distinct from
+    /// [`Self::key_off`] (NNA_NOTEOFF), which releases sustain so
+    /// the envelope walks through its release section.
+    pub fn start_fadeout(&mut self) {
+        self.volume_fading_out = true;
     }
 
     pub fn get_volume(&self) -> f32 {
@@ -260,13 +343,45 @@ impl<'a> StateInstrDefault<'a> {
     }
 
     fn envelopes(&mut self) {
-        // Volume
-        if !self.sustained {
-            self.volume_fadeout = (self.volume_fadeout - self.instr.voice.volume_fadeout).max(0.0);
-        }
+        // Volume envelope tick. Run BEFORE the fadeout decrement so
+        // a tick that walks the envelope past its last point can
+        // arm `volume_fading_out` for this same tick — matches the
+        // ordering schism uses in `sndmix.c:1156-1157`
+        // (`rn_increment_env_pos` then `rn_process_envelope`, with
+        // the fadeout register decay happening immediately after as
+        // part of the same processing pass).
         if self.instr.voice.volume_envelope.enabled {
             self.envelope_volume.tick(self.sustained);
+
+            // Schism's `_process_envelope` (sndmix.c:493-499) sets
+            // the volume envelope's `fade_flag` (i.e. CHN_NOTEFADE)
+            // exactly when the counter has walked past the last
+            // point. By construction the counter only gets there
+            // when neither sustain hold nor a real loop has
+            // wrapped it back — i.e. we're in the "release section
+            // ran out" state. `is_past_last_point` captures that
+            // condition directly.
+            if self.envelope_volume.is_past_last_point() {
+                self.volume_fading_out = true;
+            }
         }
+
+        // Fadeout decrement. Gated on `volume_fading_out`, NOT on
+        // `!sustained`. The two diverge in the IT-typical case
+        // where sustain has been released but the envelope is
+        // still walking through its release section: at that point
+        // the voice should play at envelope-controlled volume, not
+        // get attenuated by a parallel fadeout. The fadeout only
+        // kicks in once the envelope itself runs out — set above —
+        // or when `key_off` / `start_fadeout` decided up-front
+        // that the case warrants immediate fade.
+        //
+        // Schism's matching code is `rn_process_ins_fade`
+        // (sndmix.c:326-345): only runs while CHN_NOTEFADE is set.
+        if self.volume_fading_out {
+            self.volume_fadeout = (self.volume_fadeout - self.instr.voice.volume_fadeout).max(0.0);
+        }
+
         // Panning
         if self.instr.voice.pan_envelope.enabled {
             self.envelope_panning.tick(self.sustained);
@@ -464,6 +579,7 @@ impl<'a> Iterator for StateInstrDefault<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use xmrs::prelude::*;
 
     fn make_instr_with_remap(remap: &[(usize, u8)]) -> InstrDefault {
@@ -516,5 +632,188 @@ mod tests {
         // Untouched keys: identity.
         assert_eq!(state.played_pitch_for(Pitch::C5), Pitch::C5);
         assert_eq!(state.played_pitch_for(Pitch::F5), Pitch::F5);
+    }
+
+    // -------- regression tests: voices stopping too early in IT --------
+    //
+    // The 0.10.x player started decrementing `volume_fadeout` the
+    // instant `sustained` flipped to false (i.e. on every key-off),
+    // which is wrong for IT instruments with a release section: the
+    // fade was running in parallel with the release segment, so
+    // pads / sustains went silent before the envelope had finished
+    // its decay. Schism's policy (`fx_key_off`, `_process_envelope`,
+    // `rn_process_ins_fade`) is to gate fadeout decay on a separate
+    // CHN_NOTEFADE flag, set on key-off only in specific cases
+    // (no envelope, looped envelope with fadeout > 0) and otherwise
+    // deferred until the volume envelope walks past its last point.
+    //
+    // The xmrsplayer equivalent is `volume_fading_out`, exercised
+    // by the tests below.
+
+    /// Build an envelope in the IT-typical pad/sustain shape:
+    /// rises from 0 → 1 over 10 ticks, sustains at frame 10, then
+    /// decays linearly to 0 at frame 50. No loop, just sustain +
+    /// release.
+    fn pad_envelope() -> Envelope {
+        Envelope {
+            enabled: true,
+            point: vec![
+                EnvelopePoint {
+                    frame: 0,
+                    value: 0.0,
+                },
+                EnvelopePoint {
+                    frame: 10,
+                    value: 1.0,
+                },
+                EnvelopePoint {
+                    frame: 50,
+                    value: 0.0,
+                },
+            ],
+            sustain_enabled: true,
+            sustain_start_point: 1,
+            sustain_end_point: 1,
+            loop_enabled: false,
+            loop_start_point: 0,
+            loop_end_point: 0,
+        }
+    }
+
+    fn instr_with_envelope(env: Envelope, fadeout: f32) -> InstrDefault {
+        let mut instr = InstrDefault::default();
+        instr.voice.volume_envelope = env;
+        instr.voice.volume_fadeout = fadeout;
+        instr
+    }
+
+    #[test]
+    fn it_pad_release_section_plays_before_fadeout() {
+        // The bug: after key-off on an IT pad (sustain + release, no
+        // loop), `volume_fadeout` was decrementing every tick as the
+        // envelope walked through its release section. Voices died
+        // before the envelope's natural decay finished.
+        //
+        // The fix: `volume_fading_out` (CHN_NOTEFADE-equivalent)
+        // stays false through the release, so `volume_fadeout` is
+        // held at 1.0. It only flips true after the envelope has
+        // walked past its last point — at which point the fadeout
+        // register starts decaying.
+        let instr = instr_with_envelope(pad_envelope(), 0.01);
+        let mut state = state_for(&instr);
+        assert!(state.sustained);
+        assert!(!state.volume_fading_out);
+        assert_eq!(state.volume_fadeout, 1.0);
+
+        state.key_off();
+        // Sustain released, but fading not yet armed: envelope has
+        // a real release section to play through first.
+        assert!(!state.sustained, "key-off must release sustain");
+        assert!(
+            !state.volume_fading_out,
+            "fading must NOT engage on key-off when the envelope has a release section"
+        );
+
+        // Tick the envelope from sustain (counter starts at 0 in
+        // a fresh state) toward the last point at frame 50. All
+        // through that walk, the fadeout register must stay at 1.0
+        // — the release section is still playing.
+        for _ in 0..49 {
+            state.tick();
+            assert_eq!(
+                state.volume_fadeout, 1.0,
+                "fadeout must not decay while the release section is still playing"
+            );
+            assert!(
+                !state.volume_fading_out,
+                "fading must not arm before the envelope has walked past its last point"
+            );
+        }
+
+        // Push past the last point. The exact tick at which
+        // `is_past_last_point` flips depends on the inner branch
+        // ordering of `StateEnvelope::tick`, but a handful of
+        // extra ticks comfortably brackets it.
+        for _ in 0..5 {
+            state.tick();
+        }
+        assert!(
+            state.volume_fading_out,
+            "envelope walking past its last point must arm fadeout"
+        );
+
+        // From now on, fadeout decays. The next tick brings the
+        // register strictly below its previous value.
+        let pre = state.volume_fadeout;
+        state.tick();
+        assert!(
+            state.volume_fadeout < pre,
+            "fadeout register must decrement once the envelope is past its end"
+        );
+    }
+
+    #[test]
+    fn no_envelope_fades_immediately_on_key_off() {
+        // No volume envelope at all (typical MOD/S3M sample, or an
+        // IT instrument without an envelope): schism's `fx_key_off`
+        // sets CHN_NOTEFADE right away because the envelope isn't
+        // there to defer the decision.
+        let instr = instr_with_envelope(Envelope::default(), 0.01);
+        let mut state = state_for(&instr);
+        state.key_off();
+        assert!(
+            state.volume_fading_out,
+            "key-off on a no-envelope instrument must engage fadeout immediately"
+        );
+        // And the fadeout register must actually start moving.
+        let pre = state.volume_fadeout;
+        state.tick();
+        assert!(state.volume_fadeout < pre);
+    }
+
+    #[test]
+    fn looped_envelope_with_fadeout_fades_immediately_on_key_off() {
+        // Envelope with a loop AND a non-zero fadeout: schism's
+        // `fx_key_off` last branch (`effects.c:166-167`) engages
+        // CHN_NOTEFADE right away — without it, the looped envelope
+        // would hold the voice forever past key-off.
+        //
+        // FT2/XM modules reach this branch for *every* enveloped
+        // voice: the XM importer pins a degenerate loop on the
+        // last point so that this exact branch fires, matching
+        // FT2's "fadeout is parallel with the release section"
+        // semantics.
+        let mut env = pad_envelope();
+        env.loop_enabled = true;
+        env.loop_start_point = 2; // last point
+        env.loop_end_point = 2;
+        let instr = instr_with_envelope(env, 0.01);
+        let mut state = state_for(&instr);
+        state.key_off();
+        assert!(
+            state.volume_fading_out,
+            "key-off on a looped envelope with non-zero fadeout must engage fadeout immediately"
+        );
+    }
+
+    #[test]
+    fn start_fadeout_does_not_release_sustain() {
+        // NNA NoteFade / DCA NoteFadeOut / S72 / TrackEffect::
+        // NoteFadeOut all funnel into `start_fadeout`. Schism's
+        // matching code only sets CHN_NOTEFADE — sustain stays
+        // held. The previous implementation went through `key_off`
+        // here, conflating fade with note-off and making the
+        // envelope walk into its release section instead of
+        // continuing to wrap in the sustain loop.
+        let instr = instr_with_envelope(pad_envelope(), 0.01);
+        let mut state = state_for(&instr);
+        assert!(state.sustained);
+        state.start_fadeout();
+        assert!(state.sustained, "start_fadeout must NOT release sustain");
+        assert!(state.volume_fading_out, "start_fadeout must engage fadeout");
+        // And fadeout starts decaying on the next tick.
+        let pre = state.volume_fadeout;
+        state.tick();
+        assert!(state.volume_fadeout < pre);
     }
 }

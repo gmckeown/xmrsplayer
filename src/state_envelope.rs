@@ -27,6 +27,26 @@ impl<'a> StateEnvelope<'a> {
         self.env.enabled || self.enabled
     }
 
+    /// `true` when the envelope's counter has walked past the last
+    /// point's frame. Combined with the fact that the counter is
+    /// only allowed to grow past the last point when neither sustain
+    /// hold nor regular loop has wrapped it, this is precisely the
+    /// condition under which schism's `_process_envelope`
+    /// (`sndmix.c:493-499`) sets the fadeout-engage flag for the
+    /// volume envelope.
+    ///
+    /// Used by [`crate::state_instr_default::StateInstrDefault::envelopes`]
+    /// to defer the fadeout register's decay until the volume
+    /// envelope's release section is genuinely over — the IT
+    /// "release plays out, then fade" behaviour. The previous code
+    /// started fadeout the moment `sustained` flipped, which made
+    /// any keyed-off voice with a release section get cut while
+    /// still in release.
+    pub fn is_past_last_point(&self) -> bool {
+        let n = self.env.point.len();
+        n > 0 && self.counter > self.env.point[n - 1].frame
+    }
+
     pub fn reset(&mut self) {
         self.enabled = self.env.enabled;
         self.value = self.default_value;

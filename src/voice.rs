@@ -150,17 +150,22 @@ impl<'a> Voice<'a> {
         self.instr.key_off();
     }
 
-    /// NNA = NoteFadeOut (unsustain so `volume_fadeout` begins
-    /// ticking down to zero on each envelope update).
+    /// NNA = NoteFadeOut: engage the fadeout register without
+    /// releasing sustain. Mirrors schism's `NNA_NOTEFADE` branch
+    /// in `csf_check_nna` (`effects.c:1791-1792`), which sets
+    /// `CHN_NOTEFADE` but NOT `CHN_KEYOFF`. The envelope keeps
+    /// wrapping in its sustain loop while the fadeout register
+    /// decays the voice to silence — that's how IT's NNA Fade
+    /// differs from NNA NoteOff, which DOES release sustain so
+    /// the envelope walks through its release section before the
+    /// fade engages.
+    ///
+    /// The previous implementation called `instr.key_off()` here,
+    /// conflating the two NNAs and making every NNA Fade ghost
+    /// behave like an NNA NoteOff ghost.
     #[inline]
     pub fn apply_nna_note_fade_out(&mut self) {
-        // `key_off` both clears the sustained flag AND enters the
-        // release segment. For a pure fade-out we just want
-        // `sustained = false` so the fadeout counter ticks; the
-        // envelope's release behaviour is a subset of that. Reusing
-        // `key_off` is the simplest path and produces the right
-        // audible shape on instruments whose envelope has no loop.
-        self.instr.key_off();
+        self.instr.start_fadeout();
     }
 
     /// S7x past-note: immediate cut.
@@ -175,10 +180,13 @@ impl<'a> Voice<'a> {
         self.instr.key_off();
     }
 
-    /// S7x past-note: start fadeout.
+    /// S72 past-note: start fadeout. Mirrors schism's `case 2` of
+    /// the S70 dispatch in `effects.c:734-735`: only `CHN_NOTEFADE`
+    /// gets set, sustain stays held. Distinct from `past_off` (S71)
+    /// which routes through `fx_key_off`.
     #[inline]
     pub fn past_fade_out(&mut self) {
-        self.instr.key_off();
+        self.instr.start_fadeout();
     }
 
     /// Advance envelopes / fadeout / auto-vibrato by one tick. Called
@@ -205,7 +213,7 @@ impl<'a> Voice<'a> {
     ///
     ///   1. its sample stream has run out (`state_sample.step` is
     ///      `None`, surfaced as `!instr.is_enabled()`), OR
-    ///   2. it has been keyed off (`sustained == false`) AND its
+    ///   2. it is in its fadeout phase (`volume_fading_out`) AND its
     ///      monotonic fadeout register has reached zero.
     ///
     /// The current envelope value deliberately does NOT participate.
@@ -221,21 +229,24 @@ impl<'a> Voice<'a> {
     ///     chan->length = 0;
     /// ```
     ///
-    /// (i.e. only voices that have entered `CHN_NOTEFADE` and whose
-    /// fadeout register plus actual output have all reached zero get
-    /// reaped.)
-    ///
-    /// Sustained voices that are silent but still held are kept
-    /// alive here; the voice pool's eviction path is the safety
-    /// valve when the slot is genuinely needed for a louder voice.
+    /// `volume_fading_out` is the xmrsplayer equivalent of
+    /// `CHN_NOTEFADE`; it's set independently from `sustained`,
+    /// which lets a voice be "still sustained, but already fading"
+    /// (the NNA = NoteFade case — `apply_nna_note_fade_out` calls
+    /// `start_fadeout` without releasing sustain). A predicate
+    /// based on `sustained || volume_fadeout > 0.0` would have
+    /// missed that case and held the voice alive forever after
+    /// its fadeout register reached zero.
     #[inline]
     pub fn is_alive(&self) -> bool {
         if !self.instr.is_enabled() {
             return false;
         }
-        // Sustained → keep. Unsustained → keep only while the
-        // fadeout register hasn't run out yet.
-        self.instr.sustained || self.instr.volume_fadeout > 0.0
+        // Only voices that are explicitly fading AND have run their
+        // fadeout register to zero are dead. Everything else — held
+        // sustain, in-release with no fade armed yet, mid-fade —
+        // stays alive.
+        !(self.instr.volume_fading_out && self.instr.volume_fadeout <= 0.0)
     }
 
     /// Produce one stereo sample. Mirrors the gain formula used in

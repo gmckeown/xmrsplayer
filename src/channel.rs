@@ -395,30 +395,18 @@ impl<'a> Channel<'a> {
     }
 
     /// IT-only "note fade" (`~~~` in the pattern, raw byte 246).
-    /// Distinct from `key_off`: a fade starts the volume-fadeout
-    /// counter without entering the envelope's release segment, so
-    /// envelopes keep ticking from where they were and only
-    /// `volume_fadeout` decays. Schism (`effects.c:1508`) treats
-    /// any unknown / out-of-range note byte as fade too, which is
-    /// why the IT pattern decoder folds 120..=252 here.
-    ///
-    /// Implementation note: this reuses `instr.key_off()` because
-    /// the player's `key_off` already does the right thing for
-    /// "fade behaviour" — clears `sustained`, which is what makes
-    /// `volume_fadeout` tick down. The release segment of the
-    /// volume envelope, which `key_off` also enters, is benign for
-    /// instruments without an explicit release branch (it just
-    /// continues from the current point); for instruments with one,
-    /// it produces an audible difference vs schism that would need
-    /// a finer-grained API to fix. Acceptable rendering compromise
-    /// — IT NOTE_FADE is used overwhelmingly to fade out tails on
-    /// instruments without dedicated release shapes.
+    /// Distinct from `key_off`: a fade engages the volume-fadeout
+    /// register without releasing sustain, so the envelope keeps
+    /// wrapping in its sustain loop while the fadeout decays the
+    /// voice. Matches schism's NOTE_FADE handling (`effects.c`
+    /// fold of bytes 120..=252 into the fade path), which does NOT
+    /// route through `fx_key_off`.
     fn note_fade(&mut self, pool: &mut VoicePool<'a>) {
         let Some(i) = self.live_mut(pool) else {
             self.cut_pitch();
             return;
         };
-        i.key_off();
+        i.start_fadeout();
     }
 
     /// Drop every ghost voice on this channel. Used by the facade
@@ -944,7 +932,11 @@ impl<'a> Channel<'a> {
                 }
                 DuplicateCheckAction::NoteFadeOut(_) => {
                     if let Some(i) = self.live_mut(pool) {
-                        i.key_off();
+                        // Schism's DCA_NOTEFADE (`effects.c:1757-1759`)
+                        // sets only CHN_NOTEFADE on the displaced
+                        // voice — sustain stays held while the
+                        // fadeout register decays it.
+                        i.start_fadeout();
                     }
                 }
             }
@@ -1379,11 +1371,18 @@ impl<'a> Channel<'a> {
                             // S72: fade all ghost voices.
                             self.past_note_fade_all(pool);
                         } else if let Some(i) = self.live_mut(pool) {
-                            // Unsustain the live voice so its
-                            // `volume_fadeout` starts ticking down.
-                            // `key_off` is the existing entry point
-                            // for "release envelope + start fadeout".
-                            i.key_off();
+                            // Engage the fadeout register without
+                            // releasing sustain. The previous
+                            // implementation called `key_off`,
+                            // which on IT pads/sustains made the
+                            // envelope walk into its release
+                            // section AND kicked off the fadeout
+                            // in parallel — voices ended up
+                            // shorter than schism plays them.
+                            // `start_fadeout` matches schism's
+                            // NOTE_FADE path (just CHN_NOTEFADE,
+                            // no CHN_KEYOFF).
+                            i.start_fadeout();
                         }
                     }
                 }
