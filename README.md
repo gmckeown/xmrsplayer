@@ -33,8 +33,11 @@ use xmrsplayer::prelude::*;
 let bytes = std::fs::read("song.xm")?;
 let module = Module::load(&bytes)?;
 
+// Default voice pool capacity (256, matching schism's MAX_VOICES) —
+// see `XmrsPlayer::new_with_voice_pool_capacity` if you need more
+// (NNA-heavy modules) or fewer (embedded targets).
 let mut player = XmrsPlayer::new(&module, 48_000.0, /* song */ 0);
-player.set_amplification(0.25);       // lower to avoid clipping on busy modules
+player.set_amplification(1.0);        // unity by default; raise for more presence
 player.set_max_loop_count(1);         // 0 = loop forever
 
 // The player is an Iterator<Item = f32> producing interleaved L/R samples.
@@ -44,6 +47,19 @@ for sample in player.by_ref().take(48_000 * 2) {
 ```
 
 See the `examples/` directory for complete players built on `cpal` and `rodio`.
+
+For modules with very heavy NNA polyphony (the `Another Life`-class
+files that stack hundreds of `NNA = Continue` voices), you can raise
+the pool capacity at construction:
+
+```rust
+let mut player = XmrsPlayer::new_with_voice_pool_capacity(
+    &module, 48_000.0, /* song */ 0, /* capacity */ 1024
+);
+```
+
+The default is sized to match how the original trackers behaved — go
+above it only when you have evidence the song needs it.
 
 The player also exposes a subscription API — hook into row/tick changes with `PlayerObserver`, into the produced audio stream with `MixObserver` / `ChannelsObserver` (VU-meters, WAV recorders, visualisers), or into MIDI events emitted by IT `Zxx` macros with `MidiObserver` (bridge to external synths or hardware). See [OBSERVERS.md](OBSERVERS.md).
 

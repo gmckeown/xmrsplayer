@@ -5,21 +5,12 @@
 //! IT's `NewNoteAction` mechanism, which keep ringing on their own
 //! envelope + fadeout after a new note has displaced them.
 //!
-//! In the present file the live-voice case is not yet wired through
-//! `Voice` — the track still owns its live `StateInstrDefault`
-//! directly in `Channel::instr`. That migration happens in step 1.4
-//! of the voice-pool roadmap; this file already shapes its API for
-//! that destination so the eventual move is mechanical.
-//!
-//! For now `Voice` is constructed only by [`Voice::new_ghost`], and
-//! every instance corresponds to a detached voice produced by an
-//! NNA = Continue / NoteOff / NoteFadeOut transition, or by an
-//! NNA-not-Cut ghost-note retrigger. Each voice owns an independent
-//! `StateInstrDefault` (envelopes, fadeout, sample position) and
-//! captures the channel-level gain / pan that were in effect at
-//! detachment time, so subsequent pattern effects on the live track
-//! do not perturb its amplitude. Voices self-terminate when their
-//! envelope * fadeout product reaches silence.
+//! Both kinds live in the [`crate::voice_pool::VoicePool`]; channels
+//! hold only handles. [`Voice::new_live`] builds the live case
+//! (channel pattern column drives it), [`Voice::new_ghost`] builds
+//! the detached case (envelope continues, channel-level gain /
+//! pan / channel-volume captured at detach time). Voices self-
+//! terminate when their envelope × fadeout product reaches silence.
 
 // Float math backend (only needed when `std` is disabled).
 // Priority: std > libm > micromath.
@@ -82,17 +73,11 @@ pub(crate) struct Voice<'a> {
     /// becomes a ghost.
     pub period_at_fork: f32,
 
-    /// The track that engendered this voice. For ghost voices today
-    /// this is informational only — past-note effects (S7x) and DCT
-    /// matching dispatch via the track's own ghost list, not via
-    /// this field. The field exists so step 1.3 (move ghosts into a
-    /// shared `VoicePool`) can use it as the lookup key without a
-    /// further struct change. `None` is reserved for the future
-    /// "live voice" case (1.4) where the master track is the one
-    /// currently driving the voice from its pattern column; until
-    /// the live voice migrates into `Voice`, every constructed voice
-    /// is a ghost and this is always `Some(track_index)`.
-    #[allow(dead_code)] // wired in step 1.3
+    /// The track that engendered this voice. Used by past-note
+    /// effects (S7x) and DCT matching to find voices belonging to
+    /// a given track, and by ghost-list maintenance routines.
+    /// `Some(track_index)` for both live and ghost voices.
+    #[allow(dead_code)]
     pub master_track: Option<usize>,
 }
 

@@ -1,24 +1,26 @@
 //! Voice pool — a fixed-capacity, ID-keyed allocator for `Voice`s.
 //!
-//! Every active note (live or NNA-detached) lives in this pool. Tracks
-//! reference voices through `VoiceId` handles instead of owning them
-//! directly. This decoupling is what step 1.3 of the voice-pool
-//! refactor needs to lift the per-channel ghost cap and let voice
-//! stealing happen against the global voice population, the way
-//! schismtracker does it (`csf_get_nna_channel`, `effects.c:1620`).
+//! Every active note (live or NNA-detached) lives in this pool.
+//! Tracks reference voices through `VoiceId` handles instead of
+//! owning them directly. The decoupling lets voice stealing happen
+//! against the global voice population, the way schismtracker does
+//! it (`csf_get_nna_channel`, `effects.c:1620`).
 //!
 //! The pool itself is an array of generational slots. `VoiceId`
-//! encodes `(slot_index, generation)`, so a stale handle (whose voice
-//! has since been released and the slot reused) is detected via the
-//! generation mismatch and silently fails on `get`/`get_mut`. This is
-//! the standard generational-arena pattern.
+//! encodes `(slot_index, generation)`, so a stale handle (whose
+//! voice has since been released and the slot reused) is detected
+//! via the generation mismatch and silently fails on
+//! `get`/`get_mut`. Standard generational-arena pattern.
 //!
-//! 1.2 scope: this file introduces the pool type with full unit-test
-//! coverage but **no caller wires it up yet**. Live and ghost voices
-//! still live inside `Channel` exactly as in 1.1. Step 1.3 routes
-//! ghosts through the pool; step 1.4 routes the live voice; step 1.5
-//! upgrades the eviction strategy from "fail on full" to "steal the
-//! lowest-volume voice".
+//! Allocation is split into two methods reflecting two different
+//! callers:
+//!
+//! - [`VoicePool::allocate_live`]: must succeed (the pattern's note
+//!   has to play). Falls back to evicting any voice — including a
+//!   sustained one — when no evictable victim exists.
+//! - [`VoicePool::allocate_ghost`]: may refuse (the NNA spawn is
+//!   optional). Returns `None` when every voice is sustained-and-
+//!   audible, mirroring schism's `csf_get_nna_channel` returning 0.
 
 use crate::voice::Voice;
 use alloc::vec::Vec;
@@ -219,23 +221,24 @@ impl<'a> VoicePool<'a> {
 
     /// Internal: pop the head of the free list and place `voice`
     /// there. Caller must have ensured `free_head != NIL`.
+    ///
+    /// The free-list invariant — every index it points to refers
+    /// to a `Vacant` slot — is upheld by [`Self::new`] (initial
+    /// chain) and [`Self::release`] (re-insertion). Callers that
+    /// don't violate that invariant cannot trigger the
+    /// `Occupied` branch of the match below; reaching it would
+    /// mean the list was corrupted by some other code path.
     fn place_in_free_slot(&mut self, voice: Voice<'a>) -> VoiceId {
         let slot_idx = self.free_head;
         let slot = &mut self.slots[slot_idx];
         let next = match slot.state {
             SlotState::Vacant { next_free } => next_free,
-            SlotState::Occupied(_) => {
-                // Defensive: free-list pointed to an occupied slot.
-                // Mark the list as exhausted; the caller may retry
-                // (allocate_live recurses once, allocate_ghost will
-                // return None on the next attempt).
-                self.free_head = NIL;
-                // Construct a dummy VoiceId — callers shouldn't
-                // reach this branch in practice. Returning the
-                // current handle keeps the invariant
-                // "VoiceId::new succeeds".
-                return VoiceId::new(slot_idx, slot.generation);
-            }
+            SlotState::Occupied(_) => unreachable!(
+                "VoicePool free-list invariant violated: free_head ({}) points to an Occupied slot. \
+                 This indicates a bug in release() or a double-free; the free-list and SlotState \
+                 must agree by construction.",
+                slot_idx
+            ),
         };
         slot.state = SlotState::Occupied(voice);
         self.free_head = next;

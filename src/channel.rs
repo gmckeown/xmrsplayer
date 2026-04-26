@@ -135,12 +135,11 @@ pub struct Channel<'a> {
     // fadeout) alongside the live note until they go silent.
     //
     // Voices themselves live in the `VoicePool` carried by the
-    // owning `Voices`; this list holds opaque `VoiceId` handles into
-    // that pool. The pool indirection (1.3) is the prerequisite for
-    // step 1.5's voice-stealing — at that point the pool will reject
-    // an allocation only after rejecting it against every voice in
-    // every channel, lifting today's per-channel `MAX_GHOST_VOICES_
-    // PER_CHANNEL` cap. Today the per-channel cap still bites first.
+    // owning `Voices`; this list holds opaque `VoiceId` handles
+    // into that pool. The pool's lowest-volume eviction policy
+    // protects sustained voices and refuses ghost spawns when
+    // every existing voice is still audible — see
+    // [`crate::voice_pool::VoicePool::allocate_ghost`].
     //
     // No-op on MOD/XM/S3M because those importers leave NNA at its
     // `NoteCut` default — `spawn_ghost_*` short-circuits and this
@@ -236,13 +235,42 @@ impl<'a> Channel<'a> {
     }
 
     /// Set the channel's resting panning before any pattern row has
-    /// been processed. Used by [`Voices::new`] to apply S3M's
-    /// historical L/R alternance default (channels 0/2/4/... soft-
-    /// left, channels 1/3/5/... soft-right). For other formats the
-    /// channel default stays at centre.
+    /// been processed. Used by [`Voices::new`] to apply per-channel
+    /// pan defaults from the module header (`Module.channel_defaults
+    /// [i].panning`). For formats that don't carry per-channel pan
+    /// hints, the channel stays at its centre default.
     #[inline(always)]
     pub(crate) fn set_initial_panning(&mut self, panning: f32) {
         self.panning = panning.clamp(0.0, 1.0);
+    }
+
+    /// Set the channel volume before any pattern row has been
+    /// processed. Used by [`Voices::new`] to apply IT's
+    /// `initial_channel_volume` header bytes via
+    /// `Module.channel_defaults[i].volume`.
+    #[inline(always)]
+    pub(crate) fn set_initial_channel_volume(&mut self, volume: f32) {
+        self.channel_volume = volume.clamp(0.0, 1.0);
+    }
+
+    /// Set the channel's mute flag before any pattern row has been
+    /// processed. Used by [`Voices::new`] to apply S3M's "channel
+    /// disabled" bit and IT's `initial_channel_pan & 0x80` flag
+    /// from `Module.channel_defaults[i].muted`.
+    #[inline(always)]
+    pub(crate) fn set_initial_muted(&mut self, muted: bool) {
+        self.muted = muted;
+    }
+
+    /// Set the channel's surround flag before any pattern row has
+    /// been processed. Used by [`Voices::new`] to apply IT's
+    /// surround sentinel (`initial_channel_pan == 100`) via
+    /// `Module.channel_defaults[i].surround`. Equivalent to an
+    /// S91 effect, but applied as state at song start so it
+    /// doesn't depend on row 0 being free.
+    #[inline(always)]
+    pub(crate) fn set_initial_surround(&mut self, surround: bool) {
+        self.surround = surround;
     }
 
     /// Re-seed the channel's PRNG. Called by `Voices::new` with a
@@ -257,14 +285,14 @@ impl<'a> Channel<'a> {
 
     /// Record this channel's index inside the `Voices` list. Called
     /// by `Voices::new` immediately after construction. The index
-    /// flows into voices spawned by NNA so the eventual voice pool
-    /// (step 1.3 of the roadmap) can route past-note effects and
-    /// DCT lookups via a single shared list.
+    /// flows into voices spawned by NNA so the shared `VoicePool`
+    /// can route past-note effects and DCT lookups via a single
+    /// list keyed on the spawning channel.
     pub(crate) fn set_track_index(&mut self, idx: usize) {
         self.track_index = idx;
     }
 
-    // --- Live-voice accessors (1.4) -------------------------------
+    // --- Live-voice accessors --------------------------------------
     fn live<'p>(&self, pool: &'p VoicePool<'a>) -> Option<&'p StateInstrDefault<'a>> {
         self.live.and_then(|id| pool.get(id)).map(|v| &v.instr)
     }
@@ -889,9 +917,9 @@ impl<'a> Channel<'a> {
             // retrigger. Pre-1.5 xmrs missed the instrument check
             // entirely and was over-aggressive on this DCT axis.
             //
-            // The note compared is the *input* note (pattern column),
-            // not a remapped output — drum kits compare on input,
-            // see bug 6 fix.
+            // The note compared is the *input* note (pattern
+            // column), not a remapped output — drum kits compare
+            // on input.
             Dct::Note => {
                 live.num == new_instrument_index
                     && match (self.current_note, new_note) {
@@ -994,28 +1022,17 @@ impl<'a> Channel<'a> {
                 self.volume = (instr.volume * dnv).clamp(0.0, 1.0);
             }
 
-            // Panning reset: IT is selective (only when the cell
-            // carries an instrument column — a ghost-note retrigger
-            // keeps the channel's current pan so in-flight Pxx
-            // slides / panning envelope persist). S3M panning is
-            // channel state, not note state — schism's `effects.c:
-            // 249-253` only writes the instrument's pan when the
-            // sample/instrument carries an explicit `CHN_PANNING`
-            // flag. Mirror that: a plain note retrigger on S3M
-            // must leave the channel's pan alone so the header-
-            // derived L/R alternance survives.
-            //
-            // Pitch-pan separation goes inside the same branch: it's
-            // a per-note offset relative to the instrument's stored
-            // pan, so it makes sense only when we just landed on
-            // that stored pan. A ghost retrigger inherits whatever
-            // pps the previous note baked in.
-            let do_pan_reset = if self.module.profile.format.is_s3m() {
-                false
-            } else if self.module.profile.format.is_it() {
-                self.current.instrument.is_some()
-            } else {
-                true
+            // Panning reset: driven by the format's
+            // [`PanResetPolicy`]. Pitch-pan separation lives inside
+            // the same branch — it's a per-note offset relative to
+            // the instrument's stored pan, so it makes sense only
+            // when we just landed on that stored pan. A ghost
+            // retrigger inherits whatever pps the previous note
+            // baked in.
+            let do_pan_reset = match self.module.profile.quirks.pan_reset_policy {
+                PanResetPolicy::Never => false,
+                PanResetPolicy::OnInstrumentChange => self.current.instrument.is_some(),
+                PanResetPolicy::Always => true,
             };
             if do_pan_reset {
                 self.panning = instr.panning;
@@ -1661,13 +1678,17 @@ impl<'a> Channel<'a> {
                     if current_tick == 0 {
                         self.effect_vibrato.data.speed = s;
                         self.effect_vibrato.data.depth = d;
-                        // ITTECH: in normal IT mode (NOT old-effects)
-                        // the vibrato LFO is updated EVERY tick,
-                        // including tick 0. Other formats (XM/MOD/
-                        // S3M, and IT with old-effects on) tick only
-                        // on non-row ticks. This one-liner adds the
-                        // tick-0 advance under the right gate.
-                        if self.module.profile.format.is_it()
+                        // IT 2.14+ in normal mode advances the
+                        // vibrato LFO every tick, including tick 0.
+                        // Other formats (XM/MOD/S3M, and IT with
+                        // old-effects on) tick only on non-row
+                        // ticks. The `!it_old_effects` gate is
+                        // essential: an IT module with the
+                        // old-effects flag set on its header keeps
+                        // the legacy "no row-tick" behaviour even
+                        // though `it_vibrato_ticks_at_row_zero` is
+                        // on in the profile.
+                        if self.module.profile.quirks.it_vibrato_ticks_at_row_zero
                             && !self.module.profile.quirks.it_old_effects
                         {
                             self.effect_vibrato.tick();

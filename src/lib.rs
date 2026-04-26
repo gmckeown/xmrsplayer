@@ -29,11 +29,12 @@ pub(crate) mod state_sample;
 pub(crate) mod voice;
 
 /// Generational arena of `Voice`s, indexed by opaque `VoiceId`
-/// handles. Introduced in step 1.2 of the voice-pool roadmap; not
-/// yet wired up to the live engine — the `Channel` still owns its
-/// voices directly. Step 1.3 will route NNA-detached voices through
-/// here, step 1.4 the live voice, step 1.5 will add lowest-volume
-/// eviction.
+/// handles. Owns every live and ghost voice the player has in
+/// flight; channels carry only handles. Capacity is configurable
+/// at construction (default 256, mirroring schism's `MAX_VOICES`)
+/// and the pool falls back to lowest-audible-volume eviction when
+/// full — see [`voice_pool::VoicePool::allocate_live`] /
+/// [`voice_pool::VoicePool::allocate_ghost`].
 pub(crate) mod voice_pool;
 
 // --- Post-refactor modules (0.10) ---

@@ -1628,9 +1628,9 @@ dependencies = [
 
 [[package]]
 name = "xmrs"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02ed85c2697b2325290f76b1d8223dd605a1ed432357800eebe99e1f70b69d4e"
+checksum = "667b9b1132343f52eaa2566851e8128e012d5c221e2f01477f176c00592ab3d8"
 dependencies = [
  "bincode",
  "micromath",
@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "xmrsplayer"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "clap",
  "console",

@@ -22,15 +22,15 @@ use crate::voice_pool::VoicePool;
 use alloc::{vec, vec::Vec};
 use xmrs::prelude::*;
 
-/// Default capacity of the per-player voice pool. Matches schismtracker's
-/// `MAX_VOICES = 256` (`include/player/sndfile.h:40`) — large enough that
-/// even modules using NNA = Continue heavily on multiple channels never
-/// hit the cap in practice. In step 1.6 this becomes a constructor
-/// parameter on the player; for now we hard-code a reasonable default.
-/// Default voice pool capacity. Mirrors schism's `MAX_VOICES = 256`.
+/// Default voice pool capacity. Mirrors schismtracker's
+/// `MAX_VOICES = 256` (`include/player/sndfile.h:40`) — large
+/// enough that even modules using NNA = Continue heavily on
+/// multiple channels rarely hit the cap.
+///
 /// Exposed publicly so users can pass it to
 /// [`crate::XmrsPlayer::new_with_voice_pool_capacity`] when they
-/// want the default explicitly, e.g. for documentation purposes.
+/// want the default explicitly, or compare against it before
+/// passing a custom value.
 pub const DEFAULT_VOICE_POOL_CAPACITY: usize = 256;
 
 /// The audio engine. Built once per player and driven via
@@ -40,11 +40,12 @@ pub struct Voices<'a> {
 
     channel: Vec<Channel<'a>>,
 
-    /// Pool of detached (NNA-spawned) voices. Channels reference their
-    /// own ghosts by `VoiceId` — see [`Channel::ghosts`]. The pool
-    /// lives at this level (rather than per-channel) because step 1.5
-    /// will introduce voice stealing across the whole population, the
-    /// way schismtracker does it.
+    /// Pool of voices, both live and NNA-detached. Channels
+    /// reference their voices by `VoiceId` — see
+    /// [`Channel::ghosts`] and [`Channel::live`]. The pool lives at
+    /// this level (rather than per-channel) so voice stealing
+    /// happens across the whole population, mirroring schism's
+    /// `csf_get_nna_channel`.
     pool: VoicePool<'a>,
 
     /// Global volume (0.0 ..= 1.0). Mutated by `GlobalEffect::Volume` and by
@@ -102,24 +103,28 @@ impl<'a> Voices<'a> {
     ) -> Self {
         let num_channels = module.get_num_channels();
         let mut channels = vec![Channel::new(module, sample_rate, initial_tempo); num_channels];
-        // S3M historical default: channels alternate L / R / L / R...
-        // soft-pannned at ~0.2 / 0.8. ScreamTracker 3 inherited this
-        // from its SoundBlaster Pro target, which only supported
-        // hard L/R routing per voice. Schism's `fmt/s3m.c:208-213`
-        // assigns panning 14 (L1..L8) and 50 (R1..R8) on a 0..63
-        // scale, ≈ 0.22 / 0.78 normalised. We use the close 3/15 and
-        // 12/15 values which are what real ST3 stored in its
-        // `channel_settings` byte pairs — schism's read path
-        // converts the same values via `(pan & 0xf) / 15`.
-        //
-        // The per-file `channel_settings` block (read by the
-        // importer and overlaid as `Xxx` on row 0) refines this,
-        // but only when row 0's effect slot is free. The default
-        // applied here is the safety net for channels whose row 0
-        // already carries an effect.
-        if module.profile.format.is_s3m() {
-            for (i, ch) in channels.iter_mut().enumerate() {
-                ch.set_initial_panning(s3m_default_channel_panning(i));
+        // Apply per-channel defaults from the module header.
+        // Each entry can carry a pan, a volume override, a mute
+        // flag, and a surround flag — populated by importers whose
+        // format expresses these in its header (S3M's
+        // `channel_settings`, IT's `initial_channel_pan` /
+        // `initial_channel_volume`). XM/MOD leave the vector empty
+        // and every channel keeps its centre/full/unmuted/non-
+        // surround default.
+        for (i, ch) in channels.iter_mut().enumerate() {
+            if let Some(d) = module.channel_defaults.get(i) {
+                if let Some(p) = d.panning {
+                    ch.set_initial_panning(p);
+                }
+                if let Some(v) = d.volume {
+                    ch.set_initial_channel_volume(v);
+                }
+                if d.muted {
+                    ch.set_initial_muted(true);
+                }
+                if d.surround {
+                    ch.set_initial_surround(true);
+                }
             }
         }
         // Deterministic per-channel seed so each channel has an
@@ -379,9 +384,10 @@ impl<'a> Voices<'a> {
             // Hard clip on the way out: schism, OpenMPT and the
             // wider tracker family all do this — saturation in the
             // last mix stage with no shaping. If the gain chain is
-            // properly calibrated the clamp never fires; if it does,
-            // the audible distortion points us at the calibration
-            // bug instead of masking it under a soft curve.
+            // properly calibrated the clamp never fires; if it
+            // does, the audible distortion points us at the
+            // miscalibration instead of masking it under a soft
+            // curve.
             let g = self.global_volume * self.amplification * self.mix_volume;
             ((left * g).clamp(-1.0, 1.0), (right * g).clamp(-1.0, 1.0))
         } else {
@@ -413,19 +419,5 @@ impl<'a> Voices<'a> {
                 None => (0.0, 0.0),
             })
             .collect()
-    }
-}
-
-/// S3M's historical default panning for channel `channel_index`,
-/// alternating between soft-left (~0.2) and soft-right (~0.8) on
-/// even/odd channels. Mirrors ScreamTracker 3's SoundBlaster Pro
-/// L/R-alternance default — schism reads the same values from
-/// each channel's `channel_settings` byte (`fmt/s3m.c:249`).
-#[inline(always)]
-fn s3m_default_channel_panning(channel_index: usize) -> f32 {
-    if channel_index & 1 == 0 {
-        3.0 / 15.0
-    } else {
-        12.0 / 15.0
     }
 }
