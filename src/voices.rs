@@ -102,6 +102,26 @@ impl<'a> Voices<'a> {
     ) -> Self {
         let num_channels = module.get_num_channels();
         let mut channels = vec![Channel::new(module, sample_rate, initial_tempo); num_channels];
+        // S3M historical default: channels alternate L / R / L / R...
+        // soft-pannned at ~0.2 / 0.8. ScreamTracker 3 inherited this
+        // from its SoundBlaster Pro target, which only supported
+        // hard L/R routing per voice. Schism's `fmt/s3m.c:208-213`
+        // assigns panning 14 (L1..L8) and 50 (R1..R8) on a 0..63
+        // scale, ≈ 0.22 / 0.78 normalised. We use the close 3/15 and
+        // 12/15 values which are what real ST3 stored in its
+        // `channel_settings` byte pairs — schism's read path
+        // converts the same values via `(pan & 0xf) / 15`.
+        //
+        // The per-file `channel_settings` block (read by the
+        // importer and overlaid as `Xxx` on row 0) refines this,
+        // but only when row 0's effect slot is free. The default
+        // applied here is the safety net for channels whose row 0
+        // already carries an effect.
+        if module.profile.format.is_s3m() {
+            for (i, ch) in channels.iter_mut().enumerate() {
+                ch.set_initial_panning(s3m_default_channel_panning(i));
+            }
+        }
         // Deterministic per-channel seed so each channel has an
         // independent IT-humanisation stream while the whole render
         // stays bit-reproducible. High bits give us a non-zero base;
@@ -393,5 +413,19 @@ impl<'a> Voices<'a> {
                 None => (0.0, 0.0),
             })
             .collect()
+    }
+}
+
+/// S3M's historical default panning for channel `channel_index`,
+/// alternating between soft-left (~0.2) and soft-right (~0.8) on
+/// even/odd channels. Mirrors ScreamTracker 3's SoundBlaster Pro
+/// L/R-alternance default — schism reads the same values from
+/// each channel's `channel_settings` byte (`fmt/s3m.c:249`).
+#[inline(always)]
+fn s3m_default_channel_panning(channel_index: usize) -> f32 {
+    if channel_index & 1 == 0 {
+        3.0 / 15.0
+    } else {
+        12.0 / 15.0
     }
 }

@@ -443,7 +443,7 @@ impl<'a> Sequencer<'a> {
                             if value == slot.count {
                                 // Loop is over.
                                 slot.count = 0;
-                                if self.module.quirks.pattern_loop_resumes {
+                                if self.module.profile.quirks.pattern_loop_resumes {
                                     // ST3 `s_patloop` (digcmd.c:1003):
                                     // when the loop finishes, the next
                                     // row becomes the new loop start.
@@ -459,7 +459,7 @@ impl<'a> Sequencer<'a> {
                         } else {
                             // Set loop start point (E60 / SB0).
                             slot.origin = self.current_row;
-                            if self.module.quirks.e60_leaks_to_next_pattern {
+                            if self.module.profile.quirks.e60_leaks_to_next_pattern {
                                 // Replicate FT2 E60 bug: in FT2, E60 not
                                 // only sets the per-channel loop origin,
                                 // it ALSO leaks that row number into the

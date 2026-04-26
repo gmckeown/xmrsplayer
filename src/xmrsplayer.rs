@@ -92,7 +92,7 @@ impl<'a> XmrsPlayer<'a> {
     /// Format-specific FT2/XM behaviour — arpeggio LUT, E60 pattern-
     /// loop bug, arpeggio period clamp, portamento-down signed-
     /// overflow, K00-eats-note, vol-col `Bx` advancing the vibrato —
-    /// is driven entirely by `module.format`. `ModuleFormat::Xm`
+    /// is driven entirely by `module.profile.format`. `ModuleFormat::Xm`
     /// activates the canonical FT2 reference behaviour, all other
     /// formats use their own native semantics.
     pub fn new(module: &'a Module, sample_rate: f32, song: usize) -> Self {

@@ -170,7 +170,7 @@ fn play_music(
         player_lock.set_amplification(amplification);
         if debug {
             println!("Debug on");
-            println!("Module format: {:?}", module.format);
+            println!("Module format: {:?}", module.profile.format);
             // In 0.10+ the inline `debug(bool)` toggle has been replaced by a
             // standalone observer — register it explicitly.
             player_lock.add_observer(Box::new(DebugObserver::new()));

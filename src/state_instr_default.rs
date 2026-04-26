@@ -49,7 +49,7 @@ pub struct StateInstrDefault<'a> {
     /// current pitch. Default value 0.5 = centre (no offset) because
     /// the IT importer normalises the signed -32..+32 node magnitudes
     /// into 0..1 via `to_envelope_struct_signed`, with 0.5 = 0-offset.
-    /// When `instr.pitch_envelope_as_low_pass_filter` is set (IT's
+    /// When `instr.voice.pitch_envelope_as_low_pass_filter` is set (IT's
     /// "use pitch envelope as filter" flag), the same envelope state
     /// is read by the filter engine instead — that path lands with
     /// the filter work in IT_ROADMAP §4.
@@ -83,14 +83,14 @@ impl<'a> StateInstrDefault<'a> {
         period_helper: PeriodHelper,
         rate: f32,
     ) -> Self {
-        let v = &instr.vibrato;
-        let ve = &instr.volume_envelope;
-        let pe = &instr.pan_envelope;
-        let pie = &instr.pitch_envelope;
+        let v = &instr.voice.vibrato;
+        let ve = &instr.voice.volume_envelope;
+        let pe = &instr.voice.pan_envelope;
+        let pie = &instr.voice.pitch_envelope;
         let mut filter = StateFilter::new(rate);
         filter.configure_from_it_registers(
-            instr.initial_filter_cutoff,
-            instr.initial_filter_resonance,
+            instr.voice.initial_filter_cutoff,
+            instr.voice.initial_filter_resonance,
         );
         Self {
             instr,
@@ -122,8 +122,8 @@ impl<'a> StateInstrDefault<'a> {
         // them so a `replace_instr` (ghost-instrument path) picks
         // up the new sample's filter settings too.
         self.filter.configure_from_it_registers(
-            instr.initial_filter_cutoff,
-            instr.initial_filter_resonance,
+            instr.voice.initial_filter_cutoff,
+            instr.voice.initial_filter_resonance,
         );
     }
 
@@ -174,13 +174,13 @@ impl<'a> StateInstrDefault<'a> {
             ss.set_sustained(false);
         }
 
-        if !self.envelope_volume.has_volume_envelope() && self.instr.volume_fadeout == 0.0 {
+        if !self.envelope_volume.has_volume_envelope() && self.instr.voice.volume_fadeout == 0.0 {
             self.cut_pitch();
         }
     }
 
     pub fn get_volume(&self) -> f32 {
-        // `instr.global_volume` is IT's per-instrument scalar (0..1,
+        // `instr.voice.volume` is IT's per-instrument scalar (0..1,
         // populated from the IT instrument header's global-volume
         // byte / 128). For formats without the concept (XM / S3M)
         // it stays at 1.0, making this a no-op. Previously ignored —
@@ -188,7 +188,7 @@ impl<'a> StateInstrDefault<'a> {
         // instruments via the per-instrument GV (common on drums vs
         // leads, or for pad voices dialled down to sit under the
         // melody).
-        self.volume_fadeout * self.envelope_volume.value * self.volume * self.instr.global_volume
+        self.volume_fadeout * self.envelope_volume.value * self.volume * self.instr.voice.volume
     }
 
     /// The current sample's `default_note_volume` — IT's per-sample
@@ -213,13 +213,13 @@ impl<'a> StateInstrDefault<'a> {
     /// IT stores this as 0..100 percent of the starting volume; the
     /// importer normalises to 0..1. Zero for non-IT formats.
     pub fn random_volume_variation(&self) -> f32 {
-        self.instr.random_volume_variation
+        self.instr.voice.random_volume_variation
     }
 
     /// Instrument-level random pan variation (IT humanisation).
     /// Same range / normalisation as `random_volume_variation`.
     pub fn random_pan_variation(&self) -> f32 {
-        self.instr.random_pan_variation
+        self.instr.voice.random_pan_variation
     }
 
     /// Instrument-level pitch-pan separation (IT). Positive values
@@ -227,13 +227,13 @@ impl<'a> StateInstrDefault<'a> {
     /// `pitch_pan_center`. The importer normalises IT's signed
     /// -32..+32 byte to -1..+1. Zero for non-IT formats.
     pub fn pitch_pan_separation(&self) -> f32 {
-        self.instr.pitch_pan_separation
+        self.instr.voice.pitch_pan_separation
     }
 
     /// The reference note for `pitch_pan_separation`, returned as a
     /// semitone index (0 = C0). Non-IT: `Pitch::C4` (= 48).
     pub fn pitch_pan_center_semitones(&self) -> i32 {
-        self.instr.pitch_pan_center as i32
+        self.instr.voice.pitch_pan_center as i32
     }
 
     /// Current pitch-envelope contribution, in semitones.
@@ -250,9 +250,9 @@ impl<'a> StateInstrDefault<'a> {
     /// cutoff rather than pitch, and the filter engine reads the
     /// envelope value directly (Phase 4 of IT_ROADMAP).
     pub fn get_pitch_envelope_offset_semitones(&self) -> f32 {
-        if !self.instr.pitch_envelope.enabled
+        if !self.instr.voice.pitch_envelope.enabled
             || !self.envelope_pitch.enabled
-            || self.instr.pitch_envelope_as_low_pass_filter
+            || self.instr.voice.pitch_envelope_as_low_pass_filter
         {
             return 0.0;
         }
@@ -262,18 +262,18 @@ impl<'a> StateInstrDefault<'a> {
     fn envelopes(&mut self) {
         // Volume
         if !self.sustained {
-            self.volume_fadeout = (self.volume_fadeout - self.instr.volume_fadeout).max(0.0);
+            self.volume_fadeout = (self.volume_fadeout - self.instr.voice.volume_fadeout).max(0.0);
         }
-        if self.instr.volume_envelope.enabled {
+        if self.instr.voice.volume_envelope.enabled {
             self.envelope_volume.tick(self.sustained);
         }
         // Panning
-        if self.instr.pan_envelope.enabled {
+        if self.instr.voice.pan_envelope.enabled {
             self.envelope_panning.tick(self.sustained);
         }
         // Pitch (also drives the low-pass filter when flagged —
         // see `get_pitch_envelope_offset_semitones`)
-        if self.instr.pitch_envelope.enabled {
+        if self.instr.voice.pitch_envelope.enabled {
             self.envelope_pitch.tick(self.sustained);
 
             // IT "pitch envelope as low-pass filter" routing.
@@ -322,8 +322,8 @@ impl<'a> StateInstrDefault<'a> {
             // base cutoff entirely, and (b) silenced any sample at
             // envelope-value 0.5 (true neutral) by setting cutoff
             // to ~63 regardless of intent.
-            if self.instr.pitch_envelope_as_low_pass_filter {
-                let base = (self.instr.initial_filter_cutoff & 0x7F) as f32;
+            if self.instr.voice.pitch_envelope_as_low_pass_filter {
+                let base = (self.instr.voice.initial_filter_cutoff & 0x7F) as f32;
                 let v = self.envelope_pitch.value.clamp(0.0, 1.0);
                 let modulated = (base * v * 2.0).min(127.0) as u8;
                 self.filter.set_cutoff_reg(modulated);
@@ -389,14 +389,14 @@ impl<'a> StateInstrDefault<'a> {
     /// the sample should play at, while the input note is preserved
     /// for DCT / NNA / portamento-target comparisons.
     pub fn played_pitch_for(&self, input: Pitch) -> Pitch {
-        match self.instr.note_for_pitch[input.value() as usize] {
+        match self.instr.keyboard.note_for_pitch[input.value() as usize] {
             Some(out) => Pitch::try_from(out).unwrap_or(input),
             None => input,
         }
     }
 
     pub fn set_pitch(&mut self, note: Pitch) -> bool {
-        if let Some(num) = self.instr.sample_for_pitch[note.value() as usize] {
+        if let Some(num) = self.instr.keyboard.sample_for_pitch[note.value() as usize] {
             return self.select_sample(num);
         }
         false
@@ -415,10 +415,10 @@ impl<'a> StateInstrDefault<'a> {
                 // centre-pan, but treating exact-0.5 as "unset" is
                 // the right heuristic — authors rarely place a
                 // deliberate centre override, and the fallback to
-                // `instr.default_pan` is what the module expects.
+                // `instr.voice.default_pan` is what the module expects.
                 let sample_pan = state_sample.get_panning();
                 self.panning = if sample_pan == 0.5 {
-                    self.instr.default_pan
+                    self.instr.voice.default_pan
                 } else {
                     sample_pan
                 };
@@ -469,7 +469,7 @@ mod tests {
     fn make_instr_with_remap(remap: &[(usize, u8)]) -> InstrDefault {
         let mut instr = InstrDefault::default();
         for (input, output) in remap {
-            instr.note_for_pitch[*input] = Some(*output);
+            instr.keyboard.note_for_pitch[*input] = Some(*output);
         }
         instr
     }

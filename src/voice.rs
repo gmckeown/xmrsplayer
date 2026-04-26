@@ -239,8 +239,8 @@ impl<'a> Voice<'a> {
         }
         // Mirror the live-channel formula:
         //   v = volume * instr.get_volume() * channel_volume
-        //   actual_left  = v * sqrt(1 - panning)
-        //   actual_right = v * sqrt(panning)
+        //   actual_left  = v * (1 - panning)
+        //   actual_right = v * panning
         // with the channel-side terms (`volume`, `channel_volume`,
         // `panning`) captured at detachment time. `instr.get_volume()`
         // continues to evolve because that's the fadeout / envelope
@@ -248,8 +248,8 @@ impl<'a> Voice<'a> {
         // a ghost voice.
         let v = self.vol_frozen * self.instr.get_volume() * self.channel_volume_frozen;
         let v = v.clamp(0.0, 1.0);
-        let l_gain = v * (1.0 - self.panning_frozen).sqrt();
-        let r_gain = v * self.panning_frozen.sqrt();
+        let l_gain = v * (1.0 - self.panning_frozen);
+        let r_gain = v * self.panning_frozen;
 
         match self.instr.next() {
             Some((l, r)) => Some((l * l_gain, r * r_gain)),

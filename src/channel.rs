@@ -162,7 +162,7 @@ pub struct Channel<'a> {
 
 impl<'a> Channel<'a> {
     /// Build a channel. Format-specific quirks (FT2 arpeggio LUT,
-    /// FT2 arpeggio period clamp) are driven by `module.format` via
+    /// FT2 arpeggio period clamp) are driven by `module.profile.format` via
     /// `EffectArpeggio` and `PeriodHelper`; Channel itself no longer
     /// carries an `Ft2Quirks` field, so there is only one source of
     /// truth for "is this an XM?".
@@ -172,8 +172,10 @@ impl<'a> Channel<'a> {
     /// player must subsequently call [`Self::set_tempo`] whenever the
     /// song tempo changes (Fxx effect) to keep the LUT index in sync.
     pub(crate) fn new(module: &'a Module, rate: f32, tempo: usize) -> Self {
-        let period_helper =
-            PeriodHelper::new(module.frequency_type, module.quirks.ft2_arpeggio_note_clamp);
+        let period_helper = PeriodHelper::new(
+            module.frequency_type,
+            module.profile.quirks.ft2_arpeggio_note_clamp,
+        );
         Self {
             module,
             period_helper: period_helper.clone(),
@@ -189,7 +191,7 @@ impl<'a> Channel<'a> {
             period: 0.0,
             live: None,
             instr_midi_mute: false,
-            effect_arpeggio: EffectArpeggio::new(module.quirks.ft2_arpeggio_lut, tempo),
+            effect_arpeggio: EffectArpeggio::new(module.profile.quirks.ft2_arpeggio_lut, tempo),
             effect_note_retrig_backup: NoteRetrigState::default(),
             effect_note_retrig_counter: 0,
             effect_panbrello: EffectVibratoTremolo::new(Waveform::Sine),
@@ -231,6 +233,16 @@ impl<'a> Channel<'a> {
     #[inline]
     fn rng_bipolar(&mut self) -> f32 {
         self.rng.next_f32() * 2.0 - 1.0
+    }
+
+    /// Set the channel's resting panning before any pattern row has
+    /// been processed. Used by [`Voices::new`] to apply S3M's
+    /// historical L/R alternance default (channels 0/2/4/... soft-
+    /// left, channels 1/3/5/... soft-right). For other formats the
+    /// channel default stays at centre.
+    #[inline(always)]
+    pub(crate) fn set_initial_panning(&mut self, panning: f32) {
+        self.panning = panning.clamp(0.0, 1.0);
     }
 
     /// Re-seed the channel's PRNG. Called by `Voices::new` with a
@@ -313,7 +325,7 @@ impl<'a> Channel<'a> {
 
     /// Release the currently-sustaining note.
     ///
-    /// Behaviour depends on the module's canonical format (`module.format`),
+    /// Behaviour depends on the module's canonical format (`module.profile.format`),
     /// not on the FT2-quirks flag, because "how a note-off should sound" is
     /// a format-level semantic, not an FT2 bug:
     ///
@@ -349,7 +361,7 @@ impl<'a> Channel<'a> {
         // no volume envelope. This is not an FT2 bug — it is how XM
         // modules are meant to sound — so it is gated on the module's
         // declared format, not on the FT2-quirks opt-in.
-        if self.module.quirks.keyoff_cuts_without_vol_env && !had_vol_env {
+        if self.module.profile.quirks.keyoff_cuts_without_vol_env && !had_vol_env {
             self.cut_pitch();
         }
     }
@@ -671,7 +683,7 @@ impl<'a> Channel<'a> {
         let Some(instr) = self.live(pool) else {
             return NewNoteAction::NoteCut;
         };
-        match &instr.duplicate_check {
+        match &instr.behavior.duplicate_check {
             DuplicateCheckType::Off(nna) => *nna,
             DuplicateCheckType::Note(dca)
             | DuplicateCheckType::Sample(dca)
@@ -854,7 +866,7 @@ impl<'a> Channel<'a> {
         let InstrumentType::Default(id) = &incoming.instr_type else {
             return;
         };
-        let (dct, dca) = match &id.duplicate_check {
+        let (dct, dca) = match &id.behavior.duplicate_check {
             DuplicateCheckType::Off(_) => return,
             DuplicateCheckType::Note(dca) => (Dct::Note, dca.clone()),
             DuplicateCheckType::Sample(dca) => (Dct::Sample, dca.clone()),
@@ -985,16 +997,22 @@ impl<'a> Channel<'a> {
             // Panning reset: IT is selective (only when the cell
             // carries an instrument column — a ghost-note retrigger
             // keeps the channel's current pan so in-flight Pxx
-            // slides / panning envelope persist). Other formats
-            // reset unconditionally on every retrigger; that's
-            // canonical XM/S3M and we don't change it here.
+            // slides / panning envelope persist). S3M panning is
+            // channel state, not note state — schism's `effects.c:
+            // 249-253` only writes the instrument's pan when the
+            // sample/instrument carries an explicit `CHN_PANNING`
+            // flag. Mirror that: a plain note retrigger on S3M
+            // must leave the channel's pan alone so the header-
+            // derived L/R alternance survives.
             //
             // Pitch-pan separation goes inside the same branch: it's
             // a per-note offset relative to the instrument's stored
             // pan, so it makes sense only when we just landed on
             // that stored pan. A ghost retrigger inherits whatever
             // pps the previous note baked in.
-            let do_pan_reset = if self.module.format.is_it() {
+            let do_pan_reset = if self.module.profile.format.is_s3m() {
+                false
+            } else if self.module.profile.format.is_it() {
                 self.current.instrument.is_some()
             } else {
                 true
@@ -1083,11 +1101,14 @@ impl<'a> Channel<'a> {
             }
 
             // Volume and Freq in one
-            // panning = 0.0 => full left, 1.0 => full right.
+            // Tracker panning is linear: 0.0 => full left, 1.0 => full right.
             // actual_volume[0] multiplies the left sample channel,
-            // actual_volume[1] the right.
-            self.actual_volume[0] = volume * (1.0 - panning).sqrt();
-            self.actual_volume[1] = volume * panning.sqrt();
+            // actual_volume[1] the right. This matches every historical
+            // tracker (PT/ST3/FT2/IT) and schism's `sndmix.c:544`:
+            //   chan->left_volume_new  = (realvol * pan) >> 8;
+            //   chan->right_volume_new = (realvol * (256 - pan)) >> 8;
+            self.actual_volume[0] = volume * (1.0 - panning);
+            self.actual_volume[1] = volume * panning;
 
             // Frequency
             let arp_pitch = if self.current.has_arpeggio() {
@@ -1137,7 +1158,7 @@ impl<'a> Channel<'a> {
             // therefore skip the clear; the mute flag is driven
             // exclusively from the state machine in the Tremor arm
             // below.
-            if !self.module.quirks.tremor_state_persists {
+            if !self.module.profile.quirks.tremor_state_persists {
                 self.effect_tremor = false;
             }
         }
@@ -1245,7 +1266,7 @@ impl<'a> Channel<'a> {
                                     // like IT-default (ignore); a
                                     // proper-IT module with
                                     // old_effects ON will clamp.
-                                    if self.module.quirks.it_old_effects && sample_len > 0 {
+                                    if self.module.profile.quirks.it_old_effects && sample_len > 0 {
                                         sample.set_position(sample_len - 1);
                                     }
                                     // else: ignore the offset; leave
@@ -1491,7 +1512,7 @@ impl<'a> Channel<'a> {
                         // to land in the [32000, 32767] window must
                         // NOT snap to 31999 — it just passes through.
                         // Gated on `p > 0.0`.
-                        if self.module.quirks.ft2_pitch_slide_overflow && p > 0.0 {
+                        if self.module.profile.quirks.ft2_pitch_slide_overflow && p > 0.0 {
                             let wrapped = (new_period as i32).rem_euclid(65536) as i16;
                             if (32000..=32767).contains(&(wrapped as i32)) {
                                 self.period = 31999.0;
@@ -1503,7 +1524,8 @@ impl<'a> Channel<'a> {
                                 //   fires, period keeps growing.
                                 self.period = new_period.max(1.0);
                             }
-                        } else if let Some((clamp_min, clamp_max)) = self.module.quirks.period_clamp
+                        } else if let Some((clamp_min, clamp_max)) =
+                            self.module.profile.quirks.period_clamp
                         {
                             // The module requests a hard period clamp.
                             // ST3 uses this when `amigalimits` is on in
@@ -1522,7 +1544,7 @@ impl<'a> Channel<'a> {
                             // `allow_zero_period`, which lets a pitch
                             // slide reach "infinitely high note" —
                             // ST3 convention without amigalimits).
-                            let min_period = if self.module.quirks.allow_zero_period {
+                            let min_period = if self.module.profile.quirks.allow_zero_period {
                                 0.0
                             } else {
                                 1.0
@@ -1562,7 +1584,7 @@ impl<'a> Channel<'a> {
                     on_time: on,
                     off_time: off,
                 } => {
-                    if self.module.quirks.tremor_state_persists {
+                    if self.module.profile.quirks.tremor_state_persists {
                         // ST3 tremor (digcmd.c:s_tremor line 803): a
                         // count-down `atremor` + on/off toggle
                         // `atreon`, both persistent across rows. On
@@ -1631,7 +1653,7 @@ impl<'a> Channel<'a> {
                     // importer emits the normal-mode value; apply
                     // the 2× scale here on replay so the same
                     // pattern data sounds right in both modes.
-                    let d = if self.module.quirks.it_old_effects {
+                    let d = if self.module.profile.quirks.it_old_effects {
                         d * 2.0
                     } else {
                         d
@@ -1645,7 +1667,9 @@ impl<'a> Channel<'a> {
                         // S3M, and IT with old-effects on) tick only
                         // on non-row ticks. This one-liner adds the
                         // tick-0 advance under the right gate.
-                        if self.module.format.is_it() && !self.module.quirks.it_old_effects {
+                        if self.module.profile.format.is_it()
+                            && !self.module.profile.quirks.it_old_effects
+                        {
                             self.effect_vibrato.tick();
                         }
                     } else {
@@ -1660,7 +1684,7 @@ impl<'a> Channel<'a> {
                 TrackEffect::VibratoDepth(d) => {
                     if current_tick == 0 {
                         self.effect_vibrato.data.depth = d;
-                    } else if self.module.quirks.volcol_b_advances_vibrato
+                    } else if self.module.profile.quirks.volcol_b_advances_vibrato
                         && !self.current.has_vibrato()
                     {
                         // FT2 vol-column Bx quirk: when the slot carries a
@@ -1729,7 +1753,12 @@ impl<'a> Channel<'a> {
                     // voice is still standing afterwards.
                     let new_note = self.current.note.pitch();
                     let new_sample_index = new_note
-                        .and_then(|n| id.sample_for_pitch.get(n.value() as usize).copied())
+                        .and_then(|n| {
+                            id.keyboard
+                                .sample_for_pitch
+                                .get(n.value() as usize)
+                                .copied()
+                        })
                         .flatten();
                     self.apply_dct(pool, instrnr, new_note, new_sample_index);
 
@@ -1948,7 +1977,7 @@ impl<'a> Channel<'a> {
         // of that row is effectively dropped.
         //
         // Key constraints:
-        //   - This is canonical XM behaviour: `module.format ==
+        //   - This is canonical XM behaviour: `module.profile.format ==
         //     ModuleFormat::Xm` is now the single source of truth for
         //     "apply FT2 replay semantics", so every XM module gets
         //     this quirk automatically. (There is no longer a separate
@@ -1963,7 +1992,7 @@ impl<'a> Channel<'a> {
         //     (see `key_off()`) and belongs on the normal tick-0 path
         //     via `tick0_load_pitch`, hence the helper distinguishes
         //     effect-Kxx from column-keyoff.
-        if self.module.quirks.k00_eats_note && self.current.has_note_off_at_tick_zero() {
+        if self.module.profile.quirks.k00_eats_note && self.current.has_note_off_at_tick_zero() {
             return;
         }
 
@@ -2017,7 +2046,7 @@ impl<'a> Channel<'a> {
                 // we must NOT clear the output — otherwise the vibrato
                 // would audibly cut in and out on every row that only
                 // carries vol-col B.
-                let xm_volcol_b_alone = self.module.quirks.volcol_b_advances_vibrato
+                let xm_volcol_b_alone = self.module.profile.quirks.volcol_b_advances_vibrato
                     && self.current.has_vibrato_depth();
                 if !xm_volcol_b_alone {
                     // Only clear the output modulation.
