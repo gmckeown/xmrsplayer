@@ -50,6 +50,7 @@ impl VoiceId {
     /// (256 voices) and any realistic xmrsplayer cap.
     pub const MAX_SLOTS: usize = 0xFFFF;
 
+    #[inline(always)]
     fn new(slot: usize, generation: u32) -> Self {
         debug_assert!(slot < Self::MAX_SLOTS, "slot index overflow");
         // generation always >= 1; we initialise slots at gen=1 and
@@ -61,10 +62,12 @@ impl VoiceId {
         Self(NonZeroU32::new(packed).expect("encoded VoiceId is non-zero by construction"))
     }
 
+    #[inline(always)]
     fn slot(self) -> usize {
         ((self.0.get() & 0xFFFF) - 1) as usize
     }
 
+    #[inline(always)]
     fn generation(self) -> u32 {
         (self.0.get() >> 16) & 0xFFFF
     }
@@ -407,6 +410,7 @@ impl<'a> VoicePool<'a> {
 
     /// Resolve a handle to an immutable reference, or `None` if the
     /// handle is stale.
+    #[inline(always)]
     pub fn get(&self, id: VoiceId) -> Option<&Voice<'a>> {
         let slot = self.slots.get(id.slot())?;
         if slot.generation != id.generation() {
@@ -420,6 +424,7 @@ impl<'a> VoicePool<'a> {
 
     /// Resolve a handle to a mutable reference, or `None` if the
     /// handle is stale.
+    #[inline(always)]
     pub fn get_mut(&mut self, id: VoiceId) -> Option<&mut Voice<'a>> {
         let slot = self.slots.get_mut(id.slot())?;
         if slot.generation != id.generation() {

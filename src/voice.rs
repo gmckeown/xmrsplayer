@@ -169,9 +169,36 @@ impl<'a> Voice<'a> {
     }
 
     /// S7x past-note: immediate cut.
+    ///
+    /// Mirrors schism's S70 dispatch in `effects.c:737-738`:
+    ///
+    /// ```c
+    /// bkp->flags |= CHN_NOTEFADE;
+    /// bkp->fadeout_volume = 0;
+    /// ```
+    ///
+    /// Engaging both `volume_fading_out` (= `CHN_NOTEFADE`) AND
+    /// `volume_fadeout = 0.0` is what makes [`Self::is_alive`] flip to
+    /// `false` on the next `tick_ghosts` pass, so the channel's ghost
+    /// list reclaims the slot. The pre-fix version only zeroed
+    /// `instr.volume` via `cut_pitch`, which silenced the voice but
+    /// left every other predicate (`is_enabled`, `volume_fading_out`)
+    /// untouched — the ghost stayed alive forever in `self.ghosts`,
+    /// still consuming a `pool.get_mut` + sample-mix on every output
+    /// sample. Modules using S70 (or DCA NoteCut on a ghost) saw CPU
+    /// usage climb monotonically over the course of a song until the
+    /// pool capped at 256 voices.
+    ///
+    /// `cut_pitch` is kept on the call path so `instr.get_volume()`
+    /// returns 0 in the brief window between this call and the next
+    /// `tick_ghosts` reap — avoiding the residual click that would
+    /// otherwise leak through the fadeout-decay path on instruments
+    /// with a non-trivial fadeout register value.
     #[inline]
     pub fn past_cut(&mut self) {
         self.instr.cut_pitch();
+        self.instr.volume_fading_out = true;
+        self.instr.volume_fadeout = 0.0;
     }
 
     /// S7x past-note: key-off (release envelope).
@@ -252,9 +279,34 @@ impl<'a> Voice<'a> {
     /// Produce one stereo sample. Mirrors the gain formula used in
     /// `Channel::tickn_update_instr` + `Channel::next` but with the
     /// frozen pattern-side gains. Returns `None` when the underlying
-    /// sample has reached end-of-stream.
+    /// sample has reached end-of-stream OR when the voice is silent
+    /// and awaiting reap.
     pub fn next(&mut self) -> Option<(f32, f32)> {
         if !self.instr.is_enabled() {
+            return None;
+        }
+        // Voice is silent and awaiting reap by `tick_ghosts` — its
+        // fadeout register has reached zero. Skipping the sample /
+        // filter / lerp work is safe because any output would be
+        // multiplied by `instr.get_volume() == 0` below.
+        //
+        // This is the per-sample equivalent of schism's check at
+        // `sndmix.c:1112-1118`:
+        //
+        // ```c
+        // if ((chan->flags & CHN_NOTEFADE) &&
+        //     !(chan->fadeout_volume | chan->right_volume | chan->left_volume))
+        //     chan->length = 0;
+        // ```
+        //
+        // Returning `None` here also propagates "no contribution" up
+        // through `Channel::next_sample` (`any` stays unset), which
+        // matches schism's `chan->length = 0; continue;` semantics.
+        // Without this gate the gap between `past_cut` and the next
+        // tick_ghosts reap (~3 ms at the default tempo) was paid in
+        // full per ghost — small per voice but quadratic in the size
+        // of a fading "tail" cluster.
+        if self.instr.volume_fading_out && self.instr.volume_fadeout <= 0.0 {
             return None;
         }
         // Mirror the live-channel formula:
@@ -275,5 +327,56 @@ impl<'a> Voice<'a> {
             Some((l, r)) => Some((l * l_gain, r * r_gain)),
             None => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state_instr_default::StateInstrDefault;
+    use alloc::boxed::Box;
+    use xmrs::prelude::*;
+
+    /// Minimal ghost over a default (sample-less) instrument. Suitable
+    /// for tests that probe the per-voice flag bookkeeping; the sample
+    /// path stays disabled (`is_enabled() == false`), which is fine
+    /// for everything except behavioural tests that need actual audio.
+    fn fresh_ghost() -> Voice<'static> {
+        let instr: &'static InstrDefault = Box::leak(Box::new(InstrDefault::default()));
+        let ph = PeriodHelper::new(FrequencyType::LinearFrequencies, false);
+        let state = StateInstrDefault::new(instr, 0, ph, 44100.0);
+        Voice::new_ghost(state, 0, 1.0, 1.0, 0.5, None, None, 0.0)
+    }
+
+    #[test]
+    fn past_cut_engages_fadeout_for_immediate_reap() {
+        // Schism's S70 path (effects.c:737-738) sets BOTH
+        // `CHN_NOTEFADE` and `fadeout_volume = 0` so the next render
+        // pass kills the voice via the sndmix.c:1112-1118 check.
+        // The xmrsplayer equivalent is `volume_fading_out` plus
+        // `volume_fadeout = 0`, which together flip `is_alive()` to
+        // false on the next `tick_ghosts` pass.
+        //
+        // Pre-fix `past_cut` only zeroed `instr.volume`, leaving the
+        // fadeout flags at their initial `false` / `1.0` values; the
+        // ghost stayed in the channel's list forever and CPU usage
+        // climbed proportionally to the number of S70/DCA-cut events
+        // over the course of a song.
+        let mut v = fresh_ghost();
+        assert!(!v.instr.volume_fading_out);
+        assert_eq!(v.instr.volume_fadeout, 1.0);
+        assert_eq!(v.instr.volume, 1.0);
+
+        v.past_cut();
+
+        assert_eq!(v.instr.volume, 0.0, "instrument volume zeroed");
+        assert!(
+            v.instr.volume_fading_out,
+            "fadeout flag engaged (= CHN_NOTEFADE)"
+        );
+        assert_eq!(
+            v.instr.volume_fadeout, 0.0,
+            "fadeout register zeroed (= fadeout_volume = 0)"
+        );
     }
 }

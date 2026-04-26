@@ -1,6 +1,6 @@
 /// A Sample State
 use crate::helper::*;
-use xmrs::sample::Sample;
+use xmrs::sample::{LoopType, Sample};
 
 // Float math backend (only needed when `std` is disabled).
 // Priority: std > libm > micromath.
@@ -26,11 +26,38 @@ pub struct StateSample<'a> {
     step: Option<u32>, // step, M shifted
     // Output frequency
     rate: f32,
+
+    // Cached loop / length parameters from the underlying `Sample`.
+    //
+    // These mirror `Sample::len`, `Sample::loop_*` and
+    // `Sample::sustain_loop_*` and are populated once at construction.
+    // The `Sample` itself is borrowed immutably for the lifetime of
+    // this `StateSample`, so caching is safe — these values cannot
+    // change underneath us.
+    //
+    // The point is to keep the per-sample hot path (`tick` →
+    // `seek_cached` → `calculate_loop_cached`) free of the
+    // `match self.data { Mono8(v) => v.len(), Mono16(v) => ... }`
+    // walk inside `Sample::len` and `SampleDataType::len`. With
+    // `#[inline(always)]` alone these matches inline at every call
+    // site but still execute the chain of branches; caching the
+    // resolved `usize` makes the hot path purely arithmetic. After
+    // the inline-only patches, profiling still showed `Sample::len`
+    // and `Sample::is_empty` cumulatively eating ~15% of total
+    // runtime — the cache eliminates that entirely.
+    cached_len: usize,
+    cached_loop_start: usize,
+    cached_loop_length: usize,
+    cached_loop_flag: LoopType,
+    cached_sustain_loop_start: usize,
+    cached_sustain_loop_length: usize,
+    cached_sustain_loop_flag: LoopType,
 }
 
 impl<'a> StateSample<'a> {
     pub fn new(sample: &'a Sample, rate: f32) -> Self {
         let finetune = sample.finetune;
+        let cached_len = sample.len();
         Self {
             sample,
             finetune,
@@ -38,6 +65,13 @@ impl<'a> StateSample<'a> {
             position: (0, 0),
             step: None,
             rate,
+            cached_len,
+            cached_loop_start: sample.loop_start as usize,
+            cached_loop_length: sample.loop_length as usize,
+            cached_loop_flag: sample.loop_flag,
+            cached_sustain_loop_start: sample.sustain_loop_start as usize,
+            cached_sustain_loop_length: sample.sustain_loop_length as usize,
+            cached_sustain_loop_flag: sample.sustain_loop_flag,
         }
     }
 
@@ -48,13 +82,14 @@ impl<'a> StateSample<'a> {
     }
 
     pub fn set_step(&mut self, frequency: f32) {
-        if self.sample.is_empty() {
+        if self.cached_len == 0 {
             self.disable();
         } else {
             self.step = Some(((1 << M) as f32 * (frequency / self.rate)) as u32);
         }
     }
 
+    #[inline(always)]
     pub fn is_enabled(&self) -> bool {
         self.step.is_some()
     }
@@ -64,8 +99,7 @@ impl<'a> StateSample<'a> {
     /// heuristic — looping voices can ring indefinitely so they're
     /// cheaper to drop than one-shot tails.
     pub fn is_looping(&self) -> bool {
-        use xmrs::sample::LoopType;
-        self.sample.loop_flag != LoopType::No || self.sample.sustain_loop_flag != LoopType::No
+        self.cached_loop_flag != LoopType::No || self.cached_sustain_loop_flag != LoopType::No
     }
 
     pub fn disable(&mut self) {
@@ -96,25 +130,111 @@ impl<'a> StateSample<'a> {
         self.sustained = sustained;
     }
 
+    /// Cached version of `Sample::calculate_loop` — same algorithm,
+    /// but uses `self.cached_len` instead of dispatching through the
+    /// `SampleDataType` enum. `#[inline(always)]` so it folds entirely
+    /// into `seek_cached`'s call site.
+    #[inline(always)]
+    fn calculate_loop_cached(
+        &self,
+        pos: usize,
+        start: usize,
+        length: usize,
+        loop_type: LoopType,
+    ) -> usize {
+        if self.cached_len == 0 {
+            return 0;
+        }
+        let end = start + length;
+        match loop_type {
+            LoopType::No => {
+                if pos < self.cached_len {
+                    pos
+                } else {
+                    self.cached_len - 1
+                }
+            }
+            LoopType::Forward => {
+                if length == 0 || pos < end {
+                    pos.min(self.cached_len - 1)
+                } else {
+                    start + (pos - start) % length
+                }
+            }
+            LoopType::PingPong => {
+                if length == 0 || pos < end {
+                    pos.min(self.cached_len - 1)
+                } else {
+                    let total_length = 2 * length;
+                    let mod_pos = (pos - start) % total_length;
+                    if mod_pos < length {
+                        start + mod_pos
+                    } else {
+                        end - (mod_pos - length) - 1
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cached `seek`. Equivalent to `Sample::seek` but uses the
+    /// `StateSample`-side cache so the hot path doesn't hit the
+    /// `SampleDataType` match. Returns `None` when the play head has
+    /// run past the end of a non-looping sample.
+    #[inline(always)]
+    fn seek_cached(&self, pos: usize) -> Option<usize> {
+        if self.cached_len == 0 {
+            return None;
+        }
+        let (start, length, loop_type) =
+            if self.sustained && self.cached_sustain_loop_flag != LoopType::No {
+                (
+                    self.cached_sustain_loop_start,
+                    self.cached_sustain_loop_length,
+                    self.cached_sustain_loop_flag,
+                )
+            } else {
+                (
+                    self.cached_loop_start,
+                    self.cached_loop_length,
+                    self.cached_loop_flag,
+                )
+            };
+
+        match loop_type {
+            LoopType::No => {
+                if pos < self.cached_len {
+                    Some(pos)
+                } else {
+                    None
+                }
+            }
+            LoopType::Forward | LoopType::PingPong => {
+                Some(self.calculate_loop_cached(pos, start, length, loop_type))
+            }
+        }
+    }
+
+    #[inline(always)]
     fn tick(&mut self) -> (f32, f32) {
-        // Ask the sample where we actually are. `seek` returns `None`
-        // when the play head has run past the end of a non-looping
-        // sample — at which point the voice is done and must be shut
-        // off, otherwise it would hold the tail frame indefinitely and
-        // produce an audible drone on any instrument whose tail isn't
-        // silent.
+        // Ask the sample where we actually are. `seek_cached` returns
+        // `None` when the play head has run past the end of a non-
+        // looping sample — at which point the voice is done and must
+        // be shut off, otherwise it would hold the tail frame
+        // indefinitely and produce an audible drone on any instrument
+        // whose tail isn't silent.
         let pos = self.position.0 as usize;
-        let useek = match self.sample.seek(pos, self.sustained) {
+        let useek = match self.seek_cached(pos) {
             Some(s) => s,
             None => {
                 self.disable();
                 return (0.0, 0.0);
             }
         };
-        // Linear interpolation peek: the "next" sample follows the same
-        // rules. If the next frame is past the end, reuse the current
-        // one rather than blending into silence.
-        let vseek = self.sample.seek(pos + 1, self.sustained).unwrap_or(useek);
+        // Linear interpolation peek: the "next" sample follows the
+        // same rules. If the next frame is past the end, reuse the
+        // current one rather than blending into silence.
+        let vseek = self.seek_cached(pos + 1).unwrap_or(useek);
 
         let t = self.get_position_fraction() as f32 / (1 << M) as f32;
         let u = self.sample.at(useek);
@@ -134,7 +254,7 @@ impl<'a> StateSample<'a> {
     /// channel's Oxx-past-end branch to decide whether to clamp
     /// (IT old-effects) or drop the offset (IT default / XM / etc.).
     pub fn sample_len(&self) -> usize {
-        self.sample.len()
+        self.cached_len
     }
 
     #[inline(always)]
@@ -173,6 +293,7 @@ impl<'a> StateSample<'a> {
 impl<'a> Iterator for StateSample<'a> {
     type Item = (f32, f32);
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         if self.is_enabled() {
             Some(self.tick())

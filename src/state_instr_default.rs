@@ -147,6 +147,7 @@ impl<'a> StateInstrDefault<'a> {
         );
     }
 
+    #[inline(always)]
     pub fn is_enabled(&self) -> bool {
         match &self.state_sample {
             Some(s) => s.is_enabled(),
@@ -262,6 +263,7 @@ impl<'a> StateInstrDefault<'a> {
         self.volume_fading_out = true;
     }
 
+    #[inline(always)]
     pub fn get_volume(&self) -> f32 {
         // `instr.voice.volume` is IT's per-instrument scalar (0..1,
         // populated from the IT instrument header's global-volume
@@ -562,6 +564,20 @@ impl<'a> Iterator for StateInstrDefault<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if !self.is_enabled() {
+            return None;
+        }
+        // Voice is silent and awaiting reap — its fadeout register
+        // has reached zero (DCA NoteCut on the live voice, S70 past-
+        // cut on a now-promoted ghost, or the natural end of an IT
+        // fadeout). Mirrors the same gate in `Voice::next` (the
+        // ghost path) and matches schism's per-render kill check at
+        // `sndmix.c:1112-1118`. Without this, a DCA-cut live voice
+        // would keep paying the full sample / filter / lerp work
+        // every output sample until it's replaced by a fresh trigger
+        // — a bounded waste (one such voice per channel at most),
+        // but a nicely free win that aligns with the ghost path's
+        // semantics.
+        if self.volume_fading_out && self.volume_fadeout <= 0.0 {
             return None;
         }
         let raw = match &mut self.state_sample {

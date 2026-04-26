@@ -70,6 +70,26 @@ pub(crate) struct StateFilter {
     /// `true` when the biquad path is active. When `false`, `process`
     /// returns the input untouched (pass-through).
     pub enabled: bool,
+    /// `true` once the filter has been enabled at any point during
+    /// this voice's lifetime. Latched on first engagement (any of
+    /// `configure_from_it_registers` with bit-7 set, `set_cutoff_reg`,
+    /// `set_resonance_reg`, or `set_mode_from_macro` not in disable
+    /// mode) and never cleared. Drives the per-sample fast path in
+    /// [`Self::process`]: voices that never touch their filter — i.e.
+    /// XM / MOD / S3M voices, and IT voices whose instrument header
+    /// has both filter bytes bit-7-clear and whose pattern never
+    /// fires a filter MIDI macro — short-circuit out of `process`
+    /// without paying the four "warm input history" stores. Voices
+    /// that have engaged the filter at least once keep the warm-
+    /// history path so a subsequent re-engagement (rare, only via
+    /// MIDI-macro automation) doesn't crash the biquad into a zero-
+    /// initialised history state.
+    ///
+    /// Schism gets this for free via `MIXNDX_FILTER` static dispatch
+    /// at the voice-setup level (`mixer.c:714`); xmrsplayer's mixer
+    /// doesn't have an equivalent flag-driven dispatch table, so we
+    /// gate inside `process` instead.
+    was_ever_enabled: bool,
     /// Response shape — `LowPass` (default) or `HighPass`. Affects
     /// how `recompute_coefficients` derives the biquad numerator.
     mode: FilterMode,
@@ -104,6 +124,7 @@ impl StateFilter {
         Self {
             rate,
             enabled: false,
+            was_ever_enabled: false,
             mode: FilterMode::LowPass,
             cutoff_reg: 127,
             resonance_reg: 0,
@@ -149,6 +170,7 @@ impl StateFilter {
         if !self.enabled {
             return;
         }
+        self.was_ever_enabled = true;
         self.cutoff_reg = cutoff_reg & 0x7F;
         self.resonance_reg = resonance_reg & 0x7F;
         self.recompute_coefficients();
@@ -171,6 +193,7 @@ impl StateFilter {
         }
         self.cutoff_reg = new;
         self.enabled = true;
+        self.was_ever_enabled = true;
         self.recompute_coefficients();
     }
 
@@ -184,6 +207,7 @@ impl StateFilter {
         }
         self.resonance_reg = new;
         self.enabled = true;
+        self.was_ever_enabled = true;
         self.recompute_coefficients();
     }
 
@@ -269,18 +293,38 @@ impl StateFilter {
     }
 
     /// Process one stereo sample pair through the biquad. Returns the
-    /// input untouched when `enabled` is `false` — the hot path for
-    /// non-filter modules / voices. Even in pass-through we still
-    /// update the input history slots `x1`/`x2` so that when
-    /// `enabled` flips true mid-voice (via MIDI macro automation)
-    /// the biquad has warm input context and doesn't emit a
-    /// convergence click from all-zero history.
+    /// input untouched when the filter has never been engaged for this
+    /// voice (the typical XM/MOD/S3M case) or when it's currently in
+    /// pass-through. The two paths differ in their bookkeeping:
+    ///
+    /// 1. **Never engaged** (`was_ever_enabled == false`): true zero-
+    ///    cost pass-through. No state to maintain, because no
+    ///    subsequent `set_cutoff_reg` / `set_resonance_reg` /
+    ///    `set_mode_from_macro` will ever fire on this voice. Saves
+    ///    four `f32` writes per sample per voice — at 32 channels ×
+    ///    ~10 voices × 48 kHz that's ~60M useless stores per second
+    ///    on filter-free modules.
+    ///
+    /// 2. **Currently bypassed but previously engaged** (`enabled ==
+    ///    false`, `was_ever_enabled == true`): keep input history
+    ///    current so a future re-engagement (rare, only via MIDI-
+    ///    macro automation) doesn't crash the biquad into a zero-
+    ///    initialised history state and click. This path is reached
+    ///    only on IT modules that toggle their filter dynamically.
+    ///    Output history stays zero — nothing valid to store there
+    ///    until the filter produces output.
+    ///
+    /// Schism's mixer dispatches statically on the `MIXNDX_FILTER`
+    /// flag (`mixer.c:714`), so its filter-free voices pay zero
+    /// instructions. xmrsplayer's mixer doesn't have that level of
+    /// dispatch flexibility, so we gate inside `process` instead —
+    /// effectively the same fast-path, just one branch later.
     #[inline]
     pub fn process(&mut self, l: f32, r: f32) -> (f32, f32) {
+        if !self.was_ever_enabled {
+            return (l, r);
+        }
         if !self.enabled {
-            // Keep input history current for a clean bypass→engage
-            // transition. Output history stays zero — nothing valid
-            // to store there until the filter produces output.
             self.xl2 = self.xl1;
             self.xl1 = l;
             self.xr2 = self.xr1;

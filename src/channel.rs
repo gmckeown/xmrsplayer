@@ -924,7 +924,43 @@ impl<'a> Channel<'a> {
         });
         if live_matches {
             match &dca {
-                DuplicateCheckAction::NoteCut(_) => self.cut_pitch(),
+                DuplicateCheckAction::NoteCut(_) => {
+                    // Match schism's DCA_NOTECUT (effects.c:1742-1745
+                    // + the safety net at 1761-1764):
+                    //
+                    // ```c
+                    // case DCA_NOTECUT:
+                    //     fx_key_off(csf, i);
+                    //     p->volume = 0;
+                    //     ...
+                    // if (!p->volume) {
+                    //     p->fadeout_volume = 0;
+                    //     p->flags |= (CHN_NOTEFADE|CHN_FASTVOLRAMP);
+                    // }
+                    // ```
+                    //
+                    // The pre-fix code only called the channel-side
+                    // `cut_pitch` (zeroes `self.volume`, the channel's
+                    // volume modulator). That silenced the live voice
+                    // through `actual_volume`, but left every per-
+                    // voice predicate (`is_enabled`, `volume_fading_
+                    // out`, `volume_fadeout`) in their pre-cut state.
+                    // When `spawn_ghost_for_outgoing` subsequently
+                    // promoted this live voice to a ghost (line ~1790
+                    // of `tick0_change_instr`), it captured a frozen
+                    // `vol_frozen = 0` from the cut channel volume —
+                    // a permanently silent ghost that nothing would
+                    // ever reap. Modules with active DCT NoteCut on
+                    // every retrigger thus accumulated one immortal
+                    // silent ghost per displaced note.
+                    self.cut_pitch();
+                    if let Some(i) = self.live_mut(pool) {
+                        i.key_off(); // = fx_key_off
+                        i.cut_pitch(); // = p->volume = 0
+                        i.volume_fading_out = true;
+                        i.volume_fadeout = 0.0;
+                    }
+                }
                 DuplicateCheckAction::NoteOff(_) => {
                     if let Some(i) = self.live_mut(pool) {
                         i.key_off();

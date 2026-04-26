@@ -263,24 +263,33 @@ impl<'a> Voices<'a> {
     /// `PatternLoop`, `PatternDelay`) are owned by the sequencer and
     /// skipped here.
     fn apply_row_global_effects(&mut self, ch_index: usize, cell: &TrackUnit) {
-        for gfx in cell.global_effects.clone() {
+        // Iterate by reference. Pre-fix this was `for gfx in
+        // cell.global_effects.clone()` — a wholesale `Vec<GlobalEffect>`
+        // clone on every channel of every row, even though the only
+        // arm that genuinely needs an owned value is `MidiMacro` (it
+        // moves `macro_type` into `apply_midi_macro`). The other arms
+        // (`Volume`, `VolumeSlide`, navigation arms) only read scalar
+        // fields. Cloning is now confined to the MidiMacro path,
+        // which is rare in practice — most cells have no global
+        // effects at all.
+        for gfx in &cell.global_effects {
             match gfx {
                 GlobalEffect::Volume(volume) => {
                     self.global_volume = volume.clamp(0.0, 1.0);
                 }
                 GlobalEffect::VolumeSlide { speed: s, fine: f } => {
-                    if f {
+                    if *f {
                         // Fine slide: apply once at tick 0.
-                        self.global_volume = (self.global_volume + s).clamp(0.0, 1.0);
+                        self.global_volume = (self.global_volume + *s).clamp(0.0, 1.0);
                     }
                     // Latch the speed so non-fine slides apply on subsequent ticks.
-                    self.volume_slide_speed = s;
-                    self.volume_slide_fine = f;
+                    self.volume_slide_speed = *s;
+                    self.volume_slide_fine = *f;
                 }
                 GlobalEffect::MidiMacro(macro_type) => {
                     if let Some(ch) = self.channel.get_mut(ch_index) {
                         ch.apply_midi_macro(
-                            macro_type,
+                            macro_type.clone(),
                             ch_index,
                             &mut self.pending_midi_events,
                             &mut self.pool,
