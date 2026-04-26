@@ -2,9 +2,6 @@ use clap::Parser;
 use console::{Key, Term};
 use std::sync::{Arc, Mutex};
 
-use xmrs::import::amiga::amiga_module::AmigaModule;
-use xmrs::import::s3m::s3m_module::S3mModule;
-use xmrs::import::xm::xmmodule::XmModule;
 use xmrs::prelude::*;
 
 mod bufferedsource;
@@ -51,99 +48,39 @@ struct Cli {
 fn main() -> Result<(), std::io::Error> {
     let cli = Cli::parse();
 
-    match cli.filename {
-        Some(filename) => {
-            // Term::stdout().clear_screen().unwrap();
-            println!("--===~ XmRs Player Example ~===--");
-            println!("(c) 2023-2024 Sébastien Béchet\n");
-            println!("Because demo scene can't die :)\n");
-            // let path = std::env::current_dir()?;
-            // println!("The current directory is {}", path.display());
-            println!("opening {}", filename);
-            let contents = std::fs::read(filename.trim())?;
-            match filename.split('.').last() {
-                Some(extension) if extension == "xm" || extension == "XM" => {
-                    match XmModule::load(&contents) {
-                        Ok(xm) => {
-                            drop(contents); // cleanup memory
-                            let module = xm.to_module();
-                            drop(xm);
-                            println!("Playing {} !", module.name);
+    if let Some(filename) = cli.filename {
+        // Term::stdout().clear_screen().unwrap();
+        println!("--===~ XmRs Player Example ~===--");
+        println!("(c) 2023-2024 Sébastien Béchet\n");
+        println!("Because demo scene can't die :)\n");
+        println!("opening {}", filename);
+        let contents = std::fs::read(filename.trim())?;
+        // Auto-detect the module format (MOD / XM / S3M / IT) — matches the
+        // approach used by `src/bin/cpal_player.rs` and the README's
+        // minimal example. Each enabled `import_*` feature contributes one
+        // detection branch inside `Module::load`.
+        match Module::load(&contents) {
+            Ok(module) => {
+                drop(contents); // cleanup memory
+                println!("Playing {} !", module.name);
 
-                            let module = Box::new(module);
-                            let module_ref: &'static Module = Box::leak(module);
-                            rodio_play(
-                                module_ref,
-                                cli.song,
-                                cli.amplification,
-                                cli.position,
-                                cli.loops,
-                                cli.debug,
-                                cli.ch,
-                                cli.speed,
-                            );
-                        }
-                        Err(e) => {
-                            println!("{:?}", e);
-                        }
-                    }
-                }
-                Some(extension) if extension == "mod" || extension == "MOD" => {
-                    match AmigaModule::load(&contents) {
-                        Ok(amiga) => {
-                            drop(contents); // cleanup memory
-                            let module = amiga.to_module();
-                            drop(amiga);
-                            println!("Playing {} !", module.name);
-                            let module = Box::new(module);
-                            let module_ref: &'static Module = Box::leak(module);
-                            rodio_play(
-                                module_ref,
-                                cli.song,
-                                cli.amplification,
-                                cli.position,
-                                cli.loops,
-                                cli.debug,
-                                cli.ch,
-                                cli.speed,
-                            );
-                        }
-                        Err(e) => {
-                            println!("{:?}", e);
-                        }
-                    }
-                }
-                Some(extension) if extension == "s3m" || extension == "S3M" => {
-                    match S3mModule::load(&contents) {
-                        Ok(s3m) => {
-                            drop(contents); // cleanup memory
-                            let module = s3m.to_module();
-                            drop(s3m);
-                            println!("Playing {} !", module.name);
-                            let module = Box::new(module);
-                            let module_ref: &'static Module = Box::leak(module);
-                            rodio_play(
-                                module_ref,
-                                cli.song,
-                                cli.amplification,
-                                cli.position,
-                                cli.loops,
-                                cli.debug,
-                                cli.ch,
-                                cli.speed,
-                            );
-                        }
-                        Err(e) => {
-                            println!("{:?}", e);
-                        }
-                    }
-                }
-                Some(_) | None => {
-                    println!("File unknown?");
-                }
+                let module = Box::new(module);
+                let module_ref: &'static Module = Box::leak(module);
+                rodio_play(
+                    module_ref,
+                    cli.song,
+                    cli.amplification,
+                    cli.position,
+                    cli.loops,
+                    cli.debug,
+                    cli.ch,
+                    cli.speed,
+                );
+            }
+            Err(e) => {
+                println!("{:?}", e);
             }
         }
-        _ => {}
     }
     Ok(())
 }
@@ -182,7 +119,7 @@ fn rodio_play(
         player_lock.set_amplification(amplification);
         if debug {
             println!("Debug on");
-            println!("Module format: {:?}", module.format);
+            println!("Module format: {:?}", module.profile.format);
             player_lock.add_observer(Box::new(DebugObserver::new()));
         }
         if ch != 0 {
