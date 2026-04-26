@@ -380,10 +380,15 @@ impl<'a> StateInstrDefault<'a> {
     /// Used by the channel at trigger time to compute the frequency
     /// the sample should play at, while the input note is preserved
     /// for DCT / NNA / portamento-target comparisons.
+    /// Resolves the IT keyboard-table remap for a given input pitch.
+    /// When the instrument's drum-kit table maps `input` to a
+    /// different output note, returns that output. Otherwise returns
+    /// `input` unchanged.
+    ///
+    /// Used by the channel at trigger time to compute the frequency
+    /// the sample should play at, while the input note is preserved
+    /// for DCT / NNA / portamento-target comparisons.
     pub fn played_pitch_for(&self, input: Pitch) -> Pitch {
-        if !input.is_valid() {
-            return input;
-        }
         match self.instr.note_for_pitch[input.value() as usize] {
             Some(out) => Pitch::try_from(out).unwrap_or(input),
             None => input,
@@ -391,10 +396,8 @@ impl<'a> StateInstrDefault<'a> {
     }
 
     pub fn set_pitch(&mut self, note: Pitch) -> bool {
-        if note.is_valid() {
-            if let Some(num) = self.instr.sample_for_pitch[note.value() as usize] {
-                return self.select_sample(num);
-            }
+        if let Some(num) = self.instr.sample_for_pitch[note.value() as usize] {
+            return self.select_sample(num);
         }
         false
     }
@@ -513,19 +516,5 @@ mod tests {
         // Untouched keys: identity.
         assert_eq!(state.played_pitch_for(Pitch::C5), Pitch::C5);
         assert_eq!(state.played_pitch_for(Pitch::F5), Pitch::F5);
-    }
-
-    #[test]
-    fn played_pitch_passes_through_invalid_notes() {
-        // Pitch::None / Off / Fade / Cut have value() ≥ 120 and
-        // are not valid lookups in the keyboard table. The helper
-        // must return them untouched so the caller's downstream
-        // is_keyoff() / is_fade() checks still see the original.
-        let instr = make_instr_with_remap(&[(60, 67)]);
-        let state = state_for(&instr);
-        assert_eq!(state.played_pitch_for(Pitch::None), Pitch::None);
-        assert_eq!(state.played_pitch_for(Pitch::Off), Pitch::Off);
-        assert_eq!(state.played_pitch_for(Pitch::Fade), Pitch::Fade);
-        assert_eq!(state.played_pitch_for(Pitch::Cut), Pitch::Cut);
     }
 }

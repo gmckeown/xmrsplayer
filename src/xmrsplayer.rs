@@ -22,7 +22,7 @@ use crate::audio_observer::{ChannelsContext, ChannelsObserver, MixContext, MixOb
 use crate::midi_observer::MidiObserver;
 use crate::observer::{PatternChangeContext, PlayerObserver, RowContext, TickContext};
 use crate::sequencer::{Sequencer, TickOutcome};
-use crate::voices::Voices;
+use crate::voices::{Voices, DEFAULT_VOICE_POOL_CAPACITY};
 
 pub struct XmrsPlayer<'a> {
     /// The module being played. Kept public because it's an immutable
@@ -83,7 +83,11 @@ pub struct XmrsPlayer<'a> {
 }
 
 impl<'a> XmrsPlayer<'a> {
-    /// Build a player for the given module.
+    /// Build a player for the given module, with the default voice
+    /// pool capacity (256 voices, matching schism's `MAX_VOICES`).
+    /// For modules that stack many NNA voices simultaneously
+    /// (`Another Life` and the like), use
+    /// [`Self::new_with_voice_pool_capacity`] to raise this limit.
     ///
     /// Format-specific FT2/XM behaviour — arpeggio LUT, E60 pattern-
     /// loop bug, arpeggio period clamp, portamento-down signed-
@@ -92,8 +96,37 @@ impl<'a> XmrsPlayer<'a> {
     /// activates the canonical FT2 reference behaviour, all other
     /// formats use their own native semantics.
     pub fn new(module: &'a Module, sample_rate: f32, song: usize) -> Self {
+        Self::new_with_voice_pool_capacity(module, sample_rate, song, DEFAULT_VOICE_POOL_CAPACITY)
+    }
+
+    /// Like [`Self::new`] but with a caller-chosen voice pool
+    /// capacity. The pool must hold at least one voice (`capacity >=
+    /// 1`) and below 65535 (`VoiceId`'s packed-handle ceiling); the
+    /// constructor panics outside that range.
+    ///
+    /// Reasonable values:
+    ///
+    /// - `256` (default) is what schism uses and what most IT
+    ///   modules expect.
+    /// - `512`–`1024` for tracker compositions that intentionally
+    ///   layer dozens of NNA tails per channel — the cost is just a
+    ///   larger working set; the mix loop isn't sensitive to pool
+    ///   size.
+    /// - `64`–`128` if you're targeting embedded hardware where
+    ///   even 256 voices is too much state to keep around.
+    pub fn new_with_voice_pool_capacity(
+        module: &'a Module,
+        sample_rate: f32,
+        song: usize,
+        voice_pool_capacity: usize,
+    ) -> Self {
         let sequencer = Sequencer::new(module, song);
-        let voices = Voices::new(module, sample_rate, module.default_tempo);
+        let voices = Voices::new_with_voice_pool_capacity(
+            module,
+            sample_rate,
+            module.default_tempo,
+            voice_pool_capacity,
+        );
         let num_channels = voices.num_channels();
 
         Self {

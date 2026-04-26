@@ -33,7 +33,7 @@ enum Dct {
 
 #[derive(Clone, PartialEq, Default)]
 struct NoteRetrigState {
-    note: Pitch,
+    note: CellNote,
     instr: Option<usize>,
     speed: usize,
     volume_modifier: NoteRetrigOperator,
@@ -1174,19 +1174,21 @@ impl<'a> Channel<'a> {
                     }
                 }
                 TrackEffect::InstrumentFineTune(finetune) => {
-                    if current_tick == 0 && self.current.note.is_valid() {
-                        if let Some(instr) = self.live_mut(pool) {
-                            instr.set_finetune(finetune);
-                            // Recomputing the playback frequency
-                            // after a finetune change must use the
-                            // remapped output note, same as the
-                            // initial trigger. Otherwise a finetune
-                            // event on a drum-kit voice would jump
-                            // to the input-note pitch and break the
-                            // remap.
-                            let played = instr.played_pitch_for(self.current.note);
-                            self.note = played.value() as f32 + instr.get_finetuned_pitch();
-                            self.period = self.period_helper.note_to_period(self.note);
+                    if current_tick == 0 {
+                        if let Some(pitch) = self.current.note.pitch() {
+                            if let Some(instr) = self.live_mut(pool) {
+                                instr.set_finetune(finetune);
+                                // Recomputing the playback frequency
+                                // after a finetune change must use the
+                                // remapped output note, same as the
+                                // initial trigger. Otherwise a finetune
+                                // event on a drum-kit voice would jump
+                                // to the input-note pitch and break the
+                                // remap.
+                                let played = instr.played_pitch_for(pitch);
+                                self.note = played.value() as f32 + instr.get_finetuned_pitch();
+                                self.period = self.period_helper.note_to_period(self.note);
+                            }
                         }
                     }
                 }
@@ -1227,7 +1229,7 @@ impl<'a> Channel<'a> {
                     }
                 }
                 TrackEffect::InstrumentSampleOffset(seek) => {
-                    if current_tick == 0 && self.current.note.is_valid() {
+                    if current_tick == 0 && self.current.note.pitch().is_some() {
                         if let Some(instr) = self.live_mut(pool) {
                             if let Some(sample) = &mut instr.state_sample {
                                 let sample_len = sample.sample_len();
@@ -1300,14 +1302,14 @@ impl<'a> Channel<'a> {
                 }
                 TrackEffect::NoteDelay(delay) => {
                     if current_tick == 0 {
-                        if self.current.note.is_none() {
+                        if matches!(self.current.note, CellNote::Empty) {
                             self.trigger_pitch(
                                 TRIGGER_KEEP_SAMPLE_POSITION
                                     | TRIGGER_KEEP_VOLUME
                                     | TRIGGER_KEEP_PERIOD,
                                 pool,
                             );
-                        } else if self.current.note.is_keyoff() {
+                        } else if matches!(self.current.note, CellNote::KeyOff) {
                             if self.current.instrument.is_none() {
                                 self.key_off(0, pool);
                             } else {
@@ -1322,7 +1324,7 @@ impl<'a> Channel<'a> {
                         self.tickn_effects(0, pool);
 
                         /* Special KeyOff cases */
-                        if self.current.note.is_keyoff() {
+                        if matches!(self.current.note, CellNote::KeyOff) {
                             if self.current.instrument.is_none() {
                                 if let Some(i) = self.live_mut(pool) {
                                     i.volume_reset();
@@ -1725,11 +1727,7 @@ impl<'a> Channel<'a> {
                     // note's "clash preferences" are resolved first,
                     // then NNA decides what happens to whatever live
                     // voice is still standing afterwards.
-                    let new_note = if self.current.note.is_valid() {
-                        Some(self.current.note)
-                    } else {
-                        None
-                    };
+                    let new_note = self.current.note.pitch();
                     let new_sample_index = new_note
                         .and_then(|n| id.sample_for_pitch.get(n.value() as usize).copied())
                         .flatten();
@@ -1783,44 +1781,61 @@ impl<'a> Channel<'a> {
             return self.tick0_change_instr(true, pool);
         }
 
-        if self.current.note.is_none() {
-            /* Ghost instrument, trigger note */
-            let trigger_flags = if self.current.has_volume_slide() {
-                TRIGGER_KEEP_SAMPLE_POSITION | TRIGGER_KEEP_PERIOD
-            } else {
-                /* Sample position is kept, but envelopes are reset */
-                TRIGGER_KEEP_SAMPLE_POSITION | TRIGGER_KEEP_VOLUME | TRIGGER_KEEP_PERIOD
-            };
-            self.trigger_pitch(trigger_flags, pool);
-            return self.tick0_change_instr(true, pool);
-        }
-
-        if self.current.note.is_keyoff() {
-            self.trigger_pitch(TRIGGER_KEEP_PERIOD, pool);
-            return true; // Keyoff does not change instrument
-        }
-
-        // IT note-fade `~~~` (Pitch::Fade): same instrument-handling
-        // rule as Off — the fade cell is not a "new note" and must
-        // not load a different instrument or retrigger. The actual
-        // fadeout work is done in `tick0_load_pitch::note_fade`.
-        if self.current.note.is_fade() {
-            return true;
+        // Dispatch on the cell's note column. A real Play(_) falls
+        // through to the regular instrument-change path; the other
+        // variants apply their own trigger/return convention.
+        match self.current.note {
+            CellNote::Empty => {
+                /* Ghost instrument, trigger note */
+                let trigger_flags = if self.current.has_volume_slide() {
+                    TRIGGER_KEEP_SAMPLE_POSITION | TRIGGER_KEEP_PERIOD
+                } else {
+                    /* Sample position is kept, but envelopes are reset */
+                    TRIGGER_KEEP_SAMPLE_POSITION | TRIGGER_KEEP_VOLUME | TRIGGER_KEEP_PERIOD
+                };
+                self.trigger_pitch(trigger_flags, pool);
+                return self.tick0_change_instr(true, pool);
+            }
+            CellNote::KeyOff => {
+                self.trigger_pitch(TRIGGER_KEEP_PERIOD, pool);
+                return true; // Keyoff does not change instrument
+            }
+            CellNote::NoteFade => {
+                // IT note-fade `~~~`: same instrument-handling rule
+                // as KeyOff — the fade cell is not a "new note" and
+                // must not load a different instrument or retrigger.
+                // The actual fadeout work is done in
+                // `tick0_load_pitch::note_fade`.
+                return true;
+            }
+            CellNote::NoteCut | CellNote::Play(_) => {
+                // Cut and Play both go through the normal path: a
+                // Cut row will be handled inside
+                // `tick0_change_instr` like an empty note (no
+                // instrument change), and Play loads its instrument
+                // and pitch.
+            }
         }
 
         self.tick0_change_instr(false, pool)
     }
 
     fn tick0_load_pitch(&mut self, was_same_instr: bool, pool: &mut VoicePool<'a>) {
-        // Note is not valid? Return early.
-        if !self.current.note.is_valid() {
-            if self.current.note.is_keyoff() {
+        // Extract the actual pitch from the cell. For non-Play
+        // variants (KeyOff / NoteFade / NoteCut / Empty) this branch
+        // dispatches the corresponding event and returns; only
+        // Play(p) carries on to instrument/pitch loading.
+        let pitch = match self.current.note {
+            CellNote::Play(p) => p,
+            CellNote::KeyOff => {
                 if self.current.instrument.is_none() || was_same_instr {
                     self.key_off(0, pool);
                 } else {
                     self.trigger_pitch(TRIGGER_KEEP_PERIOD | TRIGGER_KEEP_ENVELOPE, pool);
                 }
-            } else if self.current.note.is_fade() {
+                return;
+            }
+            CellNote::NoteFade => {
                 // IT note-column `~~~`: start fadeout without
                 // releasing the envelope. Falls through any
                 // instrument change because fade has the same
@@ -1828,9 +1843,14 @@ impl<'a> Channel<'a> {
                 // not — schism doesn't gate on `row_instr` for
                 // NOTE_FADE either.
                 self.note_fade(pool);
+                return;
             }
-            return;
-        }
+            CellNote::NoteCut | CellNote::Empty => {
+                // NoteCut handled elsewhere; Empty means there's
+                // no note event on this row — nothing to do here.
+                return;
+            }
+        };
 
         // Instr?
         if let Some(instr) = self.live_mut(pool) {
@@ -1840,16 +1860,16 @@ impl<'a> Channel<'a> {
                     if s.is_enabled() {
                         // Same input/output split as in the SetNote
                         // branch below: the porta target's input
-                        // note (`current.note`) is what `current_
-                        // note` records for DCT comparisons, but
-                        // the period the slide aims at lives in
-                        // frequency space, so it must use the
-                        // remapped output pitch. Without this, a
-                        // Gxx targeting a remapped key on a drum
-                        // kit would slide to the wrong pitch.
-                        let played = instr.played_pitch_for(self.current.note);
+                        // note is what `current_note` records for
+                        // DCT comparisons, but the period the slide
+                        // aims at lives in frequency space, so it
+                        // must use the remapped output pitch.
+                        // Without this, a Gxx targeting a remapped
+                        // key on a drum kit would slide to the
+                        // wrong pitch.
+                        let played = instr.played_pitch_for(pitch);
                         self.note = played.value() as f32 + s.get_finetuned_pitch();
-                        self.current_note = Some(self.current.note);
+                        self.current_note = Some(pitch);
                         return;
                     }
                 }
@@ -1876,13 +1896,13 @@ impl<'a> Channel<'a> {
 
             // SetNote
             if let Some(instr) = self.live_mut(pool) {
-                if instr.set_pitch(self.current.note) {
+                if instr.set_pitch(pitch) {
                     if let Some(s) = &instr.state_sample {
                         // Two distinct notes are in play here:
                         //
-                        //  - `self.current.note` is the **input
-                        //    note** the pattern asked for. It stays
-                        //    in `self.current_note` because that's
+                        //  - `pitch` is the **input note** the
+                        //    pattern asked for. It stays in
+                        //    `self.current_note` because that's
                         //    what DCT, NNA and porta-target lookups
                         //    compare against — pressing C-5 and D-5
                         //    on the same drum kit must produce
@@ -1901,10 +1921,10 @@ impl<'a> Channel<'a> {
                         // `played_pitch_for` returns the input note
                         // unchanged and this matches the previous
                         // behaviour byte-for-byte.
-                        let played = instr.played_pitch_for(self.current.note);
+                        let played = instr.played_pitch_for(pitch);
                         self.note = played.value() as f32 + s.get_finetuned_pitch();
                     }
-                    self.current_note = Some(self.current.note);
+                    self.current_note = Some(pitch);
 
                     let trigger_flag = if self.current.instrument.is_some() {
                         TRIGGER_KEEP_NONE
@@ -1939,7 +1959,7 @@ impl<'a> Channel<'a> {
         //     `has_note_off_at_tick_zero()` rather than `has_note_off_effect()`,
         //     which would also match non-zero Kxy and wrongly eat their
         //     notes.
-        //   - Note-column `===` (`Pitch::Off`) has a different semantic
+        //   - Note-column `===` (`CellNote::KeyOff`) has a different semantic
         //     (see `key_off()`) and belongs on the normal tick-0 path
         //     via `tick0_load_pitch`, hence the helper distinguishes
         //     effect-Kxx from column-keyoff.

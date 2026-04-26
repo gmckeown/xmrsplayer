@@ -27,7 +27,11 @@ use xmrs::prelude::*;
 /// even modules using NNA = Continue heavily on multiple channels never
 /// hit the cap in practice. In step 1.6 this becomes a constructor
 /// parameter on the player; for now we hard-code a reasonable default.
-const DEFAULT_VOICE_POOL_CAPACITY: usize = 256;
+/// Default voice pool capacity. Mirrors schism's `MAX_VOICES = 256`.
+/// Exposed publicly so users can pass it to
+/// [`crate::XmrsPlayer::new_with_voice_pool_capacity`] when they
+/// want the default explicitly, e.g. for documentation purposes.
+pub const DEFAULT_VOICE_POOL_CAPACITY: usize = 256;
 
 /// The audio engine. Built once per player and driven via
 /// [`Voices::process_row`] / [`Voices::process_tick`].
@@ -90,7 +94,12 @@ pub struct Voices<'a> {
 }
 
 impl<'a> Voices<'a> {
-    pub(crate) fn new(module: &'a Module, sample_rate: f32, initial_tempo: usize) -> Self {
+    pub(crate) fn new_with_voice_pool_capacity(
+        module: &'a Module,
+        sample_rate: f32,
+        initial_tempo: usize,
+        voice_pool_capacity: usize,
+    ) -> Self {
         let num_channels = module.get_num_channels();
         let mut channels = vec![Channel::new(module, sample_rate, initial_tempo); num_channels];
         // Deterministic per-channel seed so each channel has an
@@ -121,7 +130,7 @@ impl<'a> Voices<'a> {
         Self {
             sample_rate,
             channel: channels,
-            pool: VoicePool::new(DEFAULT_VOICE_POOL_CAPACITY),
+            pool: VoicePool::new(voice_pool_capacity),
             global_volume: 1.0,
             amplification: 1.0,
             volume_slide_speed: 0.0,
