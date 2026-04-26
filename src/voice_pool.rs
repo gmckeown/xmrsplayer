@@ -1,0 +1,681 @@
+//! Voice pool — a fixed-capacity, ID-keyed allocator for `Voice`s.
+//!
+//! Every active note (live or NNA-detached) lives in this pool. Tracks
+//! reference voices through `VoiceId` handles instead of owning them
+//! directly. This decoupling is what step 1.3 of the voice-pool
+//! refactor needs to lift the per-channel ghost cap and let voice
+//! stealing happen against the global voice population, the way
+//! schismtracker does it (`csf_get_nna_channel`, `effects.c:1620`).
+//!
+//! The pool itself is an array of generational slots. `VoiceId`
+//! encodes `(slot_index, generation)`, so a stale handle (whose voice
+//! has since been released and the slot reused) is detected via the
+//! generation mismatch and silently fails on `get`/`get_mut`. This is
+//! the standard generational-arena pattern.
+//!
+//! 1.2 scope: this file introduces the pool type with full unit-test
+//! coverage but **no caller wires it up yet**. Live and ghost voices
+//! still live inside `Channel` exactly as in 1.1. Step 1.3 routes
+//! ghosts through the pool; step 1.4 routes the live voice; step 1.5
+//! upgrades the eviction strategy from "fail on full" to "steal the
+//! lowest-volume voice".
+
+use crate::voice::Voice;
+use alloc::vec::Vec;
+use core::num::NonZeroU32;
+
+/// Opaque handle to a voice inside a `VoicePool`.
+///
+/// The `NonZeroU32` lets the compiler use the niche so
+/// `size_of::<Option<VoiceId>>() == size_of::<VoiceId>()`. The encoded
+/// value combines the slot index (low 16 bits) and the slot's
+/// generation counter (high 16 bits). A handle is invalidated when
+/// its slot is released — subsequent `get`/`get_mut` return `None`,
+/// even if the slot has since been reused.
+///
+/// Handles are cheap to copy and can be safely embedded in tracks or
+/// past-note effect queues without ownership concerns. They are not
+/// portable across pools: a `VoiceId` minted by pool A will not
+/// resolve in pool B even if the same slot index happens to be live
+/// there.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct VoiceId(NonZeroU32);
+
+impl VoiceId {
+    /// Maximum slot index a single pool can address. Beyond this the
+    /// generation counter would collide with the slot bits in the
+    /// packed `NonZeroU32`. 65535 is well above the schism reference
+    /// (256 voices) and any realistic xmrsplayer cap.
+    pub const MAX_SLOTS: usize = 0xFFFF;
+
+    fn new(slot: usize, generation: u32) -> Self {
+        debug_assert!(slot < Self::MAX_SLOTS, "slot index overflow");
+        // generation always >= 1; we initialise slots at gen=1 and
+        // increment on every release. Combined with `slot+1` in the
+        // low bits, the packed value is guaranteed non-zero.
+        let packed = ((generation & 0xFFFF) << 16) | ((slot as u32 + 1) & 0xFFFF);
+        // Safety: `slot + 1` is at least 1 (since slot < MAX_SLOTS),
+        // so `packed` has at least bit 0 set and is non-zero.
+        Self(NonZeroU32::new(packed).expect("encoded VoiceId is non-zero by construction"))
+    }
+
+    fn slot(self) -> usize {
+        ((self.0.get() & 0xFFFF) - 1) as usize
+    }
+
+    fn generation(self) -> u32 {
+        (self.0.get() >> 16) & 0xFFFF
+    }
+}
+
+/// State of a single slot in the pool.
+enum SlotState<'a> {
+    /// Slot is free. `next_free` is the index of the next free slot,
+    /// or `usize::MAX` to mark the end of the chain.
+    Vacant { next_free: usize },
+    /// Slot is occupied by a live voice.
+    Occupied(Voice<'a>),
+}
+
+struct Slot<'a> {
+    /// Bumped each time the slot transitions Occupied -> Vacant. A
+    /// `VoiceId` is valid only while its `generation()` matches the
+    /// slot's current value.
+    generation: u32,
+    state: SlotState<'a>,
+}
+
+/// Fixed-capacity pool of `Voice`s, accessed via `VoiceId` handles.
+///
+/// The capacity is set at construction and never changes — relocating
+/// the slot array would force every outstanding handle to be
+/// rewritten, which we avoid by never reallocating.
+pub(crate) struct VoicePool<'a> {
+    slots: Vec<Slot<'a>>,
+    /// Index of the first free slot, or `usize::MAX` when the pool is
+    /// full. Free slots form a singly-linked list through their
+    /// `next_free` field, in LIFO order (most-recently-released first).
+    /// LIFO keeps the working set hot in cache and is conventional
+    /// for arena allocators.
+    free_head: usize,
+    /// Number of slots currently `Occupied`. Maintained alongside the
+    /// free-list so `allocated_count` is O(1).
+    allocated: usize,
+}
+
+const NIL: usize = usize::MAX;
+
+impl<'a> VoicePool<'a> {
+    /// Build a pool with room for `capacity` simultaneous voices. The
+    /// pool starts empty; every slot is on the free-list.
+    ///
+    /// Panics if `capacity == 0` or `capacity >= VoiceId::MAX_SLOTS`.
+    /// Both bounds reflect intentional limits: a zero-capacity pool
+    /// can never allocate, so it would only mask logic errors; a
+    /// capacity above MAX_SLOTS would overflow the packed `VoiceId`.
+    pub fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "VoicePool capacity must be positive");
+        assert!(
+            capacity < VoiceId::MAX_SLOTS,
+            "VoicePool capacity {} exceeds VoiceId::MAX_SLOTS ({})",
+            capacity,
+            VoiceId::MAX_SLOTS
+        );
+        let mut slots = Vec::with_capacity(capacity);
+        for i in 0..capacity {
+            // Each slot points to the next; the last points to NIL.
+            let next_free = if i + 1 < capacity { i + 1 } else { NIL };
+            slots.push(Slot {
+                generation: 1,
+                state: SlotState::Vacant { next_free },
+            });
+        }
+        Self {
+            slots,
+            free_head: 0,
+            allocated: 0,
+        }
+    }
+
+    /// Total number of slots in the pool (live + free). Test-only:
+    /// no production consumer reads the capacity today, but several
+    /// tests assert on it. Will lose the `cfg(test)` gate when 1.6
+    /// exposes a constructor parameter for the capacity.
+    #[cfg(test)]
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Number of slots currently occupied. Test-only — see comment
+    /// on `capacity`.
+    #[cfg(test)]
+    pub fn allocated_count(&self) -> usize {
+        self.allocated
+    }
+
+    /// `true` when every slot is occupied. Test-only — `allocate`
+    /// no longer fails on full so production code never needs to
+    /// check.
+    #[cfg(test)]
+    pub fn is_full(&self) -> bool {
+        self.free_head == NIL
+    }
+
+    /// Allocate a voice that *must* succeed.
+    ///
+    /// Used for the live voice driving a track's pattern column —
+    /// the user heard a note typed in the pattern, the player has
+    /// to play it. When the pool is full, evicts the
+    /// least-defensible voice to make room. The returned handle is
+    /// always valid.
+    ///
+    /// Eviction policy mirrors schism's `csf_get_nna_channel`
+    /// (`effects.c:1620`): voices that are still sustained (not yet
+    /// in their fadeout phase) are heavily protected — their score
+    /// is multiplied by a large constant. Only when *every* voice
+    /// is sustained do we fall back to evicting one of them. In
+    /// that pathological case we pick the lowest-volume of the
+    /// sustained set.
+    pub fn allocate_live(&mut self, voice: Voice<'a>) -> VoiceId {
+        if self.free_head == NIL {
+            // Pool full → must evict. `find_eviction_victim` always
+            // returns a slot when there's at least one occupied
+            // slot — and the pool has capacity ≥ 1, so this never
+            // panics.
+            let victim_slot = self
+                .find_eviction_victim()
+                .expect("allocate_live: pool full ⇒ at least one slot is Occupied");
+            let gen = self.slots[victim_slot].generation;
+            self.release(VoiceId::new(victim_slot, gen));
+        }
+        self.place_in_free_slot(voice)
+    }
+
+    /// Allocate a voice that *may* be refused.
+    ///
+    /// Used for ghost voices spawned by NNA on a channel retrigger.
+    /// Returns `None` when every existing voice is protected — in
+    /// that case the caller drops the ghost, the channel just plays
+    /// its new note without leaving a tail. Mirrors schism's
+    /// `csf_get_nna_channel` returning 0 (`effects.c:1638`):
+    ///
+    /// ```c
+    /// if (!chan->fadeout_volume) return 0;  // refuse the NNA spawn
+    /// ```
+    ///
+    /// This refusal is exactly what stops `Another Life`'s 96-note
+    /// ghost storm on pattern 4 from saturating the pool: once 256
+    /// NNA=Continue voices are sustaining, the 257th request is
+    /// silently dropped instead of stealing one of the audible
+    /// existing voices.
+    pub fn allocate_ghost(&mut self, voice: Voice<'a>) -> Option<VoiceId> {
+        if self.free_head == NIL {
+            let victim_slot = self.find_evictable_victim()?;
+            let gen = self.slots[victim_slot].generation;
+            self.release(VoiceId::new(victim_slot, gen));
+        }
+        Some(self.place_in_free_slot(voice))
+    }
+
+    /// Internal: pop the head of the free list and place `voice`
+    /// there. Caller must have ensured `free_head != NIL`.
+    fn place_in_free_slot(&mut self, voice: Voice<'a>) -> VoiceId {
+        let slot_idx = self.free_head;
+        let slot = &mut self.slots[slot_idx];
+        let next = match slot.state {
+            SlotState::Vacant { next_free } => next_free,
+            SlotState::Occupied(_) => {
+                // Defensive: free-list pointed to an occupied slot.
+                // Mark the list as exhausted; the caller may retry
+                // (allocate_live recurses once, allocate_ghost will
+                // return None on the next attempt).
+                self.free_head = NIL;
+                // Construct a dummy VoiceId — callers shouldn't
+                // reach this branch in practice. Returning the
+                // current handle keeps the invariant
+                // "VoiceId::new succeeds".
+                return VoiceId::new(slot_idx, slot.generation);
+            }
+        };
+        slot.state = SlotState::Occupied(voice);
+        self.free_head = next;
+        self.allocated += 1;
+        VoiceId::new(slot_idx, slot.generation)
+    }
+
+    /// Eviction-victim picker for `allocate_ghost`.
+    ///
+    /// Returns `Some(slot)` only when the pool contains at least one
+    /// "evictable" voice — i.e. a voice already in its fadeout phase
+    /// (`!sustained`) or whose `instr.get_volume()` is essentially
+    /// zero. Returns `None` when every occupied voice is still
+    /// sustained — that's the case schism handles by refusing the
+    /// NNA, see `effects.c:1638`.
+    ///
+    /// Among evictable voices, picks the one with the lowest
+    /// audible volume. Looping voices' score is halved (they can
+    /// ring forever, so they're cheaper to drop than one-shot
+    /// tails) — same heuristic as schism's `if (CHN_LOOP) v >>= 1`.
+    fn find_evictable_victim(&self) -> Option<usize> {
+        let mut best: Option<(usize, f32)> = None;
+        for (i, slot) in self.slots.iter().enumerate() {
+            let SlotState::Occupied(v) = &slot.state else {
+                continue;
+            };
+            // Skip protected voices: still sustained AND audible.
+            // Sustained-but-near-silent voices are evictable —
+            // their score will be tiny and they're effectively
+            // dead anyway.
+            if v.instr.sustained && v.instr.get_volume() > 1e-3 {
+                continue;
+            }
+            let score = self.eviction_score(v);
+            best = match best {
+                None => Some((i, score)),
+                Some((_, bs)) if score < bs => Some((i, score)),
+                Some(p) => Some(p),
+            };
+        }
+        best.map(|(i, _)| i)
+    }
+
+    /// Eviction-victim picker for `allocate_live`. Falls back to
+    /// stealing a sustained voice when no evictable voice exists —
+    /// the live note must play, even at the cost of cutting an
+    /// audible NNA tail.
+    fn find_eviction_victim(&self) -> Option<usize> {
+        // First try the polite path: an evictable voice.
+        if let Some(slot) = self.find_evictable_victim() {
+            return Some(slot);
+        }
+        // Fallback: every voice is sustained and audible. Pick the
+        // lowest-scoring one anyway — better to lose one NNA tail
+        // than to drop the live note from the pattern.
+        let mut best: Option<(usize, f32)> = None;
+        for (i, slot) in self.slots.iter().enumerate() {
+            let SlotState::Occupied(v) = &slot.state else {
+                continue;
+            };
+            let score = self.eviction_score(v);
+            best = match best {
+                None => Some((i, score)),
+                Some((_, bs)) if score < bs => Some((i, score)),
+                Some(p) => Some(p),
+            };
+        }
+        best.map(|(i, _)| i)
+    }
+
+    /// Score used to rank voices for eviction. Lower = more likely
+    /// victim. Mirrors schism's formula:
+    ///
+    ///   score = volume × fadeout      (when in CHN_NOTEFADE)
+    ///         = volume × LARGE_CONST   (otherwise)
+    ///         /= 2                     (when sample is looping)
+    ///
+    /// `instr.get_volume()` already folds the fadeout into the
+    /// volume product, so for sustained voices we multiply by a
+    /// large protection constant; for non-sustained voices we read
+    /// the raw `get_volume()` (which already includes the running
+    /// fadeout).
+    fn eviction_score(&self, v: &Voice<'a>) -> f32 {
+        let mut score = v.instr.get_volume();
+        if v.instr.sustained {
+            // Protection multiplier — pushes sustained voices well
+            // above any non-sustained voice in the ranking.
+            score *= 1024.0;
+        }
+        if v.instr
+            .state_sample
+            .as_ref()
+            .is_some_and(|s| s.is_looping())
+        {
+            score *= 0.5;
+        }
+        score
+    }
+
+    /// Release the voice held by `id`. No-op (and not an error) when
+    /// `id` is stale — releasing the same handle twice, or a handle
+    /// from another pool, simply does nothing.
+    pub fn release(&mut self, id: VoiceId) {
+        let slot_idx = id.slot();
+        let Some(slot) = self.slots.get_mut(slot_idx) else {
+            return;
+        };
+        if slot.generation != id.generation() {
+            return;
+        }
+        if matches!(slot.state, SlotState::Vacant { .. }) {
+            return;
+        }
+        slot.generation = slot.generation.wrapping_add(1);
+        // generation 0 is reserved (would make the packed VoiceId
+        // potentially zero); skip past it on wrap. With 16-bit
+        // generations this happens after 65535 reuses of a slot —
+        // well beyond any realistic playback session, but we handle
+        // it correctly anyway.
+        if slot.generation == 0 {
+            slot.generation = 1;
+        }
+        slot.state = SlotState::Vacant {
+            next_free: self.free_head,
+        };
+        self.free_head = slot_idx;
+        self.allocated -= 1;
+    }
+
+    /// Resolve a handle to an immutable reference, or `None` if the
+    /// handle is stale.
+    pub fn get(&self, id: VoiceId) -> Option<&Voice<'a>> {
+        let slot = self.slots.get(id.slot())?;
+        if slot.generation != id.generation() {
+            return None;
+        }
+        match &slot.state {
+            SlotState::Occupied(v) => Some(v),
+            SlotState::Vacant { .. } => None,
+        }
+    }
+
+    /// Resolve a handle to a mutable reference, or `None` if the
+    /// handle is stale.
+    pub fn get_mut(&mut self, id: VoiceId) -> Option<&mut Voice<'a>> {
+        let slot = self.slots.get_mut(id.slot())?;
+        if slot.generation != id.generation() {
+            return None;
+        }
+        match &mut slot.state {
+            SlotState::Occupied(v) => Some(v),
+            SlotState::Vacant { .. } => None,
+        }
+    }
+
+    /// Iterate over every live voice and its handle. Test-only —
+    /// production callers walk `Channel::ghosts` directly because
+    /// they need to update the channel-side handle list in the same
+    /// pass.
+    #[cfg(test)]
+    pub fn iter(&self) -> impl Iterator<Item = (VoiceId, &Voice<'a>)> {
+        self.slots.iter().enumerate().filter_map(|(i, slot)| {
+            if let SlotState::Occupied(v) = &slot.state {
+                Some((VoiceId::new(i, slot.generation), v))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Mutable counterpart to `iter`. Test-only.
+    #[cfg(test)]
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (VoiceId, &mut Voice<'a>)> {
+        self.slots.iter_mut().enumerate().filter_map(|(i, slot)| {
+            let gen = slot.generation;
+            if let SlotState::Occupied(v) = &mut slot.state {
+                Some((VoiceId::new(i, gen), v))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Run `f` against every live voice; release voices for which
+    /// `f` returns `false`. Test-only.
+    #[cfg(test)]
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(VoiceId, &mut Voice<'a>) -> bool,
+    {
+        let mut to_drop: Vec<VoiceId> = Vec::new();
+        for (id, voice) in self.iter_mut() {
+            if !f(id, voice) {
+                to_drop.push(id);
+            }
+        }
+        for id in to_drop {
+            self.release(id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state_instr_default::StateInstrDefault;
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+    use xmrs::prelude::*;
+
+    /// Minimal helper to build a fake `Voice`. The internals don't
+    /// matter for pool tests — we only check allocation bookkeeping.
+    fn dummy_voice() -> Voice<'static> {
+        // We need an `&'static InstrDefault` to make the `'static`
+        // lifetime work. A leaked Box gives us that for the duration
+        // of the test process. Acceptable in #[cfg(test)] only.
+        let instr: &'static InstrDefault = Box::leak(Box::new(InstrDefault::default()));
+        let ph = PeriodHelper::new(FrequencyType::LinearFrequencies, false);
+        let state = StateInstrDefault::new(instr, 0, ph, 44100.0);
+        Voice::new_ghost(state, 0, 1.0, 1.0, 0.5, None, None, 0.0)
+    }
+
+    #[test]
+    fn empty_pool_reports_correct_state() {
+        let pool: VoicePool<'_> = VoicePool::new(4);
+        assert_eq!(pool.capacity(), 4);
+        assert_eq!(pool.allocated_count(), 0);
+        assert!(!pool.is_full());
+    }
+
+    #[test]
+    #[should_panic]
+    fn zero_capacity_panics() {
+        let _pool: VoicePool<'_> = VoicePool::new(0);
+    }
+
+    #[test]
+    fn allocate_then_release_returns_to_free_list() {
+        let mut pool = VoicePool::new(2);
+        let id1 = pool.allocate_live(dummy_voice());
+        assert_eq!(pool.allocated_count(), 1);
+        pool.release(id1);
+        assert_eq!(pool.allocated_count(), 0);
+        assert!(!pool.is_full());
+
+        // The freed slot must be reusable. Allocating again should
+        // succeed without touching the second slot.
+        let id2 = pool.allocate_live(dummy_voice());
+        assert_eq!(pool.allocated_count(), 1);
+        // The slot index is the same (LIFO free-list), but the
+        // generation has incremented so the two handles must differ.
+        assert_eq!(id1.slot(), id2.slot());
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn full_pool_evicts_lowest_volume() {
+        // With 1.5's eviction strategy, allocate on a full pool steals
+        // the voice with the lowest audible volume rather than failing.
+        // We build voices with deliberately different `volume` values
+        // so the eviction heuristic has a clear loser.
+        let make_voice = |vol: f32| -> Voice<'static> {
+            let instr: &'static InstrDefault = Box::leak(Box::new(InstrDefault::default()));
+            let ph = PeriodHelper::new(FrequencyType::LinearFrequencies, false);
+            let mut state = StateInstrDefault::new(instr, 0, ph, 44100.0);
+            // `state.volume` is the per-voice scalar that flows into
+            // `get_volume()` and from there into the pool's score.
+            state.volume = vol;
+            Voice::new_ghost(state, 0, 1.0, 1.0, 0.5, None, None, 0.0)
+        };
+
+        let mut pool = VoicePool::new(2);
+        let _loud = pool.allocate_live(make_voice(1.0));
+        let quiet = pool.allocate_live(make_voice(0.05));
+        assert!(pool.is_full());
+
+        // Allocating a third voice on a full pool steals the
+        // quietest occupant. Its handle is now stale.
+        let _new = pool.allocate_live(make_voice(0.5));
+        assert_eq!(pool.allocated_count(), 2);
+        assert!(
+            pool.get(quiet).is_none(),
+            "quietest voice should have been evicted"
+        );
+    }
+
+    #[test]
+    fn stale_handle_after_release_returns_none() {
+        let mut pool = VoicePool::new(2);
+        let id = pool.allocate_live(dummy_voice());
+        pool.release(id);
+        // The handle is stale; reading it must not return the
+        // newly-released slot.
+        assert!(pool.get(id).is_none());
+        assert!(pool.get_mut(id).is_none());
+    }
+
+    #[test]
+    fn stale_handle_after_slot_reuse_returns_none() {
+        let mut pool = VoicePool::new(1);
+        let id1 = pool.allocate_live(dummy_voice());
+        pool.release(id1);
+        let _id2 = pool.allocate_live(dummy_voice());
+        // The original handle now points to a slot occupied by a
+        // different voice. Generation mismatch must reject it.
+        assert!(pool.get(id1).is_none());
+    }
+
+    #[test]
+    fn double_release_is_a_noop() {
+        let mut pool = VoicePool::new(1);
+        let id = pool.allocate_live(dummy_voice());
+        pool.release(id);
+        pool.release(id); // must not corrupt state
+        assert_eq!(pool.allocated_count(), 0);
+        // Free-list must still be sane.
+        let id3 = pool.allocate_live(dummy_voice());
+        assert_eq!(pool.allocated_count(), 1);
+        // generation should have only advanced once (first release),
+        // not twice — the second release was rejected.
+        assert_ne!(id, id3);
+    }
+
+    #[test]
+    fn iter_visits_every_live_voice() {
+        let mut pool = VoicePool::new(4);
+        let id_a = pool.allocate_live(dummy_voice());
+        let id_b = pool.allocate_live(dummy_voice());
+        let _id_c = pool.allocate_live(dummy_voice());
+        pool.release(id_b); // hole in the middle
+
+        let live: Vec<VoiceId> = pool.iter().map(|(id, _)| id).collect();
+        assert_eq!(live.len(), 2);
+        assert!(live.contains(&id_a));
+        assert!(!live.contains(&id_b));
+    }
+
+    #[test]
+    fn retain_drops_voices_when_predicate_returns_false() {
+        let mut pool = VoicePool::new(4);
+        let _id1 = pool.allocate_live(dummy_voice());
+        let _id2 = pool.allocate_live(dummy_voice());
+        let _id3 = pool.allocate_live(dummy_voice());
+        assert_eq!(pool.allocated_count(), 3);
+
+        // Drop the first one we see. With three voices alive that
+        // means we should end up with two.
+        let mut dropped = false;
+        pool.retain(|_id, _voice| {
+            if !dropped {
+                dropped = true;
+                false
+            } else {
+                true
+            }
+        });
+        assert_eq!(pool.allocated_count(), 2);
+    }
+
+    #[test]
+    fn voice_id_packing_round_trips() {
+        // Cover a range of (slot, generation) pairs to guard against
+        // bit-twiddle errors in `VoiceId::new`/`slot`/`generation`.
+        for slot in [0usize, 1, 5, 100, 0xFFFE] {
+            for generation in [1u32, 2, 100, 0xFFFE, 0xFFFF] {
+                let id = VoiceId::new(slot, generation);
+                assert_eq!(id.slot(), slot);
+                assert_eq!(id.generation(), generation);
+            }
+        }
+    }
+
+    /// Helper: a voice that's still sustained (audible NNA tail).
+    fn sustained_voice(vol: f32) -> Voice<'static> {
+        let instr: &'static InstrDefault = Box::leak(Box::new(InstrDefault::default()));
+        let ph = PeriodHelper::new(FrequencyType::LinearFrequencies, false);
+        let mut state = StateInstrDefault::new(instr, 0, ph, 44100.0);
+        state.volume = vol;
+        // sustained=true is the default. Don't call key_off.
+        Voice::new_ghost(state, 0, 1.0, 1.0, 0.5, None, None, 0.0)
+    }
+
+    /// Helper: a voice that's already in fadeout (evictable).
+    fn fading_voice(vol: f32) -> Voice<'static> {
+        let mut v = sustained_voice(vol);
+        v.instr.sustained = false;
+        v
+    }
+
+    #[test]
+    fn allocate_ghost_refuses_when_all_voices_sustained() {
+        // Schism's `csf_get_nna_channel` returns 0 (= refused) when
+        // every existing voice is in `!CHN_NOTEFADE` state. Mirror
+        // that: a ghost allocation on a pool full of sustained
+        // voices must return None instead of stealing.
+        let mut pool = VoicePool::new(2);
+        let _a = pool.allocate_live(sustained_voice(1.0));
+        let _b = pool.allocate_live(sustained_voice(1.0));
+        assert!(pool.is_full());
+        let result = pool.allocate_ghost(sustained_voice(1.0));
+        assert!(result.is_none(), "ghost allocation must be refused");
+        // Pool unchanged.
+        assert_eq!(pool.allocated_count(), 2);
+    }
+
+    #[test]
+    fn allocate_ghost_evicts_when_a_fading_voice_exists() {
+        // Mixed pool: one sustained, one fading. The fading one is
+        // the only evictable victim; ghost allocation should pick it.
+        let mut pool = VoicePool::new(2);
+        let sustained = pool.allocate_live(sustained_voice(1.0));
+        let fading = pool.allocate_live(fading_voice(0.5));
+        let new_id = pool
+            .allocate_ghost(sustained_voice(1.0))
+            .expect("an evictable voice was available");
+        // The fading voice was the victim; its handle is stale,
+        // the sustained voice survives.
+        assert!(pool.get(fading).is_none(), "fading voice should be evicted");
+        assert!(
+            pool.get(sustained).is_some(),
+            "sustained voice must survive"
+        );
+        assert!(pool.get(new_id).is_some(), "new ghost must be installed");
+    }
+
+    #[test]
+    fn allocate_live_evicts_even_sustained_voices() {
+        // Live allocation must always succeed: the user typed the
+        // note, the player has to play it. Pool of two sustained
+        // voices, allocate_live evicts one of them anyway.
+        let mut pool = VoicePool::new(2);
+        let a = pool.allocate_live(sustained_voice(0.5));
+        let b = pool.allocate_live(sustained_voice(1.0));
+        assert!(pool.is_full());
+        let new_id = pool.allocate_live(sustained_voice(1.0));
+        // The lower-volume sustained voice (`a`) is evicted; the
+        // louder one (`b`) survives.
+        assert!(pool.get(a).is_none(), "lower-vol sustained voice evicted");
+        assert!(pool.get(b).is_some(), "louder sustained voice survives");
+        assert!(pool.get(new_id).is_some(), "new live voice installed");
+        assert_eq!(pool.allocated_count(), 2);
+    }
+}

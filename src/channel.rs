@@ -16,7 +16,8 @@ use crate::triggerkeep::*;
 use crate::helper::*;
 use crate::midi_observer::MidiEvent;
 use crate::state_instr_default::StateInstrDefault;
-use crate::voice::{Voice, MAX_GHOST_VOICES_PER_CHANNEL};
+use crate::voice::Voice;
+use crate::voice_pool::{VoiceId, VoicePool};
 use xmrs::prelude::*;
 
 /// Simplified DCT tag, extracted once from the nested
@@ -28,20 +29,6 @@ enum Dct {
     Note,
     Sample,
     Instrument,
-}
-
-/// The note identity for a live voice, for DCT::Note matching. The
-/// live voice doesn't carry an `Option<Pitch>` field of its own
-/// (that's only materialised onto ghosts at fork time), so we read
-/// the channel's tracked `current_note`. Separate free function to
-/// side-step a borrow-conflict with the caller's `&mut self` in
-/// `apply_dct` (the live-match check there holds an `&self.instr`
-/// borrow simultaneously).
-fn live_voice_identity_note(
-    _live: &StateInstrDefault<'_>,
-    current_note: Option<Pitch>,
-) -> Option<Pitch> {
-    current_note
 }
 
 #[derive(Clone, PartialEq, Default)]
@@ -87,7 +74,11 @@ pub struct Channel<'a> {
     panning: f32, /* Between 0 (left) and 1 (right); 0.5 is centered */
 
     // Instrument
-    instr: Option<StateInstrDefault<'a>>,
+    /// 1.4 — live voice in the shared pool.
+    live: Option<VoiceId>,
+    /// Cached midi_mute_computer; refreshed at trigger to keep
+    /// `is_muted` pool-free.
+    instr_midi_mute: bool,
 
     effect_arpeggio: EffectArpeggio,
     effect_note_retrig_backup: NoteRetrigState,
@@ -121,6 +112,17 @@ pub struct Channel<'a> {
     effect_semitone: bool,
     effect_note_delay: usize,
 
+    /// Index of this channel inside the `Voices` list. Set once at
+    /// construction time (via [`Self::set_track_index`], called by
+    /// `Voices::new`) and never modified afterwards. Used today to
+    /// tag voices spawned by NNA with their originating track for
+    /// the upcoming voice-pool migration (1.3) — see
+    /// [`Voice::master_track`]. Ghosts spawned before
+    /// `set_track_index` runs would carry index 0, which is correct
+    /// for channel 0 and benign for the others (the field is purely
+    /// informational at this stage).
+    track_index: usize,
+
     pub muted: bool,
 
     actual_volume: [f32; 2],
@@ -130,11 +132,20 @@ pub struct Channel<'a> {
     // Ghost voices: notes that were playing when a new note fired on
     // the same pattern channel and whose instrument's `NewNoteAction`
     // was not `Cut`. They continue to sound (via their own envelope +
-    // fadeout) alongside the live note until they go silent. The
-    // `Vec` is capped by `MAX_GHOST_VOICES_PER_CHANNEL`; when full, the
-    // oldest ghost (index 0) is evicted. No-op on MOD/XM/S3M because
-    // those importers leave NNA at its `NoteCut` default.
-    ghosts: Vec<Voice<'a>>,
+    // fadeout) alongside the live note until they go silent.
+    //
+    // Voices themselves live in the `VoicePool` carried by the
+    // owning `Voices`; this list holds opaque `VoiceId` handles into
+    // that pool. The pool indirection (1.3) is the prerequisite for
+    // step 1.5's voice-stealing — at that point the pool will reject
+    // an allocation only after rejecting it against every voice in
+    // every channel, lifting today's per-channel `MAX_GHOST_VOICES_
+    // PER_CHANNEL` cap. Today the per-channel cap still bites first.
+    //
+    // No-op on MOD/XM/S3M because those importers leave NNA at its
+    // `NoteCut` default — `spawn_ghost_*` short-circuits and this
+    // list stays empty.
+    ghosts: Vec<VoiceId>,
     /// S7x (S73–S76) lets the *pattern* override an instrument's
     /// stored NNA for the current channel, affecting only subsequent
     /// triggers on this channel. `None` = use the incoming
@@ -176,7 +187,8 @@ impl<'a> Channel<'a> {
             surround: false,
             current: TrackUnit::default(),
             period: 0.0,
-            instr: None,
+            live: None,
+            instr_midi_mute: false,
             effect_arpeggio: EffectArpeggio::new(module.quirks.ft2_arpeggio_lut, tempo),
             effect_note_retrig_backup: NoteRetrigState::default(),
             effect_note_retrig_counter: 0,
@@ -202,6 +214,7 @@ impl<'a> Channel<'a> {
             effect_semitone: false,
             effect_note_delay: 0,
             muted: false,
+            track_index: 0,
             actual_volume: [0.0, 0.0],
             ghosts: Vec::new(),
             nna_override: None,
@@ -230,6 +243,58 @@ impl<'a> Channel<'a> {
         self.rng = xmrs::xorshift::XorShift32::new(Some(seed));
     }
 
+    /// Record this channel's index inside the `Voices` list. Called
+    /// by `Voices::new` immediately after construction. The index
+    /// flows into voices spawned by NNA so the eventual voice pool
+    /// (step 1.3 of the roadmap) can route past-note effects and
+    /// DCT lookups via a single shared list.
+    pub(crate) fn set_track_index(&mut self, idx: usize) {
+        self.track_index = idx;
+    }
+
+    // --- Live-voice accessors (1.4) -------------------------------
+    fn live<'p>(&self, pool: &'p VoicePool<'a>) -> Option<&'p StateInstrDefault<'a>> {
+        self.live.and_then(|id| pool.get(id)).map(|v| &v.instr)
+    }
+    fn live_mut<'p>(&self, pool: &'p mut VoicePool<'a>) -> Option<&'p mut StateInstrDefault<'a>> {
+        self.live
+            .and_then(|id| pool.get_mut(id))
+            .map(|v| &mut v.instr)
+    }
+    fn drop_live(&mut self, pool: &mut VoicePool<'a>) {
+        if let Some(id) = self.live.take() {
+            pool.release(id);
+        }
+    }
+    /// Move the live voice into the channel's ghost list without
+    /// reallocating in the pool — the slot just changes role from
+    /// "live" to "detached". Returns the moved `VoiceId` so the
+    /// caller can apply NNA. The ghost list grows unboundedly per
+    /// channel (1.5+); the shared pool's capacity is the only cap.
+    fn promote_live_to_ghost(&mut self, _pool: &mut VoicePool<'a>) -> Option<VoiceId> {
+        let id = self.live.take()?;
+        self.ghosts.push(id);
+        Some(id)
+    }
+    /// Allocate a fresh live voice in the pool. Releases any
+    /// previously-held live id (the caller should already have
+    /// promoted it to a ghost if NNA != Cut). Caches the
+    /// instrument's midi_mute_computer so `is_muted` stays
+    /// pool-free.
+    fn install_live(
+        &mut self,
+        pool: &mut VoicePool<'a>,
+        state: StateInstrDefault<'a>,
+        midi_mute: bool,
+    ) {
+        if let Some(old) = self.live.take() {
+            pool.release(old);
+        }
+        let voice = Voice::new_live(state, self.track_index);
+        self.live = Some(pool.allocate_live(voice));
+        self.instr_midi_mute = midi_mute;
+    }
+
     /// Forward a tempo change to the arpeggio effect. Called by the
     /// player on every step so the FT2 arpeggio LUT is indexed from
     /// the current speed rather than a stale copy.
@@ -238,12 +303,7 @@ impl<'a> Channel<'a> {
     }
 
     pub fn is_muted(&self) -> bool {
-        let midi_mute = if let Some(i) = &self.instr {
-            i.midi_mute_computer
-        } else {
-            false
-        };
-        self.muted || midi_mute
+        self.muted || self.instr_midi_mute
     }
 
     fn cut_pitch(&mut self) {
@@ -275,8 +335,8 @@ impl<'a> Channel<'a> {
     /// paths) don't need to case-split. FT2 itself also ignores which
     /// tick the key-off lands on — the branch on envelope is the only
     /// real decision.
-    fn key_off(&mut self, _tick: usize) {
-        let Some(i) = &mut self.instr else {
+    fn key_off(&mut self, _tick: usize, pool: &mut VoicePool<'a>) {
+        let Some(i) = self.live_mut(pool) else {
             self.cut_pitch();
             return;
         };
@@ -313,8 +373,8 @@ impl<'a> Channel<'a> {
     /// a finer-grained API to fix. Acceptable rendering compromise
     /// — IT NOTE_FADE is used overwhelmingly to fade out tails on
     /// instruments without dedicated release shapes.
-    fn note_fade(&mut self) {
-        let Some(i) = &mut self.instr else {
+    fn note_fade(&mut self, pool: &mut VoicePool<'a>) {
+        let Some(i) = self.live_mut(pool) else {
             self.cut_pitch();
             return;
         };
@@ -324,8 +384,10 @@ impl<'a> Channel<'a> {
     /// Drop every ghost voice on this channel. Used by the facade
     /// when the song is seeked (goto) — stale ghosts from the
     /// previous playback position must not bleed into the new one.
-    pub(crate) fn clear_ghosts(&mut self) {
-        self.ghosts.clear();
+    pub(crate) fn clear_ghosts(&mut self, pool: &mut VoicePool<'a>) {
+        for id in self.ghosts.drain(..) {
+            pool.release(id);
+        }
         self.nna_override = None;
     }
 
@@ -356,6 +418,7 @@ impl<'a> Channel<'a> {
         macro_type: MidiMacroType,
         ch_index: usize,
         out_events: &mut alloc::vec::Vec<(usize, MidiEvent)>,
+        pool: &mut VoicePool<'a>,
     ) {
         match macro_type {
             MidiMacroType::SelectParametric(idx) => {
@@ -371,7 +434,7 @@ impl<'a> Channel<'a> {
                 let Some(bytes) = macros.parametric.get(self.midi_parametric_selector) else {
                     return;
                 };
-                self.interpret_macro_bytes(bytes.clone(), z, ch_index, out_events);
+                self.interpret_macro_bytes(bytes.clone(), z, ch_index, out_events, pool);
             }
             MidiMacroType::Fixed { idx, z } => {
                 let Some(macros) = &self.module.midi_macros else {
@@ -380,7 +443,7 @@ impl<'a> Channel<'a> {
                 let Some(bytes) = macros.fixed.get(idx) else {
                     return;
                 };
-                self.interpret_macro_bytes(bytes.clone(), z, ch_index, out_events);
+                self.interpret_macro_bytes(bytes.clone(), z, ch_index, out_events, pool);
             }
         }
     }
@@ -396,6 +459,7 @@ impl<'a> Channel<'a> {
         z_value: u8,
         ch_index: usize,
         out_events: &mut alloc::vec::Vec<(usize, MidiEvent)>,
+        pool: &mut VoicePool<'a>,
     ) {
         // In-place `z` substitution — the macro byte 0x7A is the
         // ASCII letter `z`, which Schism Tracker / OpenMPT / IT use
@@ -421,12 +485,12 @@ impl<'a> Channel<'a> {
                     let val = bytes[i + 3];
                     match sub {
                         0x00 => {
-                            if let Some(instr) = &mut self.instr {
+                            if let Some(instr) = self.live_mut(pool) {
                                 instr.filter.set_cutoff_reg(val);
                             }
                         }
                         0x01 => {
-                            if let Some(instr) = &mut self.instr {
+                            if let Some(instr) = self.live_mut(pool) {
                                 instr.filter.set_resonance_reg(val);
                             }
                         }
@@ -434,7 +498,7 @@ impl<'a> Channel<'a> {
                             // Filter mode: bit 4 = HPF, bit 5 =
                             // disable. Implementation details in
                             // `StateFilter::set_mode_from_macro`.
-                            if let Some(instr) = &mut self.instr {
+                            if let Some(instr) = self.live_mut(pool) {
                                 instr.filter.set_mode_from_macro(val);
                             }
                         }
@@ -600,11 +664,11 @@ impl<'a> Channel<'a> {
     /// reads the old voice's NNA when deciding what happens to it).
     /// Returns `NoteCut` if no voice is currently held (nothing to
     /// ghost).
-    fn effective_nna(&self) -> NewNoteAction {
+    fn effective_nna(&self, pool: &VoicePool<'a>) -> NewNoteAction {
         if let Some(nna) = self.nna_override {
             return nna;
         }
-        let Some(instr) = &self.instr else {
+        let Some(instr) = self.live(pool) else {
             return NewNoteAction::NoteCut;
         };
         match &instr.duplicate_check {
@@ -626,33 +690,36 @@ impl<'a> Channel<'a> {
     /// The fork snapshots the channel-level gain / pan at the
     /// moment of displacement so subsequent tremolo / slides on the
     /// live channel don't perturb the ghost.
-    fn spawn_ghost_for_outgoing(&mut self) {
-        let nna = self.effective_nna();
+    fn spawn_ghost_for_outgoing(&mut self, pool: &mut VoicePool<'a>) {
+        let nna = self.effective_nna(pool);
         if matches!(nna, NewNoteAction::NoteCut) {
             // Legacy / XM / MOD / S3M path: the fresh note cuts the
             // old one (today's behaviour). No ghost.
             return;
         }
-        let Some(old) = self.instr.take() else {
+        // Live-voice → ghost promotion. The voice itself stays in
+        // its pool slot; only the channel-side bookkeeping changes
+        // (live → ghosts list). Before parking, snapshot the
+        // channel's current gain / pan / note / period into the
+        // voice's frozen-* fields, since the channel won't update
+        // them after detachment.
+        let Some(id) = self.promote_live_to_ghost(pool) else {
             return;
         };
-        let sample_num = old.current_sample_num;
-        let mut ghost = Voice::fork(
-            old,
-            self.volume,
-            self.channel_volume,
-            self.panning,
-            self.current_note,
-            sample_num,
-            self.period,
-        );
-        match nna {
-            NewNoteAction::Continue => ghost.apply_nna_continue(),
-            NewNoteAction::NoteOff => ghost.apply_nna_note_off(),
-            NewNoteAction::NoteFadeOut => ghost.apply_nna_note_fade_out(),
-            NewNoteAction::NoteCut => unreachable!(), // handled above
+        if let Some(ghost) = pool.get_mut(id) {
+            ghost.vol_frozen = self.volume;
+            ghost.channel_volume_frozen = self.channel_volume;
+            ghost.panning_frozen = self.panning;
+            ghost.note = self.current_note;
+            ghost.sample_num = ghost.instr.current_sample_num;
+            ghost.period_at_fork = self.period;
+            match nna {
+                NewNoteAction::Continue => ghost.apply_nna_continue(),
+                NewNoteAction::NoteOff => ghost.apply_nna_note_off(),
+                NewNoteAction::NoteFadeOut => ghost.apply_nna_note_fade_out(),
+                NewNoteAction::NoteCut => unreachable!(), // handled above
+            }
         }
-        self.push_ghost(ghost);
     }
 
     /// Ghost-note variant: clone the live voice into a ghost
@@ -664,18 +731,24 @@ impl<'a> Channel<'a> {
     /// Called from `tick0_load_pitch` on the note-only path.
     /// Default NNA = Cut → no-op (matches XM/MOD/S3M ghost-note
     /// semantics: retrigger cuts the old sound).
-    fn spawn_ghost_clone(&mut self) {
-        let nna = self.effective_nna();
+    fn spawn_ghost_clone(&mut self, pool: &mut VoicePool<'a>) {
+        let nna = self.effective_nna(pool);
         if matches!(nna, NewNoteAction::NoteCut) {
             return;
         }
-        let Some(live) = &self.instr else {
-            return;
+        // Read the live state via the pool, clone it, drop the
+        // borrow, then allocate a fresh ghost holding the clone.
+        // Two-step pattern because `pool.allocate` re-borrows the
+        // pool mutably and would conflict with the `pool.get`.
+        let (cloned, sample_num) = {
+            let Some(live) = self.live(pool) else {
+                return;
+            };
+            (live.clone(), live.current_sample_num)
         };
-        let sample_num = live.current_sample_num;
-        let cloned = live.clone();
-        let mut ghost = Voice::fork(
+        let mut ghost = Voice::new_ghost(
             cloned,
+            self.track_index,
             self.volume,
             self.channel_volume,
             self.panning,
@@ -689,48 +762,70 @@ impl<'a> Channel<'a> {
             NewNoteAction::NoteFadeOut => ghost.apply_nna_note_fade_out(),
             NewNoteAction::NoteCut => unreachable!(),
         }
-        self.push_ghost(ghost);
+        self.push_ghost(pool, ghost);
     }
 
-    /// Add a voice to the ghost list, evicting the oldest if the
-    /// cap is reached. IT's pool uses a lowest-volume heuristic —
-    /// here we pick the simplest bounded approximation (oldest = FIFO)
-    /// since per-channel lists are small.
-    fn push_ghost(&mut self, v: Voice<'a>) {
-        if self.ghosts.len() >= MAX_GHOST_VOICES_PER_CHANNEL {
-            self.ghosts.remove(0);
+    /// Add a voice to the channel's ghost list. Goes through the
+    /// pool's `allocate_ghost` which can refuse the allocation when
+    /// every existing voice is sustained-and-audible — in that
+    /// case we drop the new ghost on the floor (it would just have
+    /// been unaudible noise added to an already-saturated mix), and
+    /// the channel keeps playing whatever live note triggered the
+    /// NNA. Mirrors schism's `csf_get_nna_channel` returning 0:
+    /// the NNA spawn is silently abandoned.
+    fn push_ghost(&mut self, pool: &mut VoicePool<'a>, v: Voice<'a>) {
+        if let Some(id) = pool.allocate_ghost(v) {
+            self.ghosts.push(id);
         }
-        self.ghosts.push(v);
     }
 
     /// Advance every ghost's envelopes / fadeout by one tick, and
-    /// drop any that have decayed to silence. The resulting
-    /// capacity is naturally bounded — ghosts that have run out of
-    /// sample data or whose envelope * fadeout reached zero are
-    /// reaped here, freeing their slot for future forks.
-    fn tick_ghosts(&mut self) {
-        for g in &mut self.ghosts {
-            g.tick();
+    /// drop any that have decayed to silence. Voices that go silent
+    /// are released back to the pool here, freeing their slot for
+    /// future forks.
+    fn tick_ghosts(&mut self, pool: &mut VoicePool<'a>) {
+        // First pass: tick every live handle. Stale handles (from
+        // double-release races, which 1.3 shouldn't produce but the
+        // pool tolerates) are silently skipped via `get_mut`.
+        for id in &self.ghosts {
+            if let Some(v) = pool.get_mut(*id) {
+                v.tick();
+            }
         }
-        self.ghosts.retain(|g| g.is_alive());
+        // Second pass: drop dead voices from the channel's list and
+        // release them in the pool. Done as a `retain` over the
+        // local list so the order of survivors is preserved.
+        self.ghosts.retain(|id| {
+            let alive = pool.get(*id).map_or(false, |v| v.is_alive());
+            if !alive {
+                pool.release(*id);
+            }
+            alive
+        });
     }
 
     /// S70 / S71 / S72: apply a past-note effect to every ghost on
     /// this channel. The live note is unaffected (S7x targets only
     /// detached voices, per ITTECH).
-    fn past_note_cut_all(&mut self) {
-        for g in &mut self.ghosts {
-            g.past_cut();
+    fn past_note_cut_all(&mut self, pool: &mut VoicePool<'a>) {
+        for id in &self.ghosts {
+            if let Some(v) = pool.get_mut(*id) {
+                v.past_cut();
+            }
         }
     }
-    fn past_note_off_all(&mut self) {
-        for g in &mut self.ghosts {
-            g.past_off();
+    fn past_note_off_all(&mut self, pool: &mut VoicePool<'a>) {
+        for id in &self.ghosts {
+            if let Some(v) = pool.get_mut(*id) {
+                v.past_off();
+            }
         }
     }
-    fn past_note_fade_all(&mut self) {
-        for g in &mut self.ghosts {
-            g.past_fade_out();
+    fn past_note_fade_all(&mut self, pool: &mut VoicePool<'a>) {
+        for id in &self.ghosts {
+            if let Some(v) = pool.get_mut(*id) {
+                v.past_fade_out();
+            }
         }
     }
 
@@ -746,6 +841,7 @@ impl<'a> Channel<'a> {
     /// processed; it is what DCT tests existing voices against.
     fn apply_dct(
         &mut self,
+        pool: &mut VoicePool<'a>,
         new_instrument_index: usize,
         new_note: Option<Pitch>,
         new_sample_index: Option<usize>,
@@ -769,11 +865,28 @@ impl<'a> Channel<'a> {
         // Applying DCA to the live voice is equivalent to the usual
         // note-cut / key-off / fade semantics — just triggered by
         // DCT match rather than by effect column.
-        let live_matches = self.instr.as_ref().is_some_and(|live| match dct {
-            Dct::Note => match (live_voice_identity_note(live, self.current_note), new_note) {
-                (Some(a), Some(b)) => a == b,
-                _ => false,
-            },
+        let live_matches = self.live(pool).is_some_and(|live| match dct {
+            // DCT::Note matches when BOTH the note identity and the
+            // instrument match. Schism (`effects.c:1729`) writes:
+            //   apply_dna = (NOTE_IS_NOTE(note)
+            //                && (int) p->note == note
+            //                && ptr_instrument == p->ptr_instrument);
+            // — the instrument check is essential, otherwise two
+            // unrelated instruments that happened to play the same
+            // note would clobber each other's voices on every
+            // retrigger. Pre-1.5 xmrs missed the instrument check
+            // entirely and was over-aggressive on this DCT axis.
+            //
+            // The note compared is the *input* note (pattern column),
+            // not a remapped output — drum kits compare on input,
+            // see bug 6 fix.
+            Dct::Note => {
+                live.num == new_instrument_index
+                    && match (self.current_note, new_note) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => false,
+                    }
+            }
             Dct::Sample => {
                 live.num == new_instrument_index
                     && live.current_sample_num == new_sample_index
@@ -785,12 +898,12 @@ impl<'a> Channel<'a> {
             match &dca {
                 DuplicateCheckAction::NoteCut(_) => self.cut_pitch(),
                 DuplicateCheckAction::NoteOff(_) => {
-                    if let Some(i) = &mut self.instr {
+                    if let Some(i) = self.live_mut(pool) {
                         i.key_off();
                     }
                 }
                 DuplicateCheckAction::NoteFadeOut(_) => {
-                    if let Some(i) = &mut self.instr {
+                    if let Some(i) = self.live_mut(pool) {
                         i.key_off();
                     }
                 }
@@ -798,12 +911,20 @@ impl<'a> Channel<'a> {
         }
 
         // --- Ghost voices. ---
-        for ghost in &mut self.ghosts {
+        for id in &self.ghosts {
+            let Some(ghost) = pool.get_mut(*id) else {
+                continue;
+            };
             let matches = match dct {
-                Dct::Note => match (ghost.note, new_note) {
-                    (Some(a), Some(b)) => a == b,
-                    _ => false,
-                },
+                Dct::Note => {
+                    // Same instrument-AND-note rule as for the live
+                    // voice. See the comment on the live arm above.
+                    ghost.instr.num == new_instrument_index
+                        && match (ghost.note, new_note) {
+                            (Some(a), Some(b)) => a == b,
+                            _ => false,
+                        }
+                }
                 Dct::Sample => {
                     ghost.instr.num == new_instrument_index
                         && ghost.sample_num == new_sample_index
@@ -821,7 +942,7 @@ impl<'a> Channel<'a> {
         }
     }
 
-    pub(crate) fn trigger_pitch(&mut self, flags: TriggerKeep) {
+    pub(crate) fn trigger_pitch(&mut self, flags: TriggerKeep, pool: &mut VoicePool<'a>) {
         // A new note always starts un-muted: in both FT2 (resets
         // `realVol` from the instrument) and ST3 (`avol = aorgvol`
         // on trigger), any tremor mute from previous rows is
@@ -835,7 +956,7 @@ impl<'a> Channel<'a> {
         // immediate volume gate (`effect_tremor`) is cleared.
         self.effect_tremor = false;
 
-        if let Some(instr) = &mut self.instr {
+        if let Some(instr) = self.live_mut(pool) {
             if !contains(flags, TRIGGER_KEEP_SAMPLE_POSITION) {
                 instr.sample_reset();
             }
@@ -923,7 +1044,7 @@ impl<'a> Channel<'a> {
         // re-roll). Non-IT formats have both variations at zero, so
         // this path is a measured no-op there.
         if !contains(flags, TRIGGER_KEEP_VOLUME) {
-            let (rvv, rpv) = match &self.instr {
+            let (rvv, rpv) = match self.live(pool) {
                 Some(instr) => (
                     instr.random_volume_variation(),
                     instr.random_pan_variation(),
@@ -941,8 +1062,8 @@ impl<'a> Channel<'a> {
         }
     }
 
-    fn tickn_update_instr(&mut self) {
-        if let Some(instr) = &mut self.instr {
+    fn tickn_update_instr(&mut self, pool: &mut VoicePool<'a>) {
+        if let Some(instr) = self.live_mut(pool) {
             // Panning
             let space_from_center = (0.5 - (self.panning - 0.5).abs()) * 2.0;
             let instr_env_pan_val = instr.envelope_panning.value - 0.5;
@@ -984,22 +1105,22 @@ impl<'a> Channel<'a> {
         }
     }
 
-    pub(crate) fn tick(&mut self, current_tick: usize) {
-        if let Some(instr) = &mut self.instr {
+    pub(crate) fn tick(&mut self, current_tick: usize, pool: &mut VoicePool<'a>) {
+        if let Some(instr) = self.live_mut(pool) {
             instr.tick();
-            self.tickn_effects(current_tick);
-            self.tickn_update_instr();
+            self.tickn_effects(current_tick, pool);
+            self.tickn_update_instr(pool);
         } else if self.current.has_delay() {
-            self.tickn_effects(current_tick);
-            self.tickn_update_instr();
+            self.tickn_effects(current_tick, pool);
+            self.tickn_update_instr(pool);
         }
         // Advance ghost voices even if the live instrument is gone —
         // ghosts have independent envelope state and must keep
         // decaying regardless of what the pattern is doing.
-        self.tick_ghosts();
+        self.tick_ghosts(pool);
     }
 
-    fn tickn_effects(&mut self, current_tick: usize) {
+    fn tickn_effects(&mut self, current_tick: usize, pool: &mut VoicePool<'a>) {
         if current_tick == 0 {
             // At every row-load tick, FT2 clears the tremor mute flag:
             // its Tremor effect never runs at tickZero (only in the
@@ -1054,7 +1175,7 @@ impl<'a> Channel<'a> {
                 }
                 TrackEffect::InstrumentFineTune(finetune) => {
                     if current_tick == 0 && self.current.note.is_valid() {
-                        if let Some(instr) = &mut self.instr {
+                        if let Some(instr) = self.live_mut(pool) {
                             instr.set_finetune(finetune);
                             // Recomputing the playback frequency
                             // after a finetune change must use the
@@ -1081,14 +1202,14 @@ impl<'a> Channel<'a> {
                 }
                 TrackEffect::InstrumentPanningEnvelopePosition(position) => {
                     if current_tick == 0 {
-                        if let Some(instr) = &mut self.instr {
+                        if let Some(instr) = self.live_mut(pool) {
                             instr.envelope_panning.counter = position;
                         }
                     }
                 }
                 TrackEffect::InstrumentPanningEnvelope(pe) => {
                     if current_tick == 0 {
-                        if let Some(instr) = &mut self.instr {
+                        if let Some(instr) = self.live_mut(pool) {
                             instr.envelope_panning.enabled = pe;
                         }
                     }
@@ -1100,14 +1221,14 @@ impl<'a> Channel<'a> {
                     // toggles above. Takes effect on the next tick
                     // via `StateInstrDefault::envelopes()`.
                     if current_tick == 0 {
-                        if let Some(instr) = &mut self.instr {
+                        if let Some(instr) = self.live_mut(pool) {
                             instr.envelope_pitch.enabled = pe;
                         }
                     }
                 }
                 TrackEffect::InstrumentSampleOffset(seek) => {
                     if current_tick == 0 && self.current.note.is_valid() {
-                        if let Some(instr) = &mut self.instr {
+                        if let Some(instr) = self.live_mut(pool) {
                             if let Some(sample) = &mut instr.state_sample {
                                 let sample_len = sample.sample_len();
                                 if seek >= sample_len {
@@ -1152,14 +1273,14 @@ impl<'a> Channel<'a> {
                 }
                 TrackEffect::InstrumentVolumeEnvelopePosition(position) => {
                     if current_tick == 0 {
-                        if let Some(instr) = &mut self.instr {
+                        if let Some(instr) = self.live_mut(pool) {
                             instr.envelope_volume.counter = position;
                         }
                     }
                 }
                 TrackEffect::InstrumentVolumeEnvelope(pe) => {
                     if current_tick == 0 {
-                        if let Some(instr) = &mut self.instr {
+                        if let Some(instr) = self.live_mut(pool) {
                             instr.envelope_volume.enabled = pe;
                         }
                     }
@@ -1171,7 +1292,7 @@ impl<'a> Channel<'a> {
                             // channel. Live voice is untouched per
                             // ITTECH (S7x targets only detached
                             // notes).
-                            self.past_note_cut_all();
+                            self.past_note_cut_all(pool);
                         } else {
                             self.cut_pitch();
                         }
@@ -1184,26 +1305,30 @@ impl<'a> Channel<'a> {
                                 TRIGGER_KEEP_SAMPLE_POSITION
                                     | TRIGGER_KEEP_VOLUME
                                     | TRIGGER_KEEP_PERIOD,
+                                pool,
                             );
                         } else if self.current.note.is_keyoff() {
                             if self.current.instrument.is_none() {
-                                self.key_off(0);
+                                self.key_off(0, pool);
                             } else {
-                                self.trigger_pitch(TRIGGER_KEEP_PERIOD | TRIGGER_KEEP_ENVELOPE);
+                                self.trigger_pitch(
+                                    TRIGGER_KEEP_PERIOD | TRIGGER_KEEP_ENVELOPE,
+                                    pool,
+                                );
                             }
                         }
                     } else if current_tick == delay {
-                        self.tick0_load_instrument_and_pitch();
-                        self.tickn_effects(0);
+                        self.tick0_load_instrument_and_pitch(pool);
+                        self.tickn_effects(0, pool);
 
                         /* Special KeyOff cases */
                         if self.current.note.is_keyoff() {
                             if self.current.instrument.is_none() {
-                                if let Some(i) = &mut self.instr {
+                                if let Some(i) = self.live_mut(pool) {
                                     i.volume_reset();
                                 }
                             } else {
-                                self.trigger_pitch(TRIGGER_KEEP_NONE);
+                                self.trigger_pitch(TRIGGER_KEEP_NONE, pool);
                             }
                         }
                     }
@@ -1212,8 +1337,8 @@ impl<'a> Channel<'a> {
                     if current_tick == t {
                         if past {
                             // S72: fade all ghost voices.
-                            self.past_note_fade_all();
-                        } else if let Some(i) = &mut self.instr {
+                            self.past_note_fade_all(pool);
+                        } else if let Some(i) = self.live_mut(pool) {
                             // Unsustain the live voice so its
                             // `volume_fadeout` starts ticking down.
                             // `key_off` is the existing entry point
@@ -1226,9 +1351,9 @@ impl<'a> Channel<'a> {
                     if current_tick == t {
                         if past {
                             // S71: key-off all ghost voices.
-                            self.past_note_off_all();
+                            self.past_note_off_all(pool);
                         } else {
-                            self.key_off(t);
+                            self.key_off(t, pool);
                         }
                     }
                 }
@@ -1270,7 +1395,7 @@ impl<'a> Channel<'a> {
 
                     // If speed (s) is 0, retrig is effectively disabled.
                     if s != 0 && self.effect_note_retrig_counter.is_multiple_of(s) {
-                        self.trigger_pitch(TRIGGER_KEEP_VOLUME | TRIGGER_KEEP_ENVELOPE);
+                        self.trigger_pitch(TRIGGER_KEEP_VOLUME | TRIGGER_KEEP_ENVELOPE, pool);
                         match m {
                             NoteRetrigOperator::None => {
                                 // No volume modification, just retrigger.
@@ -1578,16 +1703,16 @@ impl<'a> Channel<'a> {
     }
 
     /// Change instr and return true if it was the same
-    fn tick0_change_instr(&mut self, sample_only: bool) -> bool {
+    fn tick0_change_instr(&mut self, sample_only: bool, pool: &mut VoicePool<'a>) -> bool {
         let instrnr = self.current.instrument.unwrap();
 
         if let InstrumentType::Default(id) = &self.module.instrument[instrnr].instr_type {
-            let was_same = self.instr.as_ref().is_some_and(|i| i.num == instrnr);
+            let was_same = self.live(pool).is_some_and(|i| i.num == instrnr);
 
             // Only proceed if the instrument has samples
             if !id.sample.is_empty() {
                 if sample_only {
-                    if let Some(i) = &mut self.instr {
+                    if let Some(i) = self.live_mut(pool) {
                         i.replace_instr(id);
                     }
                 } else {
@@ -1608,20 +1733,17 @@ impl<'a> Channel<'a> {
                     let new_sample_index = new_note
                         .and_then(|n| id.sample_for_pitch.get(n.value() as usize).copied())
                         .flatten();
-                    self.apply_dct(instrnr, new_note, new_sample_index);
+                    self.apply_dct(pool, instrnr, new_note, new_sample_index);
 
                     // IT NNA: if the outgoing voice's NNA is anything
                     // but `Cut`, fork it into a ghost before we blow
                     // it away with the new trigger. On non-IT
                     // modules this is a cheap no-op because their
                     // importers leave NNA = NoteCut (the default).
-                    self.spawn_ghost_for_outgoing();
-                    self.instr = Some(StateInstrDefault::new(
-                        id,
-                        instrnr,
-                        self.period_helper.clone(),
-                        self.rate,
-                    ));
+                    self.spawn_ghost_for_outgoing(pool);
+                    let state =
+                        StateInstrDefault::new(id, instrnr, self.period_helper.clone(), self.rate);
+                    self.install_live(pool, state, id.midi_mute_computer);
                     // Consume any one-shot S73–S76 override — it
                     // only affects this one trigger.
                     self.nna_override = None;
@@ -1643,12 +1765,12 @@ impl<'a> Channel<'a> {
     }
 
     /// Return true if it was the same instrument
-    fn tick0_load_instrument(&mut self) -> bool {
+    fn tick0_load_instrument(&mut self, pool: &mut VoicePool<'a>) -> bool {
         if let Some(instr) = self.current.instrument {
             if instr >= self.module.instrument.len() {
                 // Invalid instrument, cut current note
                 self.cut_pitch();
-                self.instr = None;
+                self.drop_live(pool);
                 return false;
             }
         } else {
@@ -1657,8 +1779,8 @@ impl<'a> Channel<'a> {
         }
 
         if self.current.has_tone_portamento() {
-            self.trigger_pitch(TRIGGER_KEEP_PERIOD | TRIGGER_KEEP_SAMPLE_POSITION);
-            return self.tick0_change_instr(true);
+            self.trigger_pitch(TRIGGER_KEEP_PERIOD | TRIGGER_KEEP_SAMPLE_POSITION, pool);
+            return self.tick0_change_instr(true, pool);
         }
 
         if self.current.note.is_none() {
@@ -1669,12 +1791,12 @@ impl<'a> Channel<'a> {
                 /* Sample position is kept, but envelopes are reset */
                 TRIGGER_KEEP_SAMPLE_POSITION | TRIGGER_KEEP_VOLUME | TRIGGER_KEEP_PERIOD
             };
-            self.trigger_pitch(trigger_flags);
-            return self.tick0_change_instr(true);
+            self.trigger_pitch(trigger_flags, pool);
+            return self.tick0_change_instr(true, pool);
         }
 
         if self.current.note.is_keyoff() {
-            self.trigger_pitch(TRIGGER_KEEP_PERIOD);
+            self.trigger_pitch(TRIGGER_KEEP_PERIOD, pool);
             return true; // Keyoff does not change instrument
         }
 
@@ -1686,17 +1808,17 @@ impl<'a> Channel<'a> {
             return true;
         }
 
-        self.tick0_change_instr(false)
+        self.tick0_change_instr(false, pool)
     }
 
-    fn tick0_load_pitch(&mut self, was_same_instr: bool) {
+    fn tick0_load_pitch(&mut self, was_same_instr: bool, pool: &mut VoicePool<'a>) {
         // Note is not valid? Return early.
         if !self.current.note.is_valid() {
             if self.current.note.is_keyoff() {
                 if self.current.instrument.is_none() || was_same_instr {
-                    self.key_off(0);
+                    self.key_off(0, pool);
                 } else {
-                    self.trigger_pitch(TRIGGER_KEEP_PERIOD | TRIGGER_KEEP_ENVELOPE);
+                    self.trigger_pitch(TRIGGER_KEEP_PERIOD | TRIGGER_KEEP_ENVELOPE, pool);
                 }
             } else if self.current.note.is_fade() {
                 // IT note-column `~~~`: start fadeout without
@@ -1705,13 +1827,13 @@ impl<'a> Channel<'a> {
                 // semantics whether the instrument cell is set or
                 // not — schism doesn't gate on `row_instr` for
                 // NOTE_FADE either.
-                self.note_fade();
+                self.note_fade(pool);
             }
             return;
         }
 
         // Instr?
-        if let Some(instr) = &mut self.instr {
+        if let Some(instr) = self.live_mut(pool) {
             // Portamento?
             if self.current.has_tone_portamento() {
                 if let Some(s) = &instr.state_sample {
@@ -1749,11 +1871,11 @@ impl<'a> Channel<'a> {
             // path (which already ran `spawn_ghost_for_outgoing` in
             // `tick0_change_instr`) doesn't double-ghost.
             if self.current.instrument.is_none() {
-                self.spawn_ghost_clone();
+                self.spawn_ghost_clone(pool);
             }
 
             // SetNote
-            if let Some(instr) = &mut self.instr {
+            if let Some(instr) = self.live_mut(pool) {
                 if instr.set_pitch(self.current.note) {
                     if let Some(s) = &instr.state_sample {
                         // Two distinct notes are in play here:
@@ -1790,7 +1912,7 @@ impl<'a> Channel<'a> {
                         /* Ghost note: keep old volume */
                         TRIGGER_KEEP_VOLUME
                     };
-                    self.trigger_pitch(trigger_flag);
+                    self.trigger_pitch(trigger_flag, pool);
                     return;
                 }
             }
@@ -1799,7 +1921,7 @@ impl<'a> Channel<'a> {
         self.cut_pitch();
     }
 
-    fn tick0_load_instrument_and_pitch(&mut self) {
+    fn tick0_load_instrument_and_pitch(&mut self, pool: &mut VoicePool<'a>) {
         // FT2 "K00 eats note" quirk. In FT2, K00 is handled specially at
         // tickZero via getNewNote (ft2_replayer.c:1418): it fires a keyoff
         // and then RETURNS, never running triggerNote — so the note column
@@ -1831,12 +1953,12 @@ impl<'a> Channel<'a> {
         // for the exact contract). This flag drives the keyoff branch in
         // tick0_load_pitch: a keyoff with a *different* instrument must
         // retrigger rather than just cut.
-        let was_same_instr: bool = self.tick0_load_instrument();
+        let was_same_instr: bool = self.tick0_load_instrument(pool);
         // Next, choose sample from note
-        self.tick0_load_pitch(was_same_instr);
+        self.tick0_load_pitch(was_same_instr, pool);
     }
 
-    pub(crate) fn tick0(&mut self, pattern_slot: &TrackUnit) {
+    pub(crate) fn tick0(&mut self, pattern_slot: &TrackUnit, pool: &mut VoicePool<'a>) {
         self.current = pattern_slot.clone();
 
         let delay = self.current.get_delay();
@@ -1851,11 +1973,11 @@ impl<'a> Channel<'a> {
             // tickn when current_tick reaches `delay`.
         } else {
             /* load instrument then note */
-            self.tick0_load_instrument_and_pitch();
-            if let Some(instr) = &mut self.instr {
+            self.tick0_load_instrument_and_pitch(pool);
+            if let Some(instr) = self.live_mut(pool) {
                 instr.tick();
             }
-            self.tickn_effects(0);
+            self.tickn_effects(0, pool);
 
             if self.effect_arpeggio.in_progress() && !self.current.has_arpeggio() {
                 // Arpeggio state is row-local (it's always restarted from
@@ -1883,32 +2005,34 @@ impl<'a> Channel<'a> {
                 }
             }
 
-            self.tickn_update_instr();
+            self.tickn_update_instr(pool);
         }
         // Tick ghosts every frame, whether the live voice is present,
         // delayed, or absent. Ghosts are driven purely by their own
         // envelope / fadeout state and must not stall just because
         // the live note is muted or dormant.
-        self.tick_ghosts();
+        self.tick_ghosts(pool);
     }
 }
 
-impl<'a> Iterator for Channel<'a> {
-    type Item = (f32, f32);
-
-    // Was next_of_sample()
-    //
-    // Folds the live voice's output (if any) together with every
-    // still-sounding ghost voice. Returns `None` only when BOTH are
-    // silent, so a channel whose live note has cut but whose NNA=
-    // Continue ghosts are still singing keeps producing audio.
-    fn next(&mut self) -> Option<Self::Item> {
+impl<'a> Channel<'a> {
+    /// Produce one stereo sample for the channel: live voice + every
+    /// still-singing ghost. Returns `None` only when both are silent
+    /// — a channel whose live note has cut but whose NNA=Continue
+    /// ghosts are still ringing keeps producing audio.
+    ///
+    /// Replaces the previous `impl Iterator for Channel` because the
+    /// trait can't pass extra arguments and we now need the
+    /// `VoicePool` to access ghost voices. Step 1.4 will move the
+    /// live voice into the pool too, at which point this becomes a
+    /// pure pool-driven mix loop.
+    pub(crate) fn next_sample(&mut self, pool: &mut VoicePool<'a>) -> Option<(f32, f32)> {
         let mut left = 0.0f32;
         let mut right = 0.0f32;
         let mut any = false;
 
         // Live voice.
-        if let Some(i) = &mut self.instr {
+        if let Some(i) = self.live_mut(pool) {
             if let Some((l, r)) = i.next() {
                 left += l * self.actual_volume[0];
                 right += r * self.actual_volume[1];
@@ -1917,12 +2041,15 @@ impl<'a> Iterator for Channel<'a> {
         }
 
         // Ghost voices. Each ghost owns its frozen gain / pan, so
-        // we just accumulate.
-        for g in &mut self.ghosts {
-            if let Some((l, r)) = g.next() {
-                left += l;
-                right += r;
-                any = true;
+        // we just accumulate. Stale handles (which 1.3 shouldn't
+        // produce but the pool tolerates) are skipped silently.
+        for id in &self.ghosts {
+            if let Some(g) = pool.get_mut(*id) {
+                if let Some((l, r)) = g.next() {
+                    left += l;
+                    right += r;
+                    any = true;
+                }
             }
         }
 

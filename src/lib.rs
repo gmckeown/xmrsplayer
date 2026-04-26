@@ -28,6 +28,14 @@ pub(crate) mod state_instr_default;
 pub(crate) mod state_sample;
 pub(crate) mod voice;
 
+/// Generational arena of `Voice`s, indexed by opaque `VoiceId`
+/// handles. Introduced in step 1.2 of the voice-pool roadmap; not
+/// yet wired up to the live engine — the `Channel` still owns its
+/// voices directly. Step 1.3 will route NNA-detached voices through
+/// here, step 1.4 the live voice, step 1.5 will add lowest-volume
+/// eviction.
+pub(crate) mod voice_pool;
+
 // --- Post-refactor modules (0.10) ---
 
 /// Song cursor and tick clock. Consumes navigation-side global effects

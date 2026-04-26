@@ -1,29 +1,25 @@
-//! A `Voice` is a still-sounding note that the `Channel` has spawned
-//! and then let go of. In MOD/XM/S3M a channel has exactly one live
-//! voice at a time — a fresh note cuts the old one. In Impulse Tracker
-//! the instrument's `NewNoteAction` decides what happens to the old
-//! sound when a new note fires on the same channel: `Cut` matches the
-//! legacy behaviour, while `Continue`, `NoteOff` and `NoteFadeOut` all
-//! leave the old voice running alongside the fresh one, fading in
-//! their own way.
+//! A `Voice` is an instance of an instrument actively producing
+//! sound. The same type represents both the **live** voice that the
+//! track is currently driving via the pattern (note triggers,
+//! tremolo, slides, vibrato) and the **detached** voices spawned by
+//! IT's `NewNoteAction` mechanism, which keep ringing on their own
+//! envelope + fadeout after a new note has displaced them.
 //!
-//! This module implements the "ghost" side of that story. The live
-//! (pattern-controlled) note still lives in `Channel::instr` — ghosts
-//! are accumulated into `Channel::ghosts` and ticked / mixed alongside
-//! it every frame. Each `Voice` owns an independent copy of the
-//! instrument's `StateInstrDefault` (envelopes, fadeout, sample
-//! position) plus the channel-level gain / pan that were in effect at
-//! the moment of the fork. Voices do not receive further pattern
-//! effects once detached; they simply run to silence via their
-//! envelope + fadeout state and then self-terminate.
+//! In the present file the live-voice case is not yet wired through
+//! `Voice` — the track still owns its live `StateInstrDefault`
+//! directly in `Channel::instr`. That migration happens in step 1.4
+//! of the voice-pool roadmap; this file already shapes its API for
+//! that destination so the eventual move is mechanical.
 //!
-//! This is a deliberate mid-point between the current single-voice-
-//! per-channel architecture and the fully-separated `Voices` pool
-//! sketched in `IT_ROADMAP.md`. A real pool with DCT / voice-stealing
-//! is Phase 2/3 of that roadmap; what we do here is Phase 3's audible
-//! behaviour (NNA + S7x past-note effects) without the full
-//! architectural refactor. The API on `Voice` is shaped so that
-//! promoting these to a flat pool later is mechanical.
+//! For now `Voice` is constructed only by [`Voice::new_ghost`], and
+//! every instance corresponds to a detached voice produced by an
+//! NNA = Continue / NoteOff / NoteFadeOut transition, or by an
+//! NNA-not-Cut ghost-note retrigger. Each voice owns an independent
+//! `StateInstrDefault` (envelopes, fadeout, sample position) and
+//! captures the channel-level gain / pan that were in effect at
+//! detachment time, so subsequent pattern effects on the live track
+//! do not perturb its amplitude. Voices self-terminate when their
+//! envelope * fadeout product reaches silence.
 
 // Float math backend (only needed when `std` is disabled).
 // Priority: std > libm > micromath.
@@ -37,18 +33,16 @@ use num_traits::float::Float;
 use crate::state_instr_default::StateInstrDefault;
 use xmrs::prelude::Pitch;
 
-/// The maximum number of concurrent ghost voices per pattern channel.
-///
-/// Impulse Tracker itself allocates voices from a global 64-deep pool
-/// shared across all channels. In this simpler per-channel model we
-/// cap each channel at 8 — enough for even aggressive NNA=Continue
-/// tremolo stabs, tight enough to keep the `Vec<Voice>` hot path
-/// bounded. When the cap is reached the oldest (front-most) ghost is
-/// evicted; that is the conventional voice-steal heuristic (see
-/// `Channel::push_ghost`).
-pub(crate) const MAX_GHOST_VOICES_PER_CHANNEL: usize = 8;
+// (1.5) The former `MAX_GHOST_VOICES_PER_CHANNEL` cap has been
+// removed. Per-channel ghost lists now grow freely; the only limit
+// is the shared pool's capacity (see `voice_pool::DEFAULT_VOICE_
+// POOL_CAPACITY`). When the pool is full, allocation steals the
+// lowest-audible-volume voice across the whole population, the way
+// schismtracker's `csf_get_nna_channel` does. This eliminates the
+// pathological case where a busy channel evicted its own quiet
+// ghosts under FIFO while loud ghosts on idle channels survived.
 
-/// A detached, still-sounding note.
+/// A voice owned by the `VoicePool` (live or detached).
 #[derive(Clone)]
 pub(crate) struct Voice<'a> {
     /// The instrument-state fork. Owns its own envelopes, fadeout
@@ -87,20 +81,58 @@ pub(crate) struct Voice<'a> {
     /// envelope-driven pitch drift stops at the moment the voice
     /// becomes a ghost.
     pub period_at_fork: f32,
+
+    /// The track that engendered this voice. For ghost voices today
+    /// this is informational only — past-note effects (S7x) and DCT
+    /// matching dispatch via the track's own ghost list, not via
+    /// this field. The field exists so step 1.3 (move ghosts into a
+    /// shared `VoicePool`) can use it as the lookup key without a
+    /// further struct change. `None` is reserved for the future
+    /// "live voice" case (1.4) where the master track is the one
+    /// currently driving the voice from its pattern column; until
+    /// the live voice migrates into `Voice`, every constructed voice
+    /// is a ghost and this is always `Some(track_index)`.
+    #[allow(dead_code)] // wired in step 1.3
+    pub master_track: Option<usize>,
 }
 
 impl<'a> Voice<'a> {
-    /// Fork a live instrument state into a ghost voice. Callers must
-    /// then dispatch the NNA-specific action on the returned voice —
-    /// see [`Voice::apply_nna_continue`] (no-op), [`apply_nna_note_off`],
-    /// [`apply_nna_note_fade_out`]. Apply-functions live on this type
-    /// so the NNA dispatch table is co-located with the voice it
-    /// affects.
+    /// Build a live voice (driven by a track's pattern column).
+    /// Used by `Channel::install_live` when a fresh trigger needs
+    /// a slot in the pool. The frozen-gain fields are populated to
+    /// neutral defaults; the channel applies its own `actual_volume`
+    /// in the mixer, so these are unread for live voices but kept
+    /// at sensible values in case the voice is later promoted to a
+    /// ghost without an explicit re-snapshot.
+    pub fn new_live(instr: StateInstrDefault<'a>, master_track: usize) -> Self {
+        Self {
+            instr,
+            vol_frozen: 1.0,
+            channel_volume_frozen: 1.0,
+            panning_frozen: 0.5,
+            note: None,
+            sample_num: None,
+            period_at_fork: 0.0,
+            master_track: Some(master_track),
+        }
+    }
+
+    /// Build a detached (ghost) voice from a live instrument state.
+    /// Callers must then dispatch the NNA-specific action on the
+    /// returned voice — see [`Voice::apply_nna_continue`] (no-op),
+    /// [`apply_nna_note_off`], [`apply_nna_note_fade_out`].
+    /// Apply-functions live on this type so the NNA dispatch table
+    /// is co-located with the voice it affects.
+    ///
+    /// `master_track` records which pattern track engendered the
+    /// voice. For ghosts spawned by NNA != Cut, that's the track
+    /// whose live note was just displaced.
     ///
     /// `note` / `sample_num` carry the identity tags used by DCT
     /// matching on subsequent triggers.
-    pub fn fork(
+    pub fn new_ghost(
         instr: StateInstrDefault<'a>,
+        master_track: usize,
         vol_frozen: f32,
         channel_volume_frozen: f32,
         panning_frozen: f32,
@@ -116,6 +148,7 @@ impl<'a> Voice<'a> {
             note,
             sample_num,
             period_at_fork,
+            master_track: Some(master_track),
         }
     }
 

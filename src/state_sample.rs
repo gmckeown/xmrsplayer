@@ -59,6 +59,15 @@ impl<'a> StateSample<'a> {
         self.step.is_some()
     }
 
+    /// `true` if the underlying sample has any kind of loop (forward,
+    /// ping-pong, or sustain). Used by the voice pool's eviction
+    /// heuristic — looping voices can ring indefinitely so they're
+    /// cheaper to drop than one-shot tails.
+    pub fn is_looping(&self) -> bool {
+        use xmrs::sample::LoopType;
+        self.sample.loop_flag != LoopType::No || self.sample.sustain_loop_flag != LoopType::No
+    }
+
     pub fn disable(&mut self) {
         self.step = None;
     }

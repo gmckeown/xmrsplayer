@@ -23,9 +23,12 @@ struct Cli {
     #[arg(short = 'o', long, value_name = "output filename")]
     output: Option<String>,
 
-    /// Choose amplification (1.0 = unity after volume-chain fix; lower
-    /// to avoid clipping on modules with many simultaneous channels)
-    #[arg(short = 'a', long, default_value = "0.25")]
+    /// Output amplification. The mixer is now calibrated so that
+    /// `1.0` is the natural unity gain (matches schism's mix levels
+    /// after the engine's `MIXER_HEADROOM_DIV` attenuation). Lower
+    /// it if you want quieter playback; raise it for more presence,
+    /// at your own clipping risk on busy modules.
+    #[arg(short = 'a', long, default_value = "1.0")]
     amplification: f32,
 
     /// Play only a specific channel (from 1 to n, 0 for all)
