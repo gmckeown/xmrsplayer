@@ -249,27 +249,37 @@ impl<'a> VoicePool<'a> {
     /// Eviction-victim picker for `allocate_ghost`.
     ///
     /// Returns `Some(slot)` only when the pool contains at least one
-    /// "evictable" voice — i.e. a voice already in its fadeout phase
-    /// (`!sustained`) or whose `instr.get_volume()` is essentially
-    /// zero. Returns `None` when every occupied voice is still
-    /// sustained — that's the case schism handles by refusing the
-    /// NNA, see `effects.c:1638`.
+    /// "evictable" voice — i.e. a voice that has already been keyed
+    /// off (`!sustained`) and is now in its fadeout phase. Returns
+    /// `None` when every occupied voice is still sustained — that's
+    /// the case schism handles by refusing the NNA, see
+    /// `effects.c:1638` (`if (!chan->fadeout_volume) return 0;`).
+    ///
+    /// Sustained voices are protected unconditionally, even if their
+    /// volume envelope momentarily reads zero. The envelope is just
+    /// a curve the author drew; a sustain that holds zero (swell
+    /// pads, V-shapes, release sections crossing zero) is a
+    /// legitimate IT shape and must not become an eviction
+    /// candidate. Mirrors schism's score loop, which only ranks
+    /// voices in the unsustained / `CHN_NOTEFADE` group.
     ///
     /// Among evictable voices, picks the one with the lowest
-    /// audible volume. Looping voices' score is halved (they can
-    /// ring forever, so they're cheaper to drop than one-shot
-    /// tails) — same heuristic as schism's `if (CHN_LOOP) v >>= 1`.
+    /// fadeout-weighted volume. Looping voices' score is halved
+    /// (they can ring forever, so they're cheaper to drop than
+    /// one-shot tails) — same heuristic as schism's
+    /// `if (CHN_LOOP) v >>= 1`.
     fn find_evictable_victim(&self) -> Option<usize> {
         let mut best: Option<(usize, f32)> = None;
         for (i, slot) in self.slots.iter().enumerate() {
             let SlotState::Occupied(v) = &slot.state else {
                 continue;
             };
-            // Skip protected voices: still sustained AND audible.
-            // Sustained-but-near-silent voices are evictable —
-            // their score will be tiny and they're effectively
-            // dead anyway.
-            if v.instr.sustained && v.instr.get_volume() > 1e-3 {
+            // Sustained voices are never evictable from this path.
+            // The envelope value is irrelevant — sustain means "the
+            // author is holding this note", and we don't pre-empt
+            // that just because the current envelope point happens
+            // to be zero.
+            if v.instr.sustained {
                 continue;
             }
             let score = self.eviction_score(v);
@@ -310,24 +320,51 @@ impl<'a> VoicePool<'a> {
     }
 
     /// Score used to rank voices for eviction. Lower = more likely
-    /// victim. Mirrors schism's formula:
+    /// victim. Mirrors schism's formula in `csf_get_nna_channel`
+    /// (`effects.c:1646`):
     ///
-    ///   score = volume × fadeout      (when in CHN_NOTEFADE)
-    ///         = volume × LARGE_CONST   (otherwise)
-    ///         /= 2                     (when sample is looping)
+    /// ```c
+    /// uint32_t v = pj->volume;
+    /// if (pj->flags & CHN_NOTEFADE)
+    ///     v = v * pj->fadeout_volume;
+    /// else
+    ///     v <<= 16;
+    /// if (pj->flags & CHN_LOOP) v >>= 1;
+    /// ```
     ///
-    /// `instr.get_volume()` already folds the fadeout into the
-    /// volume product, so for sustained voices we multiply by a
-    /// large protection constant; for non-sustained voices we read
-    /// the raw `get_volume()` (which already includes the running
-    /// fadeout).
+    /// In other words: score uses the channel volume × the fadeout
+    /// register for unsustained voices, and a large protection
+    /// constant times channel volume for sustained ones. The current
+    /// envelope value does not appear — schism's `pj->volume` is the
+    /// pre-envelope channel volume, and the alive predicate works the
+    /// same way. Mixing the live envelope into the ranking would
+    /// (a) make a transient zero on a long-tail pad rate it lower
+    /// than a near-silent dying note, and (b) flicker the ranking
+    /// on every tick instead of letting fadeout's monotonic decay
+    /// produce a stable victim.
+    ///
+    /// We use `vol_frozen` rather than `instr.get_volume()` because
+    /// ghost voices snapshot their channel-side gain at fork time;
+    /// the channel can no longer modulate them, so the frozen value
+    /// is the right "channel volume" to multiply.
     fn eviction_score(&self, v: &Voice<'a>) -> f32 {
-        let mut score = v.instr.get_volume();
-        if v.instr.sustained {
-            // Protection multiplier — pushes sustained voices well
-            // above any non-sustained voice in the ranking.
-            score *= 1024.0;
-        }
+        // `instr.volume` is the per-voice channel volume (Vxx column,
+        // post-effects). It corresponds to schism's `pj->volume`,
+        // the single register read at `effects.c:1646`. The
+        // envelope value and the instrument's static global
+        // volume are deliberately not folded in: see the doc
+        // comment for the rationale.
+        let mut score = if v.instr.sustained {
+            // Sustained: protect with a large constant. This branch
+            // is reached only from `find_eviction_victim`'s sustained-
+            // fallback (when allocate_live has to pre-empt anyway);
+            // `find_evictable_victim` already filters sustained
+            // voices out before scoring.
+            v.instr.volume * 1024.0
+        } else {
+            // Unsustained: rank by remaining fadeout × channel volume.
+            v.instr.volume * v.instr.volume_fadeout
+        };
         if v.instr
             .state_sample
             .as_ref()
@@ -680,5 +717,49 @@ mod tests {
         assert!(pool.get(b).is_some(), "louder sustained voice survives");
         assert!(pool.get(new_id).is_some(), "new live voice installed");
         assert_eq!(pool.allocated_count(), 2);
+    }
+
+    // -------- regression tests: voices stopping too early in IT --------
+    //
+    // The 0.10.x series killed ghost voices the moment their volume
+    // envelope passed through zero, because `is_alive()` and the
+    // eviction predicates both folded the live envelope value into
+    // their "audible?" check. IT modules legitimately run envelopes
+    // through zero (V-shapes, sustains authored at 0 for swells,
+    // release segments crossing zero) — those voices must keep their
+    // pool slot until either the sample exhausts or the monotonic
+    // fadeout register decays to 0 post-key-off. Schism's policy:
+    // `sndmix.c:1112` only reaps voices in `CHN_NOTEFADE` whose
+    // fadeout register and output volumes have all reached 0.
+
+    #[test]
+    fn sustained_voice_at_zero_envelope_is_not_evictable() {
+        // Pool with two sustained voices: one at full envelope, one
+        // whose envelope happens to be at zero this tick. A ghost
+        // allocation must NOT pick the zero-envelope voice as a
+        // victim — sustained voices are protected unconditionally,
+        // regardless of envelope value.
+        //
+        // Before the fix, `find_evictable_victim` skipped sustained
+        // voices only when `instr.get_volume() > 1e-3`, so a
+        // sustained voice on a transient envelope-zero would become
+        // evictable and get reaped to make room for a new ghost.
+        let mut pool = VoicePool::new(2);
+        let full = pool.allocate_live(sustained_voice(1.0));
+        let mut silent = sustained_voice(1.0);
+        silent.instr.envelope_volume.value = 0.0;
+        let silent_id = pool.allocate_live(silent);
+        assert!(pool.is_full());
+        let result = pool.allocate_ghost(sustained_voice(1.0));
+        assert!(
+            result.is_none(),
+            "ghost must be refused — both sustained voices are protected, \
+             regardless of envelope value"
+        );
+        assert!(pool.get(full).is_some(), "full-envelope voice survives");
+        assert!(
+            pool.get(silent_id).is_some(),
+            "zero-envelope sustained voice must not be evicted"
+        );
     }
 }

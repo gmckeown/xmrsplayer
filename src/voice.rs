@@ -200,18 +200,42 @@ impl<'a> Voice<'a> {
             .update_frequency(self.period_at_fork, 0.0, 0.0, false);
     }
 
-    /// `true` while the voice is still audible. A voice is considered
-    /// "dead" when either its sample stream has run out (no enabled
-    /// state_sample) or the combined envelope*fadeout*inner-volume
-    /// product has fallen to (effectively) zero — at which point
-    /// further samples would be silent anyway, so the caller can
-    /// drop this voice and reclaim the slot.
+    /// `true` while the voice still owns its pool slot. A voice is
+    /// considered "dead" — and therefore reclaimable — only when:
+    ///
+    ///   1. its sample stream has run out (`state_sample.step` is
+    ///      `None`, surfaced as `!instr.is_enabled()`), OR
+    ///   2. it has been keyed off (`sustained == false`) AND its
+    ///      monotonic fadeout register has reached zero.
+    ///
+    /// The current envelope value deliberately does NOT participate.
+    /// IT envelopes legitimately pass through zero — V-shapes,
+    /// sustain points authored at zero for swells, release segments
+    /// that cross zero — and a sustained NNA = Continue ghost must
+    /// keep its slot through those silent moments. Schism's
+    /// `sndmix.c:1112` codifies the same policy:
+    ///
+    /// ```c
+    /// if ((chan->flags & CHN_NOTEFADE) &&
+    ///     !(chan->fadeout_volume | chan->right_volume | chan->left_volume))
+    ///     chan->length = 0;
+    /// ```
+    ///
+    /// (i.e. only voices that have entered `CHN_NOTEFADE` and whose
+    /// fadeout register plus actual output have all reached zero get
+    /// reaped.)
+    ///
+    /// Sustained voices that are silent but still held are kept
+    /// alive here; the voice pool's eviction path is the safety
+    /// valve when the slot is genuinely needed for a louder voice.
     #[inline]
     pub fn is_alive(&self) -> bool {
         if !self.instr.is_enabled() {
             return false;
         }
-        self.instr.get_volume() > 1e-6
+        // Sustained → keep. Unsustained → keep only while the
+        // fadeout register hasn't run out yet.
+        self.instr.sustained || self.instr.volume_fadeout > 0.0
     }
 
     /// Produce one stereo sample. Mirrors the gain formula used in
