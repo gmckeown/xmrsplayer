@@ -246,8 +246,7 @@ impl<'a> Voices<'a> {
         self.pending_midi_events.clear();
 
         let n = self.channel.len().min(cells.len());
-        for i in 0..n {
-            let cell = &cells[i];
+        for (i, cell) in cells.iter().enumerate().take(n) {
             self.channel[i].tick0(cell, &mut self.pool);
             self.apply_row_global_effects(i, cell);
         }

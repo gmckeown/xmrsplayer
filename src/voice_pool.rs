@@ -74,6 +74,18 @@ impl VoiceId {
 }
 
 /// State of a single slot in the pool.
+//
+// `Voice` is intentionally large (the full instrument-state engine
+// lives inline) and `Occupied` therefore dominates the variant
+// size. Boxing it the way clippy suggests would push the voice
+// onto the heap, costing one allocation per `allocate_live` /
+// `allocate_ghost` and a pointer indirection on every per-sample
+// mix touch — exactly the wrong tradeoff for an audio hot path.
+// Vacant slots already cost the full enum size today, but those
+// are bounded by `MAX_VOICES` (256 by default) so the worst-case
+// dead memory is a few tens of KiB and never grows past pool
+// capacity.
+#[allow(clippy::large_enum_variant)]
 enum SlotState<'a> {
     /// Slot is free. `next_free` is the index of the next free slot,
     /// or `usize::MAX` to mark the end of the chain.

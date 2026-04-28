@@ -453,7 +453,6 @@ impl<'a> Channel<'a> {
                 // SFx — just stash the selector. The macro only
                 // fires when a subsequent Zxx<0x80 picks it up.
                 self.midi_parametric_selector = idx;
-                return;
             }
             MidiMacroType::Parametric(z) => {
                 let Some(macros) = &self.module.midi_macros else {
@@ -483,20 +482,21 @@ impl<'a> Channel<'a> {
     /// `out_events` for external dispatch.
     fn interpret_macro_bytes(
         &mut self,
-        mut bytes: alloc::vec::Vec<u8>,
+        bytes: alloc::vec::Vec<u8>,
         z_value: u8,
         ch_index: usize,
         out_events: &mut alloc::vec::Vec<(usize, MidiEvent)>,
         pool: &mut VoicePool<'a>,
     ) {
-        // In-place `z` substitution — the macro byte 0x7A is the
-        // ASCII letter `z`, which Schism Tracker / OpenMPT / IT use
-        // as a parameter placeholder inside a macro string.
-        for b in bytes.iter_mut() {
-            if *b == b'z' {
-                *b = z_value;
-            }
-        }
+        // IT macros are stored in the file as 32-byte ASCII strings
+        // (ITTECH, "Internal Editing Of Macros"). Hex digits encode
+        // nibbles two-per-byte and a small letter table substitutes
+        // dynamic per-channel state (note, velocity, pan, etc.).
+        // Raw-byte interpretation produces no MIDI output for any
+        // real-world IT file because every ASCII char is a data byte
+        // (< 0x80). We therefore expand the text first, then run the
+        // MIDI parser on the resulting binary buffer.
+        let bytes = self.expand_macro_text(&bytes, z_value, ch_index, &*pool);
 
         let mut i = 0;
         while i < bytes.len() {
@@ -681,6 +681,241 @@ impl<'a> Channel<'a> {
         }
     }
 
+    /// Expand an IT MIDI-macro text string to a binary byte stream.
+    ///
+    /// Macros are stored in the IT file as 32-byte ASCII strings
+    /// (NUL-padded). Schism's `csf_process_midi_macro`
+    /// (`effects.c:1031-1180`) is the canonical reference. The
+    /// substitution table:
+    ///
+    /// | Char    | Meaning                       | Form       |
+    /// |---------|-------------------------------|------------|
+    /// | `0`-`9` | hex nibble                    | nibble     |
+    /// | `A`-`F` | hex nibble                    | nibble     |
+    /// | `c`     | MIDI channel (instrument)     | nibble     |
+    /// | `n`     | last triggered note           | full byte  |
+    /// | `v`     | note velocity (Zxx ⇒ 1)       | full byte  |
+    /// | `u`     | channel running volume        | full byte  |
+    /// | `x`     | channel pan                   | full byte  |
+    /// | `y`     | final channel pan             | full byte  |
+    /// | `a`     | MIDI bank high (instrument)   | full byte  |
+    /// | `b`     | MIDI bank low (instrument)    | full byte  |
+    /// | `p`     | MIDI program (instrument)     | full byte  |
+    /// | `z`     | Zxx parameter                 | full byte  |
+    /// | `h`     | host (tracker) channel        | full byte  |
+    /// | `m`     | sample loop direction         | full byte  |
+    /// | `o`     | sample offset high byte       | full byte  |
+    ///
+    /// Hex nibbles pack two-per-byte (high nibble first); a
+    /// substitution that's a full byte arriving while a single
+    /// nibble is pending flushes the half-byte as-is (matching
+    /// schism's `write_pos++` without OR-folding). Unrecognised
+    /// bytes are silently dropped (also matching schism's `default:
+    /// continue`).
+    fn expand_macro_text(
+        &self,
+        bytes: &[u8],
+        z_value: u8,
+        ch_index: usize,
+        pool: &VoicePool<'a>,
+    ) -> alloc::vec::Vec<u8> {
+        let mut out = alloc::vec::Vec::with_capacity(bytes.len());
+        let mut pending_low_nibble: Option<u8> = None;
+
+        for &b in bytes {
+            // NUL terminator: schism's outer loop tests
+            // `macro[read_pos]` (C-string sentinel) so any 0 byte
+            // ends the macro. IT files NUL-pad each 32-byte slot,
+            // and stopping at the first NUL keeps the trailing
+            // padding from emitting a string of zero bytes.
+            if b == 0 {
+                break;
+            }
+
+            let (data, is_nibble) = match b {
+                b'0'..=b'9' => (b - b'0', true),
+                b'A'..=b'F' => (b - b'A' + 0x0A, true),
+                b'c' => (self.macro_subst_midi_channel(), true),
+                b'n' => (self.macro_subst_note(), false),
+                b'v' => (self.macro_subst_velocity(), false),
+                b'u' => (self.macro_subst_volume(), false),
+                b'x' => (self.macro_subst_pan(), false),
+                b'y' => (self.macro_subst_final_pan(), false),
+                b'a' => (self.macro_subst_bank_high(), false),
+                b'b' => (self.macro_subst_bank_low(), false),
+                b'p' => (self.macro_subst_program(), false),
+                b'z' => (z_value, false),
+                b'h' => ((ch_index as u8) & 0x7F, false),
+                b'm' => (self.macro_subst_loop_direction(pool), false),
+                b'o' => (self.macro_subst_offset_high(), false),
+                // Anything else (whitespace, lower-case letters not
+                // listed, punctuation): skip silently like schism.
+                _ => continue,
+            };
+
+            if is_nibble {
+                let nib = data & 0x0F;
+                if let Some(low) = pending_low_nibble {
+                    // Second nibble of a pair: existing low half
+                    // moves to the high position, new nibble takes
+                    // the low half.
+                    out.push((low << 4) | nib);
+                    pending_low_nibble = None;
+                } else {
+                    pending_low_nibble = Some(nib);
+                }
+            } else {
+                // Full-byte substitution. If a half-byte is pending,
+                // commit it as a low-nibble byte (schism's behaviour
+                // is `write_pos++` with no shift — the pending nibble
+                // is already stored in `outbuffer[write_pos]`'s low
+                // half from the first encounter).
+                if let Some(low) = pending_low_nibble {
+                    out.push(low);
+                    pending_low_nibble = None;
+                }
+                out.push(data);
+            }
+        }
+
+        // Trailing single nibble: schism flushes it the same way
+        // (`if (nibble_pos == 1) write_pos++;`). Mirror it.
+        if let Some(low) = pending_low_nibble {
+            out.push(low);
+        }
+
+        out
+    }
+
+    // ------------------------------------------------------------------
+    // MIDI-macro letter substitutions
+    //
+    // These mirror schism's `csf_process_midi_macro` substitution
+    // dispatch (`effects.c:1061-1156`), each returning the value to
+    // splice into the macro's binary expansion. Any substitution
+    // that depends on state xmrsplayer doesn't currently surface
+    // (final-pan post-envelope, live ping-pong direction, sticky
+    // Oxx memory) returns a documented placeholder rather than
+    // breaking the macro byte-stream.
+    // ------------------------------------------------------------------
+
+    /// Look up the current instrument's [`InstrMidi`] payload, if
+    /// the cell's instrument index points at an `InstrumentType::
+    /// Midi` variant. Returns `None` for sampled / OPL / SID /
+    /// missing instruments — the caller substitutes 0 in that
+    /// case, which is what schism does when `penv->midi_*` is
+    /// unset.
+    fn current_instr_midi(&self) -> Option<&InstrMidi> {
+        let idx = self.current.instrument?;
+        let instr = self.module.instrument.get(idx)?;
+        match &instr.instr_type {
+            InstrumentType::Midi(im) => Some(im),
+            _ => None,
+        }
+    }
+
+    /// `c` — MIDI channel for the active instrument, masked to
+    /// 0..15. Schism falls back to 15 when no instrument has a
+    /// MIDI-channel mask; we match that for non-Midi instruments.
+    fn macro_subst_midi_channel(&self) -> u8 {
+        self.current_instr_midi()
+            .map(|im| im.channel & 0x0F)
+            .unwrap_or(15)
+    }
+
+    /// `n` — last-triggered note. xmrs's `Pitch::value()` is
+    /// already 0-based MIDI-aligned (`Pitch::C0 = 0`,
+    /// `Pitch::C5 = 60`), matching schism's `note - 1`
+    /// transformation of the 1-based cell-stored byte.
+    fn macro_subst_note(&self) -> u8 {
+        self.current_note.map(|p| p.value()).unwrap_or(0)
+    }
+
+    /// `v` — note velocity. xmrsplayer reaches the macro
+    /// interpreter only via `Zxx` / `SFx`; schism's caller passes
+    /// `velocity = 0` in that path, then `CLAMP(0, 0x01, 0x7F)`
+    /// promotes it to 1. Mirror that: the canonical "no
+    /// explicit velocity" value is 1.
+    fn macro_subst_velocity(&self) -> u8 {
+        1
+    }
+
+    /// `u` — channel running volume mapped to the MIDI 1..127
+    /// range. Schism does a four-register `_muldiv` with a known-
+    /// approximate result (the comment at `effects.c:1091` flags it
+    /// as not-quite-right); using the channel's already-resolved
+    /// normalised volume produces the same musically-meaningful
+    /// value for any correctly-authored macro.
+    fn macro_subst_volume(&self) -> u8 {
+        let v = (self.volume * 127.0).clamp(1.0, 127.0);
+        v as u8
+    }
+
+    /// `x` — channel pan, saturated at 127. xmrs stores pan as
+    /// 0..1 normalised; schism stores it 0..256 with a `MIN(_, 127)`
+    /// at substitution time. The musical mapping is the same once
+    /// the saturation point lands at "fully right".
+    fn macro_subst_pan(&self) -> u8 {
+        let p = (self.panning * 127.0).clamp(0.0, 127.0);
+        p as u8
+    }
+
+    /// `y` — "final" channel pan after pan envelope and pan-swing
+    /// modulation. xmrsplayer's mixer keeps separate left/right
+    /// gains in `actual_volume[0..2]` rather than a single post-
+    /// envelope pan, so reconstructing the MIDI value would require
+    /// a lossy inverse. Approximated by the static channel pan;
+    /// macros relying on tight tracking of `y` will see the pre-
+    /// envelope value.
+    fn macro_subst_final_pan(&self) -> u8 {
+        self.macro_subst_pan()
+    }
+
+    /// `a` — MIDI bank high byte: `(bank >> 7) & 0x7F`.
+    fn macro_subst_bank_high(&self) -> u8 {
+        self.current_instr_midi()
+            .map(|im| ((im.bank >> 7) & 0x7F) as u8)
+            .unwrap_or(0)
+    }
+
+    /// `b` — MIDI bank low byte: `bank & 0x7F`.
+    fn macro_subst_bank_low(&self) -> u8 {
+        self.current_instr_midi()
+            .map(|im| (im.bank & 0x7F) as u8)
+            .unwrap_or(0)
+    }
+
+    /// `p` — MIDI program, masked to 7 bits.
+    fn macro_subst_program(&self) -> u8 {
+        self.current_instr_midi()
+            .map(|im| (im.program & 0x7F) as u8)
+            .unwrap_or(0)
+    }
+
+    /// `m` — sample-loop direction (`1` if currently playing
+    /// reverse on a ping-pong loop, `0` otherwise). xmrsplayer's
+    /// `Channel` does not surface live voice loop state at the
+    /// macro-interpreter call site — the live voice's playback
+    /// direction lives inside `StateSample` behind a `pool` look-
+    /// up that would require mutable borrowing during what is
+    /// otherwise a read-only expansion pass. Returning 0 keeps the
+    /// macro byte-stream well-formed; macros using `m` are an
+    /// OpenMPT-era extension that real-world IT files almost never
+    /// exercise.
+    fn macro_subst_loop_direction(&self, _pool: &VoicePool<'a>) -> u8 {
+        0
+    }
+
+    /// `o` — sample offset high byte. Schism reads this from the
+    /// channel's `mem_offset` register, which is the cumulative
+    /// Oxx + SAx high-nibble memorised across rows (used by
+    /// "ZxxSecrets.it" and similar OpenMPT test cases). xmrsplayer
+    /// resolves Oxx inline when it fires and does not retain a
+    /// sticky high-nibble register, so we substitute 0.
+    fn macro_subst_offset_high(&self) -> u8 {
+        0
+    }
+
     // ------------------------------------------------------------------
     // IT New Note Action helpers
     // ------------------------------------------------------------------
@@ -824,7 +1059,7 @@ impl<'a> Channel<'a> {
         // release them in the pool. Done as a `retain` over the
         // local list so the order of survivors is preserved.
         self.ghosts.retain(|id| {
-            let alive = pool.get(*id).map_or(false, |v| v.is_alive());
+            let alive = pool.get(*id).is_some_and(|v| v.is_alive());
             if !alive {
                 pool.release(*id);
             }

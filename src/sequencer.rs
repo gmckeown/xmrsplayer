@@ -137,7 +137,7 @@ impl<'a> Sequencer<'a> {
             current_row: 0,
             playing_row: 0,
             playing_pattern: module.pattern_order[current_song]
-                .get(0)
+                .first()
                 .copied()
                 .unwrap_or(0),
             position_jump: false,

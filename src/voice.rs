@@ -115,6 +115,15 @@ impl<'a> Voice<'a> {
     ///
     /// `note` / `sample_num` carry the identity tags used by DCT
     /// matching on subsequent triggers.
+    //
+    // Eight construction parameters: every one is a distinct piece
+    // of frozen state captured at fork time (the volume / channel-
+    // volume / panning trio, the identity tags, the period, plus
+    // the master-track index and the borrowed instrument state).
+    // Folding them into a builder struct just relocates the count
+    // without removing any complexity, so we keep the flat
+    // signature and silence the lint locally.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_ghost(
         instr: StateInstrDefault<'a>,
         master_track: usize,
@@ -323,10 +332,7 @@ impl<'a> Voice<'a> {
         let l_gain = v * (1.0 - self.panning_frozen);
         let r_gain = v * self.panning_frozen;
 
-        match self.instr.next() {
-            Some((l, r)) => Some((l * l_gain, r * r_gain)),
-            None => None,
-        }
+        self.instr.next().map(|(l, r)| (l * l_gain, r * r_gain))
     }
 }
 
