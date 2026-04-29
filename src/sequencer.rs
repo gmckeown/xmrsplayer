@@ -302,14 +302,25 @@ impl<'a> Sequencer<'a> {
         let mut pattern_changed = false;
 
         // 1. Apply any pending jump/break from the previous row.
+        //
+        // For `position_jump`: SBx pattern loops set this with
+        // `jump_dest = current_table_index` (within-pattern jump).
+        // Real cross-pattern moves — `Bxx`, end-of-pattern natural
+        // advance funnelled through here (see step 6 below) — set
+        // `jump_dest` to a different table index. We only flag the
+        // observer-visible `pattern_changed` when the table index
+        // actually moves; otherwise SBx loops would print one
+        // spurious "pattern_order[X] = Y" header per iteration even
+        // though we're staying on the same pattern.
         if self.position_jump {
+            let table_changed = self.jump_dest != self.current_table_index;
             self.current_table_index = self.jump_dest;
             self.current_row = self.jump_row;
             self.position_jump = false;
             self.pattern_break = false;
             self.jump_row = 0;
             self.post_pattern_change();
-            pattern_changed = true;
+            pattern_changed = table_changed;
         } else if self.pattern_break {
             self.current_table_index += 1;
             self.current_row = self.jump_row;
@@ -356,14 +367,30 @@ impl<'a> Sequencer<'a> {
         // A previous comment speculated about shrinking this field to `u8`
         // and wanted the wrap to push us into the next pattern; if that ever
         // happens, reintroduce the `== 0` guard in the condition below.
+        //
+        // When the row pointer falls off the pattern's last row we
+        // *defer* the actual advance: instead of bumping
+        // `current_table_index` here and flipping `pattern_changed`
+        // on the OUTGOING row, we synthesize a position_jump
+        // targeting `current_table_index + 1`. The next
+        // `row_start_tick` consumes that jump in step 1, where
+        // `pattern_changed` correctly fires on the FIRST row of the
+        // new pattern with `pat_idx` already pointing at the new
+        // pattern. This matches how `Bxx` and SBx are wired and
+        // keeps observers (e.g. DebugObserver) honest:
+        // `on_pattern_change` fires once, immediately before the
+        // first row of the destination, with both `new_table_index`
+        // and `new_pattern` describing the same destination.
         self.current_row += 1;
         let pattern_len = self.module.pattern[pat_idx].len();
         if !self.position_jump && !self.pattern_break && self.current_row >= pattern_len {
-            self.current_table_index += 1;
-            self.current_row = self.jump_row; /* usually 0, except when E60 set jump_row */
-            self.jump_row = 0;
-            self.post_pattern_change();
-            pattern_changed = true;
+            self.position_jump = true;
+            self.jump_dest = self.current_table_index + 1;
+            // `jump_row` is intentionally left as-is: it might carry
+            // a row index leaked by the FT2 E60 quirk
+            // (`e60_leaks_to_next_pattern`), and the position_jump
+            // consumption code in step 1 will pick that up and reset
+            // `jump_row` to 0 afterwards.
         }
 
         TickOutcome::RowStart {
