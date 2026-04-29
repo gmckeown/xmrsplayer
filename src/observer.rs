@@ -12,6 +12,8 @@
 //! generation. Long-running work or I/O must be deferred (push to a channel
 //! drained elsewhere) — otherwise it will stall audio. See `OBSERVERS.md`
 //! for the detailed threading contract and recipes.
+//!
+//! [`PlayerObserver`]: crate::observer::PlayerObserver
 
 use xmrs::prelude::*;
 

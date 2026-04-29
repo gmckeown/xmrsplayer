@@ -31,6 +31,9 @@
 //!   a macro on tracker channel 3 can address MIDI channel 7.
 //!
 //! [`PlayerObserver`]: crate::observer::PlayerObserver
+//! [`MidiObserver`]: crate::midi_observer::MidiObserver
+//! [`MidiObserver::on_midi_event`]: crate::midi_observer::MidiObserver::on_midi_event
+//! [`MidiEvent`]: crate::midi_observer::MidiEvent
 
 use alloc::vec::Vec;
 
@@ -81,7 +84,7 @@ pub enum MidiEvent {
 
 /// A consumer of MIDI events emitted by the macro interpreter.
 ///
-/// Register with [`XmrsPlayer::add_midi_observer`](crate::XmrsPlayer::add_midi_observer).
+/// Register with [`XmrsPlayer::add_midi_observer`](crate::xmrsplayer::XmrsPlayer::add_midi_observer).
 ///
 /// The `source_channel` argument is the *tracker* channel (pattern
 /// column, 0..num_channels) the macro fired on — distinct from the

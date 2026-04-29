@@ -42,6 +42,10 @@
 //! (could be a genuine silent passage). If you need the distinction, keep
 //! a `paused: bool` externally and update it when *you* call
 //! `player.pause()`.
+//!
+//! [`PlayerObserver`]: crate::observer::PlayerObserver
+//! [`MixObserver`]: crate::audio_observer::MixObserver
+//! [`ChannelsObserver`]: crate::audio_observer::ChannelsObserver
 
 /// Context passed to [`MixObserver::on_mix`].
 ///

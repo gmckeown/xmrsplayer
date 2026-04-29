@@ -21,7 +21,7 @@
 //! (`GlobalEffect::Volume`, `GlobalEffect::VolumeSlide`) are read separately
 //! by `Voices`.
 //!
-//! The facade drives the sequencer one tick at a time via [`Sequencer::advance_tick`].
+//! The facade drives the sequencer one tick at a time via `Sequencer::advance_tick`.
 
 use alloc::{vec, vec::Vec};
 use xmrs::prelude::*;

@@ -28,13 +28,14 @@ use xmrs::prelude::*;
 /// multiple channels rarely hit the cap.
 ///
 /// Exposed publicly so users can pass it to
-/// [`crate::XmrsPlayer::new_with_voice_pool_capacity`] when they
+/// [`crate::xmrsplayer::XmrsPlayer::new_with_voice_pool_capacity`] when they
 /// want the default explicitly, or compare against it before
 /// passing a custom value.
 pub const DEFAULT_VOICE_POOL_CAPACITY: usize = 256;
 
 /// The audio engine. Built once per player and driven via
-/// [`Voices::process_row`] / [`Voices::process_tick`].
+/// `process_row` / `process_tick` (crate-private; the facade calls
+/// them on each row/tick boundary).
 pub struct Voices<'a> {
     sample_rate: f32,
 
