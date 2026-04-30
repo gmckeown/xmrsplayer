@@ -51,19 +51,17 @@
 ///
 /// `left` and `right` are the **pre-gain** summed mix — what comes out of
 /// the channel mixer before `global_volume * amplification` is applied.
-/// An observer wanting the post-gain version computes
-/// `left * global_volume * amplification` itself; one that wants the pre-
-/// gain signal (e.g. a loudness analyzer that shouldn't be influenced by
-/// the user's volume slider) uses `left` and `right` directly.
+/// Sample values are signed 16-bit PCM. An observer wanting the post-gain
+/// version applies `global_volume`/`amplification` itself in Q-format.
 pub struct MixContext {
-    pub left: f32,
-    pub right: f32,
-    /// Current `global_volume` (song-driven, 0.0..=1.0). Normally moves
-    /// only when a `GlobalEffect::Volume` / `VolumeSlide` fires.
-    pub global_volume: f32,
-    /// Current `amplification` (user-driven, unbounded). Changes only
-    /// when `XmrsPlayer::set_amplification` is called.
-    pub amplification: f32,
+    pub left: i16,
+    pub right: i16,
+    /// Current `global_volume` Q1.15 (song-driven, 0.0..=1.0).
+    /// Moves when a `GlobalEffect::Volume` / `VolumeSlide` fires.
+    pub global_volume: xmrs::fixed::units::Volume,
+    /// Current `amplification` Q4.12 (user-driven, up to 8×).
+    /// Changes only when `XmrsPlayer::set_amplification` is called.
+    pub amplification: xmrs::fixed::units::Amplification,
 }
 
 /// Context passed to [`ChannelsObserver::on_channels`].
@@ -72,15 +70,11 @@ pub struct MixContext {
 /// channel, captured *during* the mix loop — so each entry already has
 /// the channel's `actual_volume` / mute state applied, but **not** the
 /// global gain. Sum of all pairs equals the pre-gain stereo mix reported
-/// to [`MixObserver`].
-///
-/// The slice is valid only for the duration of the call; do not retain
-/// references to it. If you need to keep the data, copy what you need
-/// (each entry is a `(f32, f32)` — trivial to clone).
+/// to [`MixObserver`]. Sample values are signed 16-bit PCM.
 pub struct ChannelsContext<'a> {
-    pub channels: &'a [(f32, f32)],
-    pub global_volume: f32,
-    pub amplification: f32,
+    pub channels: &'a [(i16, i16)],
+    pub global_volume: xmrs::fixed::units::Volume,
+    pub amplification: xmrs::fixed::units::Amplification,
 }
 
 /// Subscriber to the final (summed, stereo) audio mix, pre-gain.

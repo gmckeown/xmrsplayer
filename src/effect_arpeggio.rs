@@ -1,10 +1,14 @@
-use crate::effect::EffectPlugin;
 use core::default::Default;
+use xmrs::fixed::units::PitchDelta;
 
 #[derive(Clone, Default)]
 pub struct Arpeggio {
-    offset1: f32,
-    offset2: f32,
+    /// Half1 / half2 offsets in semitones (integer). XM/MOD/IT/S3M
+    /// arpeggio nibbles are always integer semitone counts (`0..15`),
+    /// so `i16` is enough and lets the runtime stay Q-format down to
+    /// the [`PitchDelta`] return.
+    offset1: i16,
+    offset2: i16,
 }
 
 /// Per-channel arpeggio state + FT2 historical LUT.
@@ -41,6 +45,53 @@ impl EffectArpeggio {
 
     pub fn set_tempo(&mut self, tempo: usize) {
         self.tempo = tempo;
+    }
+
+    /// Latch row-time arpeggio offsets and reset the LFO.
+    pub fn tick0_semitones(&mut self, half1: usize, half2: usize) {
+        self.data.offset1 = half1.min(i16::MAX as usize) as i16;
+        self.data.offset2 = half2.min(i16::MAX as usize) as i16;
+        self.retrigger();
+    }
+
+    /// Current arpeggio offset as a [`PitchDelta`] (semitones,
+    /// Q8.8). The pitch chain consumes this directly.
+    pub fn value_pitch_delta(&self) -> PitchDelta {
+        let semitones = self.current_semitones();
+        PitchDelta::from_q8_8_i16(semitones.saturating_mul(256))
+    }
+
+    /// Whether an arpeggio has been triggered and not yet
+    /// consumed back to the base pitch.
+    pub fn in_progress(&self) -> bool {
+        self.in_progress
+    }
+
+    /// Advance the LFO by one tick.
+    pub fn tick(&mut self) {
+        self.in_progress = true;
+        self.tick += 1;
+    }
+
+    /// Reset to tick 0.
+    pub fn retrigger(&mut self) {
+        self.tick = 0;
+        self.in_progress = false;
+    }
+
+    fn current_semitones(&self) -> i16 {
+        let idx = if self.use_ft2_lut {
+            Self::ft2_arpeggio_index(self.tick, self.tempo)
+        } else {
+            // Protracker / ST3 / IT all use the simple three-step
+            // rotation with no LUT quirks.
+            self.tick % 3
+        };
+        match idx {
+            1 => self.data.offset1,
+            2 => self.data.offset2,
+            _ => 0,
+        }
     }
 
     /// FT2 historical arpeggio lookup.
@@ -82,45 +133,6 @@ impl EffectArpeggio {
             | 168 | 171 | 174 | 177 | 180 | 183 | 186 | 189 | 192 | 195 | 198 | 201 | 204 | 207
             | 210 | 216 | 219 | 222 | 225 | 228 | 231 | 234 | 237 | 240 | 243 => 0,
             _ => 2,
-        }
-    }
-}
-
-impl EffectPlugin for EffectArpeggio {
-    fn tick0(&mut self, param1: f32, param2: f32) -> f32 {
-        self.data.offset1 = param1;
-        self.data.offset2 = param2;
-        self.retrigger()
-    }
-
-    fn tick(&mut self) -> f32 {
-        self.in_progress = true;
-        self.tick += 1;
-        self.value()
-    }
-
-    fn in_progress(&self) -> bool {
-        self.in_progress
-    }
-
-    fn retrigger(&mut self) -> f32 {
-        self.tick = 0;
-        self.in_progress = false;
-        self.value()
-    }
-
-    fn value(&self) -> f32 {
-        let idx = if self.use_ft2_lut {
-            Self::ft2_arpeggio_index(self.tick, self.tempo)
-        } else {
-            // Protracker / ST3 / IT all use the simple three-step
-            // rotation with no LUT quirks.
-            self.tick % 3
-        };
-        match idx {
-            1 => self.data.offset1,
-            2 => self.data.offset2,
-            _ => 0.0,
         }
     }
 }

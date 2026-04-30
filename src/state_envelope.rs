@@ -1,18 +1,23 @@
 /// An Instrument Envelope State
+use xmrs::fixed::units::EnvValue;
 use xmrs::prelude::*;
 
 #[derive(Clone)]
 pub struct StateEnvelope<'a> {
     env: &'a Envelope,
-    default_value: f32,
+    default_value: EnvValue,
     pub enabled: bool,
-    pub value: f32,
+    pub value: EnvValue,
     pub counter: usize,
 }
 
 impl<'a> StateEnvelope<'a> {
-    // value is volume_envelope_volume=1.0 or volume_envelope_panning=0.5
-    pub fn new(env: &'a Envelope, default_value: f32) -> Self {
+    /// `default_value` is what the envelope sits at when there
+    /// are no points (or before the first point fires). Volume
+    /// envelopes pass [`EnvValue::VOLUME_DEFAULT`] (≈ 1.0),
+    /// panning / pitch envelopes pass [`EnvValue::PAN_DEFAULT`]
+    /// (= 0.5 = centre / no pitch deviation).
+    pub fn new(env: &'a Envelope, default_value: EnvValue) -> Self {
         let enabled = env.enabled;
         Self {
             env,
@@ -57,12 +62,16 @@ impl<'a> StateEnvelope<'a> {
         let num_points = self.env.point.len();
 
         if num_points == 0 {
-            self.value = 0.0;
+            self.value = EnvValue::default();
             return;
         }
 
         if num_points == 1 {
-            self.value = self.env.point[0].value.min(1.0);
+            // The previous code did `.min(1.0)` here as a
+            // defensive cap. With Q1.15 storage the value
+            // cannot exceed `Q15::ONE` by construction, so the
+            // cap is no longer necessary.
+            self.value = self.env.point[0].value;
             return;
         }
 
@@ -114,8 +123,16 @@ mod tests {
     use super::*;
     use alloc::vec;
     use alloc::vec::Vec;
+    use xmrs::fixed::fixed::Q15;
 
-    fn make_envelope(points: Vec<(usize, f32)>) -> Envelope {
+    /// Helper: build an `EnvValue` from an integer ratio so tests
+    /// stay readable. `ev(0, 1)` = 0.0, `ev(1, 1)` = 1.0,
+    /// `ev(3, 10)` = 0.3, etc.
+    fn ev(num: i32, den: i32) -> EnvValue {
+        EnvValue::from_q15(Q15::from_ratio(num, den))
+    }
+
+    fn make_envelope(points: Vec<(usize, EnvValue)>) -> Envelope {
         Envelope {
             enabled: true,
             point: points
@@ -130,26 +147,26 @@ mod tests {
     fn envelope_clamps_to_last_point_when_counter_exceeds_end() {
         // Non-looping envelope that decays to zero: after the last point,
         // tick() must return the last value (0.0), not the default 1.0.
-        let env = make_envelope(vec![(0, 1.0), (10, 0.5), (20, 0.0)]);
-        let mut state = StateEnvelope::new(&env, 1.0);
+        let env = make_envelope(vec![(0, ev(1, 1)), (10, ev(1, 2)), (20, ev(0, 1))]);
+        let mut state = StateEnvelope::new(&env, EnvValue::VOLUME_DEFAULT);
         state.counter = 50; // well past the final point
         state.tick(false);
-        assert_eq!(state.value, 0.0, "should clamp to last point value");
+        assert_eq!(state.value, ev(0, 1), "should clamp to last point value");
     }
 
     #[test]
     fn envelope_clamps_to_last_point_nonzero_tail() {
         // Envelope that ends at a non-zero value: the held value must be
-        // that of the last point, not the default.
-        let env = make_envelope(vec![(0, 0.0), (10, 0.3)]);
-        let mut state = StateEnvelope::new(&env, 1.0);
+        // that of the last point, not the default. Q1.15 quantisation
+        // means a small drift around the target is expected; we tolerate
+        // a few raw LSBs (≪ 1 dB).
+        let env = make_envelope(vec![(0, ev(0, 1)), (10, ev(3, 10))]);
+        let mut state = StateEnvelope::new(&env, EnvValue::VOLUME_DEFAULT);
         state.counter = 100;
         state.tick(false);
-        assert!(
-            (state.value - 0.3).abs() < 1e-6,
-            "expected 0.3, got {}",
-            state.value
-        );
+        let target = ev(3, 10);
+        let drift = (state.value.raw_q15().raw() - target.raw_q15().raw()).abs();
+        assert!(drift <= 4, "expected ≈ 0.3, drift {} LSB", drift);
     }
 
     #[test]
@@ -157,25 +174,23 @@ mod tests {
         // Repro for the InstrumentVolumeEnvelopePosition case: if L command
         // sets counter beyond the last point, the value must reflect the
         // last point, not the default (1.0).
-        let env = make_envelope(vec![(0, 1.0), (50, 0.0)]);
-        let mut state = StateEnvelope::new(&env, 1.0);
+        let env = make_envelope(vec![(0, ev(1, 1)), (50, ev(0, 1))]);
+        let mut state = StateEnvelope::new(&env, EnvValue::VOLUME_DEFAULT);
         // Simulate setting the counter past the tail
         state.counter = 999;
         state.tick(false);
-        assert_eq!(state.value, 0.0);
+        assert_eq!(state.value, ev(0, 1));
     }
 
     #[test]
     fn envelope_counter_at_last_point_exactly() {
         // Exactly at the last point frame: value should be the last point.
-        let env = make_envelope(vec![(0, 1.0), (10, 0.5), (20, 0.25)]);
-        let mut state = StateEnvelope::new(&env, 1.0);
+        let env = make_envelope(vec![(0, ev(1, 1)), (10, ev(1, 2)), (20, ev(1, 4))]);
+        let mut state = StateEnvelope::new(&env, EnvValue::VOLUME_DEFAULT);
         state.counter = 20;
         state.tick(false);
-        assert!(
-            (state.value - 0.25).abs() < 1e-6,
-            "expected 0.25, got {}",
-            state.value
-        );
+        let target = ev(1, 4);
+        let drift = (state.value.raw_q15().raw() - target.raw_q15().raw()).abs();
+        assert!(drift <= 4, "expected ≈ 0.25, drift {} LSB", drift);
     }
 }

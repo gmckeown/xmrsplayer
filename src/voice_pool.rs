@@ -284,7 +284,7 @@ impl<'a> VoicePool<'a> {
     /// one-shot tails) — same heuristic as schism's
     /// `if (CHN_LOOP) v >>= 1`.
     fn find_evictable_victim(&self) -> Option<usize> {
-        let mut best: Option<(usize, f32)> = None;
+        let mut best: Option<(usize, i32)> = None;
         for (i, slot) in self.slots.iter().enumerate() {
             let SlotState::Occupied(v) = &slot.state else {
                 continue;
@@ -319,7 +319,7 @@ impl<'a> VoicePool<'a> {
         // Fallback: every voice is sustained and audible. Pick the
         // lowest-scoring one anyway — better to lose one NNA tail
         // than to drop the live note from the pattern.
-        let mut best: Option<(usize, f32)> = None;
+        let mut best: Option<(usize, i32)> = None;
         for (i, slot) in self.slots.iter().enumerate() {
             let SlotState::Occupied(v) = &slot.state else {
                 continue;
@@ -362,30 +362,33 @@ impl<'a> VoicePool<'a> {
     /// ghost voices snapshot their channel-side gain at fork time;
     /// the channel can no longer modulate them, so the frozen value
     /// is the right "channel volume" to multiply.
-    fn eviction_score(&self, v: &Voice<'a>) -> f32 {
-        // `instr.volume` is the per-voice channel volume (Vxx column,
-        // post-effects). It corresponds to schism's `pj->volume`,
-        // the single register read at `effects.c:1646`. The
-        // envelope value and the instrument's static global
-        // volume are deliberately not folded in: see the doc
-        // comment for the rationale.
-        let mut score = if v.instr.sustained {
-            // Sustained: protect with a large constant. This branch
-            // is reached only from `find_eviction_victim`'s sustained-
-            // fallback (when allocate_live has to pre-empt anyway);
-            // `find_evictable_victim` already filters sustained
-            // voices out before scoring.
-            v.instr.volume * 1024.0
+    fn eviction_score(&self, v: &Voice<'a>) -> i32 {
+        // Pure Q-format ranking. We don't need an absolute
+        // magnitude, just a consistent ordering — so the score
+        // stays in `i32` and callers compare with `<`.
+        //
+        // Scale-equivalent of the OLD f32 formula:
+        //   sustained:    vol × 1024       → `vol_q15 << 10`
+        //   unsustained:  vol × fadeout    → `(vol_q15 × fadeout_q15) >> 15`
+        //   looping:      score × 0.5      → `>> 1`
+        //
+        // Sustained range: `[0, 32767 × 1024 ≈ 3.4 × 10⁷]`
+        // Unsustained range: `[0, 32767]`
+        // Sustained always outranks unsustained at equal `vol` —
+        // matches the OLD f32 ordering.
+        let v_q15 = v.instr.volume.as_q15_i32();
+        let mut score: i32 = if v.instr.sustained {
+            v_q15 << 10
         } else {
-            // Unsustained: rank by remaining fadeout × channel volume.
-            v.instr.volume * v.instr.volume_fadeout
+            let f_q15 = v.instr.volume_fadeout.as_q15_i32();
+            (v_q15 * f_q15) >> 15
         };
         if v.instr
             .state_sample
             .as_ref()
             .is_some_and(|s| s.is_looping())
         {
-            score *= 0.5;
+            score >>= 1;
         }
         score
     }
@@ -501,6 +504,7 @@ mod tests {
     use crate::state_instr_default::StateInstrDefault;
     use alloc::boxed::Box;
     use alloc::vec::Vec;
+    use xmrs::fixed::units::{ChannelVolume, EnvValue, Panning, Volume};
     use xmrs::prelude::*;
 
     /// Minimal helper to build a fake `Voice`. The internals don't
@@ -511,8 +515,8 @@ mod tests {
         // of the test process. Acceptable in #[cfg(test)] only.
         let instr: &'static InstrDefault = Box::leak(Box::new(InstrDefault::default()));
         let ph = PeriodHelper::new(FrequencyType::LinearFrequencies, false);
-        let state = StateInstrDefault::new(instr, 0, ph, 44100.0);
-        Voice::new_ghost(state, 0, 1.0, 1.0, 0.5, None, None, 0.0)
+        let state = StateInstrDefault::new(instr, 0, ph, SampleRate::from_hz(44100));
+        Voice::new_ghost(state, 0, Volume::FULL, ChannelVolume::FULL, Panning::CENTER, None, None, Period::ZERO)
     }
 
     #[test]
@@ -554,24 +558,24 @@ mod tests {
         // the voice with the lowest audible volume rather than failing.
         // We build voices with deliberately different `volume` values
         // so the eviction heuristic has a clear loser.
-        let make_voice = |vol: f32| -> Voice<'static> {
+        let make_voice = |vol: Volume| -> Voice<'static> {
             let instr: &'static InstrDefault = Box::leak(Box::new(InstrDefault::default()));
             let ph = PeriodHelper::new(FrequencyType::LinearFrequencies, false);
-            let mut state = StateInstrDefault::new(instr, 0, ph, 44100.0);
+            let mut state = StateInstrDefault::new(instr, 0, ph, SampleRate::from_hz(44100));
             // `state.volume` is the per-voice scalar that flows into
             // `get_volume()` and from there into the pool's score.
             state.volume = vol;
-            Voice::new_ghost(state, 0, 1.0, 1.0, 0.5, None, None, 0.0)
+            Voice::new_ghost(state, 0, Volume::FULL, ChannelVolume::FULL, Panning::CENTER, None, None, Period::ZERO)
         };
 
         let mut pool = VoicePool::new(2);
-        let _loud = pool.allocate_live(make_voice(1.0));
-        let quiet = pool.allocate_live(make_voice(0.05));
+        let _loud = pool.allocate_live(make_voice(Volume::FULL));
+        let quiet = pool.allocate_live(make_voice(Volume::from_ratio(5, 100)));
         assert!(pool.is_full());
 
         // Allocating a third voice on a full pool steals the
         // quietest occupant. Its handle is now stale.
-        let _new = pool.allocate_live(make_voice(0.5));
+        let _new = pool.allocate_live(make_voice(Volume::from_ratio(50, 100)));
         assert_eq!(pool.allocated_count(), 2);
         assert!(
             pool.get(quiet).is_none(),
@@ -666,17 +670,17 @@ mod tests {
     }
 
     /// Helper: a voice that's still sustained (audible NNA tail).
-    fn sustained_voice(vol: f32) -> Voice<'static> {
+    fn sustained_voice(vol: Volume) -> Voice<'static> {
         let instr: &'static InstrDefault = Box::leak(Box::new(InstrDefault::default()));
         let ph = PeriodHelper::new(FrequencyType::LinearFrequencies, false);
-        let mut state = StateInstrDefault::new(instr, 0, ph, 44100.0);
+        let mut state = StateInstrDefault::new(instr, 0, ph, SampleRate::from_hz(44100));
         state.volume = vol;
         // sustained=true is the default. Don't call key_off.
-        Voice::new_ghost(state, 0, 1.0, 1.0, 0.5, None, None, 0.0)
+        Voice::new_ghost(state, 0, Volume::FULL, ChannelVolume::FULL, Panning::CENTER, None, None, Period::ZERO)
     }
 
     /// Helper: a voice that's already in fadeout (evictable).
-    fn fading_voice(vol: f32) -> Voice<'static> {
+    fn fading_voice(vol: Volume) -> Voice<'static> {
         let mut v = sustained_voice(vol);
         v.instr.sustained = false;
         v
@@ -689,10 +693,10 @@ mod tests {
         // that: a ghost allocation on a pool full of sustained
         // voices must return None instead of stealing.
         let mut pool = VoicePool::new(2);
-        let _a = pool.allocate_live(sustained_voice(1.0));
-        let _b = pool.allocate_live(sustained_voice(1.0));
+        let _a = pool.allocate_live(sustained_voice(Volume::FULL));
+        let _b = pool.allocate_live(sustained_voice(Volume::FULL));
         assert!(pool.is_full());
-        let result = pool.allocate_ghost(sustained_voice(1.0));
+        let result = pool.allocate_ghost(sustained_voice(Volume::FULL));
         assert!(result.is_none(), "ghost allocation must be refused");
         // Pool unchanged.
         assert_eq!(pool.allocated_count(), 2);
@@ -703,10 +707,10 @@ mod tests {
         // Mixed pool: one sustained, one fading. The fading one is
         // the only evictable victim; ghost allocation should pick it.
         let mut pool = VoicePool::new(2);
-        let sustained = pool.allocate_live(sustained_voice(1.0));
-        let fading = pool.allocate_live(fading_voice(0.5));
+        let sustained = pool.allocate_live(sustained_voice(Volume::FULL));
+        let fading = pool.allocate_live(fading_voice(Volume::from_ratio(50, 100)));
         let new_id = pool
-            .allocate_ghost(sustained_voice(1.0))
+            .allocate_ghost(sustained_voice(Volume::FULL))
             .expect("an evictable voice was available");
         // The fading voice was the victim; its handle is stale,
         // the sustained voice survives.
@@ -724,10 +728,10 @@ mod tests {
         // note, the player has to play it. Pool of two sustained
         // voices, allocate_live evicts one of them anyway.
         let mut pool = VoicePool::new(2);
-        let a = pool.allocate_live(sustained_voice(0.5));
-        let b = pool.allocate_live(sustained_voice(1.0));
+        let a = pool.allocate_live(sustained_voice(Volume::from_ratio(50, 100)));
+        let b = pool.allocate_live(sustained_voice(Volume::FULL));
         assert!(pool.is_full());
-        let new_id = pool.allocate_live(sustained_voice(1.0));
+        let new_id = pool.allocate_live(sustained_voice(Volume::FULL));
         // The lower-volume sustained voice (`a`) is evicted; the
         // louder one (`b`) survives.
         assert!(pool.get(a).is_none(), "lower-vol sustained voice evicted");
@@ -762,12 +766,12 @@ mod tests {
         // sustained voice on a transient envelope-zero would become
         // evictable and get reaped to make room for a new ghost.
         let mut pool = VoicePool::new(2);
-        let full = pool.allocate_live(sustained_voice(1.0));
-        let mut silent = sustained_voice(1.0);
-        silent.instr.envelope_volume.value = 0.0;
+        let full = pool.allocate_live(sustained_voice(Volume::FULL));
+        let mut silent = sustained_voice(Volume::FULL);
+        silent.instr.envelope_volume.value = EnvValue::default();
         let silent_id = pool.allocate_live(silent);
         assert!(pool.is_full());
-        let result = pool.allocate_ghost(sustained_voice(1.0));
+        let result = pool.allocate_ghost(sustained_voice(Volume::FULL));
         assert!(
             result.is_none(),
             "ghost must be refused — both sustained voices are protected, \

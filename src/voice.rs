@@ -12,16 +12,9 @@
 //! pan / channel-volume captured at detach time). Voices self-
 //! terminate when their envelope × fadeout product reaches silence.
 
-// Float math backend (only needed when `std` is disabled).
-// Priority: std > libm > micromath.
-#[cfg(all(not(feature = "std"), not(feature = "libm"), feature = "micromath"))]
-#[allow(unused_imports)]
-use micromath::F32Ext;
-#[cfg(all(not(feature = "std"), feature = "libm"))]
-#[allow(unused_imports)]
-use num_traits::float::Float;
-
 use crate::state_instr_default::StateInstrDefault;
+use xmrs::fixed::fixed::Q15;
+use xmrs::fixed::units::{Amp, ChannelVolume, Panning, Period, PitchDelta, Volume};
 use xmrs::prelude::Pitch;
 
 // (1.5) The former `MAX_GHOST_VOICES_PER_CHANNEL` cap has been
@@ -46,12 +39,12 @@ pub(crate) struct Voice<'a> {
     /// the ghost's amplitude only changes through its envelope /
     /// fadeout, which is exactly what IT's "the note runs to its
     /// envelope end on its own" model calls for.
-    pub vol_frozen: f32,
+    pub vol_frozen: Volume,
     /// Channel-level `self.channel_volume` at the moment of
     /// detachment. Same rationale as `vol_frozen`.
-    pub channel_volume_frozen: f32,
+    pub channel_volume_frozen: ChannelVolume,
     /// Panning at the moment of detachment.
-    pub panning_frozen: f32,
+    pub panning_frozen: Panning,
 
     /// The note (integer semitone, ignoring finetune) this voice
     /// was triggered on. Used by DCT::Note matching. `None` when
@@ -71,7 +64,7 @@ pub(crate) struct Voice<'a> {
     /// envelope's live channel has moved on. Without this,
     /// envelope-driven pitch drift stops at the moment the voice
     /// becomes a ghost.
-    pub period_at_fork: f32,
+    pub period_at_fork: Period,
 
     /// The track that engendered this voice. Used by past-note
     /// effects (S7x) and DCT matching to find voices belonging to
@@ -92,12 +85,12 @@ impl<'a> Voice<'a> {
     pub fn new_live(instr: StateInstrDefault<'a>, master_track: usize) -> Self {
         Self {
             instr,
-            vol_frozen: 1.0,
-            channel_volume_frozen: 1.0,
-            panning_frozen: 0.5,
+            vol_frozen: Volume::FULL,
+            channel_volume_frozen: ChannelVolume::FULL,
+            panning_frozen: Panning::CENTER,
             note: None,
             sample_num: None,
-            period_at_fork: 0.0,
+            period_at_fork: Period::ZERO,
             master_track: Some(master_track),
         }
     }
@@ -127,12 +120,12 @@ impl<'a> Voice<'a> {
     pub fn new_ghost(
         instr: StateInstrDefault<'a>,
         master_track: usize,
-        vol_frozen: f32,
-        channel_volume_frozen: f32,
-        panning_frozen: f32,
+        vol_frozen: Volume,
+        channel_volume_frozen: ChannelVolume,
+        panning_frozen: Panning,
         note: Option<Pitch>,
         sample_num: Option<usize>,
-        period_at_fork: f32,
+        period_at_fork: Period,
     ) -> Self {
         Self {
             instr,
@@ -207,7 +200,7 @@ impl<'a> Voice<'a> {
     pub fn past_cut(&mut self) {
         self.instr.cut_pitch();
         self.instr.volume_fading_out = true;
-        self.instr.volume_fadeout = 0.0;
+        self.instr.volume_fadeout = Volume::SILENT;
     }
 
     /// S7x past-note: key-off (release envelope).
@@ -240,8 +233,12 @@ impl<'a> Voice<'a> {
         // voice, not to detached ghosts — those stop at detachment.
         // Pitch envelope is folded in by `update_frequency` itself
         // via `get_pitch_envelope_offset_semitones`.
-        self.instr
-            .update_frequency(self.period_at_fork, 0.0, 0.0, false);
+        self.instr.update_frequency(
+            self.period_at_fork,
+            PitchDelta::ZERO,
+            PitchDelta::ZERO,
+            false,
+        );
     }
 
     /// `true` while the voice still owns its pool slot. A voice is
@@ -282,7 +279,7 @@ impl<'a> Voice<'a> {
         // fadeout register to zero are dead. Everything else — held
         // sustain, in-release with no fade armed yet, mid-fade —
         // stays alive.
-        !(self.instr.volume_fading_out && self.instr.volume_fadeout <= 0.0)
+        !(self.instr.volume_fading_out && self.instr.volume_fadeout.raw() == Q15::ZERO)
     }
 
     /// Produce one stereo sample. Mirrors the gain formula used in
@@ -290,49 +287,29 @@ impl<'a> Voice<'a> {
     /// frozen pattern-side gains. Returns `None` when the underlying
     /// sample has reached end-of-stream OR when the voice is silent
     /// and awaiting reap.
-    pub fn next(&mut self) -> Option<(f32, f32)> {
+    pub fn next(&mut self) -> Option<(Amp, Amp)> {
         if !self.instr.is_enabled() {
             return None;
         }
-        // Voice is silent and awaiting reap by `tick_ghosts` — its
-        // fadeout register has reached zero. Skipping the sample /
-        // filter / lerp work is safe because any output would be
-        // multiplied by `instr.get_volume() == 0` below.
-        //
-        // This is the per-sample equivalent of schism's check at
-        // `sndmix.c:1112-1118`:
-        //
-        // ```c
-        // if ((chan->flags & CHN_NOTEFADE) &&
-        //     !(chan->fadeout_volume | chan->right_volume | chan->left_volume))
-        //     chan->length = 0;
-        // ```
-        //
-        // Returning `None` here also propagates "no contribution" up
-        // through `Channel::next_sample` (`any` stays unset), which
-        // matches schism's `chan->length = 0; continue;` semantics.
-        // Without this gate the gap between `past_cut` and the next
-        // tick_ghosts reap (~3 ms at the default tempo) was paid in
-        // full per ghost — small per voice but quadratic in the size
-        // of a fading "tail" cluster.
-        if self.instr.volume_fading_out && self.instr.volume_fadeout <= 0.0 {
+        if self.instr.volume_fading_out && self.instr.volume_fadeout.raw() == Q15::ZERO {
             return None;
         }
-        // Mirror the live-channel formula:
-        //   v = volume * instr.get_volume() * channel_volume
-        //   actual_left  = v * (1 - panning)
-        //   actual_right = v * panning
-        // with the channel-side terms (`volume`, `channel_volume`,
-        // `panning`) captured at detachment time. `instr.get_volume()`
-        // continues to evolve because that's the fadeout / envelope
-        // side of the gain — which IS what should still be moving on
-        // a ghost voice.
-        let v = self.vol_frozen * self.instr.get_volume() * self.channel_volume_frozen;
-        let v = v.clamp(0.0, 1.0);
-        let l_gain = v * (1.0 - self.panning_frozen);
-        let r_gain = v * self.panning_frozen;
+        // Pure Q-format gain chain. Three saturating Q1.15
+        // mults compose `vol_frozen × channel_volume_frozen ×
+        // instr.get_volume()`, then a final stereo split by
+        // `panning_frozen`.
+        let v_q = self
+            .channel_volume_frozen
+            .applied_to(self.vol_frozen)
+            .scaled_by(self.instr.get_volume());
 
-        self.instr.next().map(|(l, r)| (l * l_gain, r * r_gain))
+        let (pan_left, pan_right) = self.panning_frozen.stereo_split_linear();
+        let l_gain = v_q.scaled_by(pan_left);
+        let r_gain = v_q.scaled_by(pan_right);
+
+        self.instr
+            .next()
+            .map(|(l, r)| (l_gain.apply(l), r_gain.apply(r)))
     }
 }
 
@@ -350,8 +327,8 @@ mod tests {
     fn fresh_ghost() -> Voice<'static> {
         let instr: &'static InstrDefault = Box::leak(Box::new(InstrDefault::default()));
         let ph = PeriodHelper::new(FrequencyType::LinearFrequencies, false);
-        let state = StateInstrDefault::new(instr, 0, ph, 44100.0);
-        Voice::new_ghost(state, 0, 1.0, 1.0, 0.5, None, None, 0.0)
+        let state = StateInstrDefault::new(instr, 0, ph, SampleRate::from_hz(44100));
+        Voice::new_ghost(state, 0, Volume::FULL, ChannelVolume::FULL, Panning::CENTER, None, None, Period::ZERO)
     }
 
     #[test]
@@ -370,18 +347,19 @@ mod tests {
         // over the course of a song.
         let mut v = fresh_ghost();
         assert!(!v.instr.volume_fading_out);
-        assert_eq!(v.instr.volume_fadeout, 1.0);
-        assert_eq!(v.instr.volume, 1.0);
+        assert_eq!(v.instr.volume_fadeout, Volume::FULL);
+        assert_eq!(v.instr.volume, Volume::FULL);
 
         v.past_cut();
 
-        assert_eq!(v.instr.volume, 0.0, "instrument volume zeroed");
+        assert_eq!(v.instr.volume, Volume::SILENT, "instrument volume zeroed");
         assert!(
             v.instr.volume_fading_out,
             "fadeout flag engaged (= CHN_NOTEFADE)"
         );
         assert_eq!(
-            v.instr.volume_fadeout, 0.0,
+            v.instr.volume_fadeout,
+            Volume::SILENT,
             "fadeout register zeroed (= fadeout_volume = 0)"
         );
     }

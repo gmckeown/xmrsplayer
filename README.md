@@ -73,12 +73,13 @@ The player also exposes a subscription API — hook into row/tick changes with `
 
 | Feature      | Effect                                                                                            |
 | ------------ | ------------------------------------------------------------------------------------------------- |
-| `std`        | Enable the standard library and use `f32`'s inherent methods for float math. Forwarded to `xmrs`. |
-| `libm`       | `no_std` float backend via `num-traits` + `libm`.                                                 |
-| `micromath`  | `no_std` float backend via `micromath` (smaller, slightly less precise).                          |
+| `std`        | Enable the standard library and forward `std` + `float-helpers` to `xmrs`. The latter exposes `f32 ↔ Q` conversions on every fixed-point type, which desktop editors / GUIs use for level-meters and numeric inputs. Embedded users skip both with `default-features = false`. |
 | `demo`       | Everything needed to build the example CLI players: pulls in `std`, `import`, `clap`, `console`, `cpal`, `hound`, `rodio`. |
 
-When `std` is disabled you **must** pick exactly one of `libm` or `micromath`; otherwise the crate emits a `compile_error!`.
+The whole gain / pitch / LFO / filter / sample chain is integer
+Q-format, end-to-end. No `libm`, no `micromath`, no `num-traits`. The
+crate compiles `no_std` out of the box without picking a math
+backend — there's nothing to pick.
 
 ### Format importers (propagated to `xmrs`)
 
@@ -94,11 +95,11 @@ When `std` is disabled you **must** pick exactly one of `libm` or `micromath`; o
 Build examples:
 
 ```sh
-# Tiny no_std build, XM only, libm backend
-cargo build --no-default-features --features "libm import_xm" --release
+# Tiny no_std build, XM only
+cargo build --no-default-features --features "import_xm" --release
 
-# no_std with micromath instead
-cargo build --no-default-features --features "micromath import_xm" --release
+# Embedded build with multiple importers
+cargo build --no-default-features --features "import_mod import_xm" --release
 
 # Desktop build (default)
 cargo build --release
@@ -140,6 +141,7 @@ Interactive keys while playing: `Space` to pause, `←`/`→` to move, `Enter`/`
 
 - **Safety first.** Both this crate and its dependency `xmrs` are `#![forbid(unsafe_code)]`.
 - **Dependencies are lean**, and gated behind features — this matters not only for embedded.
+- **Concert pitch by default.** Notes resolve to MIDI-aligned frequencies (A-4 = 440 Hz exactly), so tracker output mixes cleanly with any 440-Hz-aligned source. The legacy FT2 / ProTracker reference values (≈ −2 cents in linear mode, ≈ +17 cents in Amiga mode) are still available in `xmrs::fixed::tables` for bit-numerical comparison against reference players.
 - **FT2/XM quirks are format-driven.** Setting `module.format = ModuleFormat::Xm` activates the canonical FT2 reference behaviour (arpeggio LUT, `E60` pattern-loop bug, arpeggio period clamp, portamento-down signed-overflow, `K00`-eats-note, vol-col `Bx` advancing vibrato). There is no separate `ft2_quirks` flag — the format *is* the switch.
 - **Embedded-friendly.** The code should be progressively degradable to older processors through successive optimizations, and it would be a lot of fun to see what LLVM can do with it on float-less architectures like the [Z80](https://github.com/jacobly0/llvm-project), the [MOS 6502 family](https://github.com/llvm-mos/llvm-mos), or on the 68k target.
 

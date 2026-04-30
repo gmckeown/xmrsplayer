@@ -158,16 +158,26 @@ fn play_music(
         .default_output_config()
         .expect("failed to get default output config");
     let sample_rate = config.sample_rate();
+    // `cpal::StreamConfig::sample_rate()` already yields a
+    // primitive `u32` Hz value in this cpal version — pass it
+    // straight through to the (now Q-typed) player ctor.
+    let sample_rate_hz: u32 = sample_rate;
 
     let player = Arc::new(Mutex::new(XmrsPlayer::new(
         module,
-        sample_rate as f32,
+        sample_rate_hz,
         song,
     )));
 
     {
         let mut player_lock = player.lock().unwrap();
-        player_lock.set_amplification(amplification);
+        // Q4.12 Q-format amplification — convert the f32 CLI
+        // arg at the boundary.
+        player_lock.set_amplification(Amplification::from_raw_q4_12(
+            ((amplification * 4096.0)
+                .round()
+                .clamp(i16::MIN as f32, i16::MAX as f32)) as i16,
+        ));
         if debug {
             println!("Debug on");
             println!("Module format: {:?}", module.profile.format);
@@ -193,9 +203,15 @@ fn play_music(
                 &config.config(),
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let mut player_lock = player_clone.lock().unwrap();
+                    // The player produces `i16` PCM (full
+                    // ±32767 range). cpal in this stream
+                    // configuration wants `f32` in [-1, 1] —
+                    // convert at the demo boundary.
                     data.iter_mut()
                         .zip(player_lock.by_ref()) // itère sur les deux en parallèle
-                        .for_each(|(sample, value)| *sample = value);
+                        .for_each(|(sample, value)| {
+                            *sample = value as f32 / i16::MAX as f32;
+                        });
                 },
                 |_: cpal::StreamError| {},
                 None,
@@ -300,8 +316,9 @@ fn write_wave(
     let mut player_lock = player_clone.lock().unwrap();
 
     for sample in player_lock.by_ref() {
-        let sample_i16 = (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16;
-        writer.write_sample(sample_i16)?;
+        // Player iterator yields `i16` directly — write straight
+        // to the wav file with no float round-trip.
+        writer.write_sample(sample)?;
     }
 
     writer.finalize()?;

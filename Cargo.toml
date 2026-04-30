@@ -1,6 +1,6 @@
 [package]
 name = "xmrsplayer"
-version = "0.10.3"
+version = "0.11.0"
 edition = "2021"
 description = "XMrsPlayer is a safe no-std soundtracker music player"
 authors = ["Sebastien Bechet"]
@@ -22,14 +22,11 @@ autoexamples = false
 [dependencies]
 # `xmrs` is pulled in without default features; the `std` feature (on by
 # default here) re-enables it below.
-xmrs = { version = "0.10.3", default-features = false }
+xmrs = { path = "0.11.0", default-features = false }
 clap = { version = "4.5", optional = true, features = ["cargo", "derive"] }
 rodio = { version = "0.22", optional = true, features = ["playback"] }
 console = { version = "0.16", optional = true }
 cpal = { version = "0.17", optional = true }
-# Float math backends for `no_std` builds (ignored when `std` is enabled).
-num-traits = { version = "0.2", default-features = false, optional = true } # libm wrapper
-micromath = { version = "2.1", optional = true }
 hound = { version = "3.5", optional = true }
 
 [features]
@@ -40,10 +37,16 @@ hound = { version = "3.5", optional = true }
 # they need.
 default = ["std", "import"]
 
-# Enable the standard library. Forwarded to `xmrs`. When on, `f32`'s
-# inherent methods are used for float math and no extra math
-# dependency is pulled in.
-std = ["xmrs/std"]
+# Enable the standard library. Forwarded to `xmrs`. The crate
+# compiles fully `no_std` without any extra math backend — the
+# entire gain / pitch / LFO / filter chain is integer Q-format,
+# and the importers no longer need `log2` / `sin` / `cos`.
+#
+# `xmrs/float-helpers` is still propagated so that downstream
+# editors / GUIs can call `EnvValue::to_f32()` & co. on the
+# desktop side; embedded users keep `default-features = false`
+# to skip it.
+std = ["xmrs/std", "xmrs/float-helpers"]
 
 # `demo` gates the interactive example players (cpal_player binary and
 # rodio_player example). It is a convenience feature that also turns on
@@ -51,11 +54,6 @@ std = ["xmrs/std"]
 # still builds.
 # To install the player binary: `cargo install xmrsplayer --features demo`.
 demo = ["std", "import", "clap", "console", "cpal", "hound", "rodio"]
-
-# ---- Float math backends (only needed when `std` is disabled) ----
-# Pick exactly one of `libm` or `micromath` in `no_std` builds.
-libm = ["dep:num-traits", "num-traits/libm", "xmrs/libm"]
-micromath = ["dep:micromath", "xmrs/micromath"]
 
 # ---- Historical-format importers (propagate to xmrs) ----
 # `import` is an umbrella for all importers. Downstreams that want
@@ -95,3 +93,14 @@ path = "examples/arp_bug.rs"
 name = "rodio_player"
 path = "examples/rodio_player.rs"
 required-features = ["demo"]
+
+[[example]]
+name = "sizetest"
+path = "examples/sizetest.rs"
+
+[profile.release-bloat]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false
+debug = false

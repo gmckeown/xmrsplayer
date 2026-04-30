@@ -1,11 +1,5 @@
-// Float math backend (only needed when `std` is disabled).
-// Priority: std > libm > micromath.
-#[cfg(all(not(feature = "std"), not(feature = "libm"), feature = "micromath"))]
-#[allow(unused_imports)]
-use micromath::F32Ext;
-#[cfg(all(not(feature = "std"), feature = "libm"))]
-#[allow(unused_imports)]
-use num_traits::float::Float;
+// Float-backend imports kept removed (Tour 6): no f32 methods
+// remain in this file after the period→pitch fold.
 
 use core::ops::Deref;
 
@@ -13,6 +7,8 @@ use crate::{
     state_auto_vibrato::StateAutoVibrato, state_envelope::StateEnvelope, state_filter::StateFilter,
     state_sample::StateSample,
 };
+use xmrs::fixed::fixed::Q15;
+use xmrs::fixed::units::{Amp, EnvValue, Finetune, Panning, PitchDelta, SampleRate, Volume};
 use xmrs::prelude::*;
 
 impl<'a> Deref for StateInstrDefault<'a> {
@@ -27,8 +23,12 @@ impl<'a> Deref for StateInstrDefault<'a> {
 pub struct StateInstrDefault<'a> {
     instr: &'a InstrDefault,
     pub num: usize,
-    /// Output frequency
-    rate: f32,
+    /// Output sample-rate, as integer Hz ([`SampleRate`]).
+    /// Forwarded to [`StateSample::set_step`] (which divides
+    /// frequency by it for the sample-clock step) and used by
+    /// [`StateFilter`] for biquad coefficient sizing. The whole
+    /// chain runs without `f32` from this point on.
+    rate: SampleRate,
     period_helper: PeriodHelper,
     /// Sample state
     pub state_sample: Option<StateSample<'a>>,
@@ -76,16 +76,23 @@ pub struct StateInstrDefault<'a> {
     /// [`Self::envelopes_reset`] / [`Self::volume_reset`] on a fresh
     /// trigger.
     pub volume_fading_out: bool,
-    /// Volume fadeout value
-    pub volume_fadeout: f32,
+    /// Volume fadeout register, Q1.15 in `[0, 1]`. Was `f32`.
+    /// Decremented by `voice.volume_fadeout` per tick once
+    /// `volume_fading_out` is true; held at `Volume::FULL`
+    /// otherwise.
+    pub volume_fadeout: Volume,
 
-    /// Current volume
-    pub volume: f32,
-    /// Original Sample volume
-    volume_orig: f32,
+    /// Current voice volume, Q1.15 in `[0, 1]`. Was `f32`.
+    /// Initialised at note-trigger time from the sample's
+    /// channel volume (see `volume_orig`); modulated
+    /// thereafter by Vxx, tremolo, retrigger, etc.
+    pub volume: Volume,
+    /// Snapshot of [`Self::volume`] at the most recent
+    /// note-trigger, used by `volume_reset`.
+    volume_orig: Volume,
 
-    /// Current panning
-    pub panning: f32,
+    /// Current panning, Q1.15 in `[0, 1]`. Was `f32`.
+    pub panning: Panning,
 
     /// Per-voice resonant low-pass filter. Engaged at note-trigger
     /// time from the instrument's `initial_filter_cutoff` /
@@ -100,13 +107,14 @@ impl<'a> StateInstrDefault<'a> {
         instr: &'a InstrDefault,
         num: usize,
         period_helper: PeriodHelper,
-        rate: f32,
+        rate: SampleRate,
     ) -> Self {
         let v = &instr.voice.vibrato;
         let ve = &instr.voice.volume_envelope;
         let pe = &instr.voice.pan_envelope;
         let pie = &instr.voice.pitch_envelope;
-        let mut filter = StateFilter::new(rate);
+        // Q-format filter — takes integer Hz directly.
+        let mut filter = StateFilter::new(rate.hz());
         filter.configure_from_it_registers(
             instr.voice.initial_filter_cutoff,
             instr.voice.initial_filter_resonance,
@@ -119,15 +127,15 @@ impl<'a> StateInstrDefault<'a> {
             state_sample: None,
             current_sample_num: None,
             state_vibrato: StateAutoVibrato::new(v, period_helper),
-            envelope_volume: StateEnvelope::new(ve, 1.0),
-            envelope_panning: StateEnvelope::new(pe, 0.5),
-            envelope_pitch: StateEnvelope::new(pie, 0.5),
+            envelope_volume: StateEnvelope::new(ve, EnvValue::VOLUME_DEFAULT),
+            envelope_panning: StateEnvelope::new(pe, EnvValue::PAN_DEFAULT),
+            envelope_pitch: StateEnvelope::new(pie, EnvValue::PAN_DEFAULT),
             sustained: true,
             volume_fading_out: false,
-            volume_fadeout: 1.0,
-            volume: 1.0,
-            volume_orig: 1.0,
-            panning: 0.5,
+            volume_fadeout: Volume::FULL,
+            volume: Volume::FULL,
+            volume_orig: Volume::FULL,
+            panning: Panning::CENTER,
             filter,
         }
     }
@@ -168,7 +176,7 @@ impl<'a> StateInstrDefault<'a> {
     pub fn envelopes_reset(&mut self) {
         self.sustained = true;
         self.volume_fading_out = false;
-        self.volume_fadeout = 1.0;
+        self.volume_fadeout = Volume::FULL;
         self.envelope_volume.reset();
         self.envelope_panning.reset();
         self.envelope_pitch.reset();
@@ -176,7 +184,7 @@ impl<'a> StateInstrDefault<'a> {
 
     pub fn volume_reset(&mut self) {
         self.volume = self.volume_orig;
-        self.volume_fadeout = 1.0;
+        self.volume_fadeout = Volume::FULL;
         self.volume_fading_out = false;
         self.sustained = true;
     }
@@ -186,7 +194,7 @@ impl<'a> StateInstrDefault<'a> {
     }
 
     pub fn cut_pitch(&mut self) {
-        self.volume = 0.0;
+        self.volume = Volume::SILENT;
     }
 
     pub fn key_off(&mut self) {
@@ -213,16 +221,18 @@ impl<'a> StateInstrDefault<'a> {
             // Schism's `fx_key_off` line 142-144 sets CHN_NOTEFADE
             // for the same reason in the same case.
             self.volume_fading_out = true;
-            if self.instr.voice.volume_fadeout == 0.0 {
+            if self.instr.voice.volume_fadeout == Volume::SILENT {
                 // No envelope AND no fadeout amount: nothing keeps
                 // the voice alive past key-off. Cut the pitch (silence
                 // the sample) and force the fadeout register to zero
                 // so `Voice::is_alive()` reports the voice as dead on
                 // the next pool sweep.
                 self.cut_pitch();
-                self.volume_fadeout = 0.0;
+                self.volume_fadeout = Volume::SILENT;
             }
-        } else if env.loop_enabled && self.instr.voice.volume_fadeout > 0.0 {
+        } else if env.loop_enabled
+            && self.instr.voice.volume_fadeout != Volume::SILENT
+        {
             // Looped envelope with non-zero fadeout: schism's
             // `fx_key_off` line 166-167 also engages CHN_NOTEFADE
             // here. Without this trigger the looped envelope would
@@ -264,16 +274,23 @@ impl<'a> StateInstrDefault<'a> {
     }
 
     #[inline(always)]
-    pub fn get_volume(&self) -> f32 {
-        // `instr.voice.volume` is IT's per-instrument scalar (0..1,
-        // populated from the IT instrument header's global-volume
-        // byte / 128). For formats without the concept (XM / S3M)
-        // it stays at 1.0, making this a no-op. Previously ignored —
-        // which threw off any IT module where the author balanced
-        // instruments via the per-instrument GV (common on drums vs
-        // leads, or for pad voices dialled down to sit under the
-        // melody).
-        self.volume_fadeout * self.envelope_volume.value * self.volume * self.instr.voice.volume
+    pub fn get_volume(&self) -> Volume {
+        // Pure Q1.15 gain chain. Each multiplication is a
+        // saturating Q15 mul (`Volume::scaled_by`); no float
+        // anywhere.
+        //
+        //   final = fadeout × env × per_voice × per_instrument
+        //
+        // `EnvValue::applied_to` returns a `Volume` (the
+        // envelope acts as a gain multiplier on the fadeout).
+        // From there it's straight `Volume × Volume → Volume`.
+        // `instr.voice.volume` (per-instrument scalar) is IT's
+        // global-volume byte — full unity for non-IT formats.
+        self.envelope_volume
+            .value
+            .applied_to(self.volume_fadeout)
+            .scaled_by(self.volume)
+            .scaled_by(self.instr.voice.volume)
     }
 
     /// The current sample's `default_note_volume` — IT's per-sample
@@ -286,24 +303,24 @@ impl<'a> StateInstrDefault<'a> {
     /// A V-column override later in effect processing replaces the
     /// resulting `self.volume` wholesale, cleanly superseding Vol
     /// without also discarding the GvL scaling.
-    pub fn current_sample_default_note_volume(&self) -> f32 {
+    pub fn current_sample_default_note_volume(&self) -> Volume {
         self.current_sample_num
             .and_then(|n| self.instr.sample.get(n))
             .and_then(|s| s.as_ref())
             .map(|s| s.default_note_volume)
-            .unwrap_or(1.0)
+            .unwrap_or(Volume::FULL)
     }
 
     /// Instrument-level random volume variation (IT humanisation).
     /// IT stores this as 0..100 percent of the starting volume; the
     /// importer normalises to 0..1. Zero for non-IT formats.
-    pub fn random_volume_variation(&self) -> f32 {
+    pub fn random_volume_variation(&self) -> Q15 {
         self.instr.voice.random_volume_variation
     }
 
     /// Instrument-level random pan variation (IT humanisation).
     /// Same range / normalisation as `random_volume_variation`.
-    pub fn random_pan_variation(&self) -> f32 {
+    pub fn random_pan_variation(&self) -> Q15 {
         self.instr.voice.random_pan_variation
     }
 
@@ -311,7 +328,7 @@ impl<'a> StateInstrDefault<'a> {
     /// spread the pan as the played note moves away from
     /// `pitch_pan_center`. The importer normalises IT's signed
     /// -32..+32 byte to -1..+1. Zero for non-IT formats.
-    pub fn pitch_pan_separation(&self) -> f32 {
+    pub fn pitch_pan_separation(&self) -> Q15 {
         self.instr.voice.pitch_pan_separation
     }
 
@@ -334,14 +351,27 @@ impl<'a> StateInstrDefault<'a> {
     /// set — in the latter case the envelope drives the filter
     /// cutoff rather than pitch, and the filter engine reads the
     /// envelope value directly (Phase 4 of IT_ROADMAP).
-    pub fn get_pitch_envelope_offset_semitones(&self) -> f32 {
+    /// Pitch envelope contribution as a [`PitchDelta`] (Q8.8
+    /// semitones). Q-format throughout — no f32 round trip.
+    ///
+    /// Mapping: `EnvValue` is Q1.15 in `[0, 1]` with `0.5` as
+    /// the neutral point. Offset in semitones is `(v - 0.5) ×
+    /// 32`. In raw bits: `(v_q15 - 16384) × 32 / 128 =
+    /// (v_q15 - 16384) / 4` lands in Q8.8 raw directly.
+    /// Range: `±16` semitones.
+    pub fn get_pitch_envelope_offset(&self) -> PitchDelta {
         if !self.instr.voice.pitch_envelope.enabled
             || !self.envelope_pitch.enabled
             || self.instr.voice.pitch_envelope_as_low_pass_filter
         {
-            return 0.0;
+            return PitchDelta::ZERO;
         }
-        (self.envelope_pitch.value - 0.5) * 32.0
+        // Pitch envelope value is `EnvValue` ∈ `[0, ONE]`; centre
+        // it to a signed `[-HALF, +HALF]` Q1.15 swing, then narrow
+        // to Q8.8 (the `/ 4` scales `±0.5` cycle to `±0.125 cycle`
+        // = `±32 semitones`, the XM pitch-envelope range).
+        let centred = self.envelope_pitch.value.raw_q15() - Q15::HALF;
+        PitchDelta::from_q8_8_i32_sat(centred.raw() as i32 / 4)
     }
 
     fn envelopes(&mut self) {
@@ -381,7 +411,11 @@ impl<'a> StateInstrDefault<'a> {
         // Schism's matching code is `rn_process_ins_fade`
         // (sndmix.c:326-345): only runs while CHN_NOTEFADE is set.
         if self.volume_fading_out {
-            self.volume_fadeout = (self.volume_fadeout - self.instr.voice.volume_fadeout).max(0.0);
+            // Volume::faded_by saturates at zero, replacing the
+            // previous `(fadeout - step).max(0.0)` pattern.
+            self.volume_fadeout = self
+                .volume_fadeout
+                .faded_by(self.instr.voice.volume_fadeout.raw());
         }
 
         // Panning
@@ -440,22 +474,28 @@ impl<'a> StateInstrDefault<'a> {
             // envelope-value 0.5 (true neutral) by setting cutoff
             // to ~63 regardless of intent.
             if self.instr.voice.pitch_envelope_as_low_pass_filter {
-                let base = (self.instr.voice.initial_filter_cutoff & 0x7F) as f32;
-                let v = self.envelope_pitch.value.clamp(0.0, 1.0);
-                let modulated = (base * v * 2.0).min(127.0) as u8;
+                // Q-format integer modulation:
+                //   modulated = clamp(base × envelope_value × 2, 0, 127)
+                // base ∈ 0..=127, envelope_value Q1.15 raw [0, 32767].
+                //   `(base × env_q15 × 2) >> 15`
+                // = `(base × env_q15) >> 14`
+                // Saturate at 127.
+                let base = (self.instr.voice.initial_filter_cutoff & 0x7F) as i32;
+                let env_q15 = self.envelope_pitch.value.as_q15_i32().max(0);
+                let modulated = ((base * env_q15) >> 14).min(127) as u8;
                 self.filter.set_cutoff_reg(modulated);
             }
         }
     }
 
-    pub fn get_finetuned_pitch(&self) -> f32 {
+    pub fn get_finetuned_pitch(&self) -> PitchDelta {
         match &self.state_sample {
             Some(s) if s.is_enabled() => s.get_finetuned_pitch(),
-            _ => 0.0,
+            _ => PitchDelta::ZERO,
         }
     }
 
-    pub fn set_finetune(&mut self, finetune: f32) {
+    pub fn set_finetune(&mut self, finetune: Finetune) {
         if let Some(s) = &mut self.state_sample {
             if s.is_enabled() {
                 s.set_finetune(finetune);
@@ -463,26 +503,116 @@ impl<'a> StateInstrDefault<'a> {
         }
     }
 
-    pub fn update_frequency(&mut self, period: f32, arp_pitch: f32, finetune: f32, semitone: bool) {
-        // Compute the pitch-envelope contribution BEFORE the `&mut
-        // self.state_sample` borrow below — `get_pitch_envelope_
-        // offset_semitones` reads `self.envelope_pitch` /
-        // `self.instr` immutably, which overlaps the later mutable
-        // sample borrow otherwise. `pitch_env_offset` is in semitones,
-        // independent of vibrato finetune, and goes into the
-        // `arp_pitch` slot (also in semitones).
-        let pitch_env_offset = self.get_pitch_envelope_offset_semitones();
+    /// Recompute the per-sample frequency from the channel's
+    /// current period and the LFO / arpeggio / pitch-envelope
+    /// contributions. Q-typed inputs:
+    ///
+    /// * `period` — current channel period.
+    /// * `arp_pitch` — arpeggio offset (semitones).
+    /// * `vibrato` — vibrato modulation from the channel's main
+    ///   vibrato LFO (semitones).
+    /// * `semitone` — XM glissando: round the base pitch to the
+    ///   nearest integer semitone before adding modulation.
+    ///
+    /// Pitch envelope and instrument auto-vibrato are read from
+    /// `self` directly (not parameters) — they're voice-internal
+    /// state.
+    pub fn update_frequency(
+        &mut self,
+        period: xmrs::fixed::units::Period,
+        arp_pitch: PitchDelta,
+        vibrato: PitchDelta,
+        semitone: bool,
+    ) {
+        let pitch_env_offset = self.get_pitch_envelope_offset();
         let vibrato_mod = self.state_vibrato.current_modulation;
+        if self.state_sample.is_none() {
+            return;
+        }
+
+        // Sum the four pitch deltas. Each `PitchDelta` is Q8.8
+        // bounded to `±i16::MAX/256 ≈ ±128 semitones`; their
+        // saturating `+` keeps the result inside that range
+        // (and in practice each term is `± 32 semitones max`,
+        // so we never get near saturation).
+        let delta = arp_pitch + pitch_env_offset + vibrato + vibrato_mod;
+        let delta_q88: i32 = delta.as_q8_8_i32();
+
+        // Period → base pitch (Q8.8 semitones). Both branches
+        // are now integer-only:
+        //   - Linear: exact `(7680 - period) << 2` Q8.8 raw.
+        //   - Amiga: binary-search through the Amiga period
+        //     table (1/8-semitone grid, Q8.8 raw step 32).
+        let pitch_q = match self.period_helper.freq_type {
+            FrequencyType::LinearFrequencies => {
+                // EXACT: pitch_semitones = (7680 - period) / 64.
+                // In Q8.8 raw: `(7680 - period) << 2` because
+                // (1/64) in Q8.8 raw = 256/64 = 4.
+                let mut pitch_q88 = (7680_i32 - period.raw() as i32) * 4;
+
+                // FT2 glissando snap: round to nearest integer
+                // semitone (Q8.8 raw multiple of 256).
+                if semitone {
+                    pitch_q88 = round_to_nearest_semitone_q88(pitch_q88);
+                }
+
+                // FT2 arpeggio quirk: clamp base note to ≤ 95
+                // (Q8.8 raw `95 * 256 = 24320`) if arpeggio or
+                // pitch envelope is active.
+                if self.period_helper.legacy_arpeggio_clamp_enabled()
+                    && (arp_pitch + pitch_env_offset) != PitchDelta::ZERO
+                {
+                    pitch_q88 = pitch_q88.min(95 * 256);
+                }
+
+                // Saturating sum + Q-format encode (negative
+                // pitch is meaningless, hence `.max(0)`; the i16
+                // ceiling is handled by `from_q8_8_i32_sat`).
+                let final_q88 = pitch_q88.saturating_add(delta_q88).max(0);
+                xmrs::fixed::units::Pitch::from_q8_8_i32_sat(final_q88)
+            }
+            FrequencyType::AmigaFrequencies => {
+                // Q-format Amiga period→pitch lookup. Uses the
+                // 1/8-semitone (Q8.8 raw step = 32) grid that
+                // matches the Amiga period table itself; pitch
+                // slides between table entries map to the
+                // nearest unit (12.5 cent precision) — same
+                // resolution any FT2-era tracker offers on its
+                // pitch sliders. No log2 / no f32.
+                let mut pitch_q88 =
+                    xmrs::fixed::tables::amiga_period_to_pitch(period).as_q8_8_i32();
+
+                if semitone {
+                    pitch_q88 = round_to_nearest_semitone_q88(pitch_q88);
+                }
+
+                if self.period_helper.legacy_arpeggio_clamp_enabled()
+                    && (arp_pitch + pitch_env_offset) != PitchDelta::ZERO
+                {
+                    pitch_q88 = pitch_q88.min(95 * 256);
+                }
+
+                let final_q88 = pitch_q88.saturating_add(delta_q88).max(0);
+                xmrs::fixed::units::Pitch::from_q8_8_i32_sat(final_q88)
+            }
+        };
+
+        // Q-format end-to-end: Pitch → Period → Frequency → step.
+        let period_q = self.period_helper.note_to_period(pitch_q);
+        let f = self.period_helper.period_to_frequency(period_q);
+
         if let Some(s) = &mut self.state_sample {
-            let f = self.period_helper.all_to_frequency_cached(
-                period,
-                arp_pitch + pitch_env_offset,
-                finetune + vibrato_mod,
-                semitone,
-            );
             s.set_step(f);
         }
     }
+}
+
+// log2 / pitch_from_semitones_f32_clamped helpers removed
+// (Tour 6): both period→pitch branches in `update_frequency`
+// now use Q-format LUTs from `xmrs::fixed::tables`. The
+// `update_frequency` body is integer-only end-to-end.
+
+impl<'a> StateInstrDefault<'a> {
 
     /// Resolve the *output* pitch for a given input note, applying
     /// the instrument's keyboard remap if any.
@@ -534,12 +664,19 @@ impl<'a> StateInstrDefault<'a> {
                 // deliberate centre override, and the fallback to
                 // `instr.voice.default_pan` is what the module expects.
                 let sample_pan = state_sample.get_panning();
-                self.panning = if sample_pan == 0.5 {
+                self.panning = if sample_pan == Panning::CENTER {
+                    // IT semantics: exact-centre = "unset, defer
+                    // to instrument default_pan".
                     self.instr.voice.default_pan
                 } else {
                     sample_pan
                 };
-                self.volume = state_sample.get_volume();
+                // ChannelVolume and Volume are both Q1.15 in
+                // `[0, 1]`. The newtype distinction reflects
+                // semantics (always-applied vs running per-voice
+                // gain), not range. Sharing the raw Q15 is
+                // lossless.
+                self.volume = Volume::from_q15(state_sample.get_volume().raw());
                 self.volume_orig = self.volume;
                 self.state_sample = Some(state_sample);
                 self.current_sample_num = Some(num);
@@ -548,8 +685,8 @@ impl<'a> StateInstrDefault<'a> {
         }
         self.state_sample = None;
         self.current_sample_num = None;
-        self.panning = 0.5;
-        self.volume = 0.0;
+        self.panning = Panning::CENTER;
+        self.volume = Volume::SILENT;
         false
     }
 
@@ -560,7 +697,7 @@ impl<'a> StateInstrDefault<'a> {
 }
 
 impl<'a> Iterator for StateInstrDefault<'a> {
-    type Item = (f32, f32);
+    type Item = (Amp, Amp);
 
     fn next(&mut self) -> Option<Self::Item> {
         if !self.is_enabled() {
@@ -577,18 +714,32 @@ impl<'a> Iterator for StateInstrDefault<'a> {
         // — a bounded waste (one such voice per channel at most),
         // but a nicely free win that aligns with the ghost path's
         // semantics.
-        if self.volume_fading_out && self.volume_fadeout <= 0.0 {
+        if self.volume_fading_out && self.volume_fadeout.raw() == Q15::ZERO {
             return None;
         }
         let raw = match &mut self.state_sample {
             Some(s) => s.next(),
             None => None,
         };
-        // Route through the per-voice filter. When the filter's
-        // `enabled` flag is clear (XM / MOD / S3M and IT samples
-        // without either register's bit-7 set), this is a no-op
-        // pass-through — checked once at the top of `process`.
+        // Filter is Q-format end-to-end: `process` takes
+        // `(Amp, Amp)` and returns `(Amp, Amp)` directly. The
+        // never-engaged short-circuit lives inside `process`
+        // itself (`was_ever_enabled` check) — no `f32` touched
+        // anywhere in the audio chain. For XM / MOD / S3M and
+        // IT samples without filter bit-7 set, the function
+        // returns its input unchanged.
         raw.map(|(l, r)| self.filter.process(l, r))
+    }
+}
+
+/// Round a Q8.8 pitch to the nearest integer semitone (a Q8.8
+/// raw multiple of `256`), half-away-from-zero. Used by the
+/// FT2 glissando snap on both linear and Amiga period flavours.
+const fn round_to_nearest_semitone_q88(pitch_q88: i32) -> i32 {
+    if pitch_q88 >= 0 {
+        ((pitch_q88 + 128) / 256) * 256
+    } else {
+        -(((-pitch_q88) + 128) / 256) * 256
     }
 }
 
@@ -596,7 +747,8 @@ impl<'a> Iterator for StateInstrDefault<'a> {
 mod tests {
     use super::*;
     use alloc::vec;
-    use xmrs::prelude::*;
+    // `xmrs::prelude::*` is already in scope through the file-
+    // level `use` at the top, re-exported here by `super::*`.
 
     fn make_instr_with_remap(remap: &[(usize, u8)]) -> InstrDefault {
         let mut instr = InstrDefault::default();
@@ -611,7 +763,7 @@ mod tests {
         // doesn't actually consult the period helper, but
         // StateInstrDefault::new requires one.
         let ph = PeriodHelper::new(FrequencyType::LinearFrequencies, false);
-        StateInstrDefault::new(instr, 0, ph, 44100.0)
+        StateInstrDefault::new(instr, 0, ph, SampleRate::from_hz(44100))
     }
 
     #[test]
@@ -676,15 +828,15 @@ mod tests {
             point: vec![
                 EnvelopePoint {
                     frame: 0,
-                    value: 0.0,
+                    value: EnvValue::default(),
                 },
                 EnvelopePoint {
                     frame: 10,
-                    value: 1.0,
+                    value: EnvValue::VOLUME_DEFAULT,
                 },
                 EnvelopePoint {
                     frame: 50,
-                    value: 0.0,
+                    value: EnvValue::default(),
                 },
             ],
             sustain_enabled: true,
@@ -696,7 +848,7 @@ mod tests {
         }
     }
 
-    fn instr_with_envelope(env: Envelope, fadeout: f32) -> InstrDefault {
+    fn instr_with_envelope(env: Envelope, fadeout: Volume) -> InstrDefault {
         let mut instr = InstrDefault::default();
         instr.voice.volume_envelope = env;
         instr.voice.volume_fadeout = fadeout;
@@ -715,11 +867,11 @@ mod tests {
         // held at 1.0. It only flips true after the envelope has
         // walked past its last point — at which point the fadeout
         // register starts decaying.
-        let instr = instr_with_envelope(pad_envelope(), 0.01);
+        let instr = instr_with_envelope(pad_envelope(), Volume::from_ratio(1, 100));
         let mut state = state_for(&instr);
         assert!(state.sustained);
         assert!(!state.volume_fading_out);
-        assert_eq!(state.volume_fadeout, 1.0);
+        assert_eq!(state.volume_fadeout, Volume::FULL);
 
         state.key_off();
         // Sustain released, but fading not yet armed: envelope has
@@ -737,7 +889,7 @@ mod tests {
         for _ in 0..49 {
             state.tick();
             assert_eq!(
-                state.volume_fadeout, 1.0,
+                state.volume_fadeout, Volume::FULL,
                 "fadeout must not decay while the release section is still playing"
             );
             assert!(
@@ -763,7 +915,7 @@ mod tests {
         let pre = state.volume_fadeout;
         state.tick();
         assert!(
-            state.volume_fadeout < pre,
+            state.volume_fadeout.raw() < pre.raw(),
             "fadeout register must decrement once the envelope is past its end"
         );
     }
@@ -774,7 +926,7 @@ mod tests {
         // IT instrument without an envelope): schism's `fx_key_off`
         // sets CHN_NOTEFADE right away because the envelope isn't
         // there to defer the decision.
-        let instr = instr_with_envelope(Envelope::default(), 0.01);
+        let instr = instr_with_envelope(Envelope::default(), Volume::from_ratio(1, 100));
         let mut state = state_for(&instr);
         state.key_off();
         assert!(
@@ -784,7 +936,7 @@ mod tests {
         // And the fadeout register must actually start moving.
         let pre = state.volume_fadeout;
         state.tick();
-        assert!(state.volume_fadeout < pre);
+        assert!(state.volume_fadeout.raw() < pre.raw());
     }
 
     #[test]
@@ -803,7 +955,7 @@ mod tests {
         env.loop_enabled = true;
         env.loop_start_point = 2; // last point
         env.loop_end_point = 2;
-        let instr = instr_with_envelope(env, 0.01);
+        let instr = instr_with_envelope(env, Volume::from_ratio(1, 100));
         let mut state = state_for(&instr);
         state.key_off();
         assert!(
@@ -821,7 +973,7 @@ mod tests {
         // here, conflating fade with note-off and making the
         // envelope walk into its release section instead of
         // continuing to wrap in the sustain loop.
-        let instr = instr_with_envelope(pad_envelope(), 0.01);
+        let instr = instr_with_envelope(pad_envelope(), Volume::from_ratio(1, 100));
         let mut state = state_for(&instr);
         assert!(state.sustained);
         state.start_fadeout();
@@ -830,6 +982,6 @@ mod tests {
         // And fadeout starts decaying on the next tick.
         let pre = state.volume_fadeout;
         state.tick();
-        assert!(state.volume_fadeout < pre);
+        assert!(state.volume_fadeout.raw() < pre.raw());
     }
 }

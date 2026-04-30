@@ -20,6 +20,8 @@ use crate::midi_observer::MidiEvent;
 use crate::triggerkeep::TRIGGER_KEEP_PERIOD;
 use crate::voice_pool::VoicePool;
 use alloc::{vec, vec::Vec};
+use xmrs::fixed::fixed::Q15;
+use xmrs::fixed::units::{Amplification, SampleRate, Volume};
 use xmrs::prelude::*;
 
 /// Default voice pool capacity. Mirrors schismtracker's
@@ -37,7 +39,7 @@ pub const DEFAULT_VOICE_POOL_CAPACITY: usize = 256;
 /// `process_row` / `process_tick` (crate-private; the facade calls
 /// them on each row/tick boundary).
 pub struct Voices<'a> {
-    sample_rate: f32,
+    sample_rate: SampleRate,
 
     channel: Vec<Channel<'a>>,
 
@@ -49,19 +51,21 @@ pub struct Voices<'a> {
     /// `csf_get_nna_channel`.
     pool: VoicePool<'a>,
 
-    /// Global volume (0.0 ..= 1.0). Mutated by `GlobalEffect::Volume` and by
-    /// accumulating `GlobalEffect::VolumeSlide`. Applied as a final gain in
+    /// Global volume (0.0 ..= 1.0) Q1.15. Mutated by
+    /// `GlobalEffect::Volume` and by accumulating
+    /// `GlobalEffect::VolumeSlide`. Applied as a final gain in
     /// [`Voices::mix`].
-    global_volume: f32,
-    /// Extra amplification applied after `global_volume` — caller-controlled,
-    /// defaults to 1.0. Raise above 1.0 at your own clipping risk; lower to
-    /// 0.25 on busy modules (see README).
-    amplification: f32,
+    global_volume: Volume,
+    /// Extra amplification applied after `global_volume` —
+    /// caller-controlled, defaults to unity (`Q4.12 = 0x1000`).
+    /// Stored as `Amplification` (Q4.12) so it can express up
+    /// to 8× gain without leaving the i16 raw range.
+    amplification: Amplification,
 
     /// Non-fine volume-slide speed latched on the last row that carried a
     /// `GlobalEffect::VolumeSlide { fine: false }`. Applied once per tick as
     /// long as `row_has_global_volume_slide` stays true.
-    volume_slide_speed: f32,
+    volume_slide_speed: Q15,
     /// Whether the last latched slide was a fine one (fires once at tick 0
     /// only). Tracked so we know whether to keep sliding on subsequent
     /// ticks of this row.
@@ -77,33 +81,21 @@ pub struct Voices<'a> {
     /// dispatches to any registered [`MidiObserver`]. The buffer is
     /// re-used across rows — cleared on entry to each `process_row`.
     pending_midi_events: Vec<(usize, MidiEvent)>,
-
-    /// Final-mix scalar applied once per output sample. Folds two
-    /// things at construction time:
-    ///   - the format's headroom request (read from the IT header
-    ///     `mv` byte, hard-coded to 48/128 for XM/MOD per schism's
-    ///     `fmt/xm.c:885`, read from the master-volume byte for S3M);
-    ///   - the engine's own attenuation (the float-domain equivalent
-    ///     of schism's `MIXING_ATTENUATION = 5` shift), which gives
-    ///     the mix bus enough headroom for stacked NNA voices not
-    ///     to clip.
-    ///
-    /// See the construction site for the derivation. The value is
-    /// kept separate from `global_volume` (which Vxx animates each
-    /// tick) and `amplification` (which the user controls) so the
-    /// three concerns stay readable.
-    mix_volume: f32,
 }
 
 impl<'a> Voices<'a> {
     pub(crate) fn new_with_voice_pool_capacity(
         module: &'a Module,
-        sample_rate: f32,
+        sample_rate: u32,
         initial_tempo: usize,
         voice_pool_capacity: usize,
     ) -> Self {
         let num_channels = module.get_num_channels();
-        let mut channels = vec![Channel::new(module, sample_rate, initial_tempo); num_channels];
+        let sr = SampleRate::from_hz(sample_rate.max(1));
+        let mut channels = vec![
+            Channel::new(module, sr, initial_tempo);
+            num_channels
+        ];
         // Apply per-channel defaults from the module header.
         // Each entry can carry a pan, a volume override, a mute
         // flag, and a surround flag — populated by importers whose
@@ -136,57 +128,69 @@ impl<'a> Voices<'a> {
             ch.reseed_rng(0xA5A5_0000 | (i as u32 + 1));
             ch.set_track_index(i);
         }
-        // Engine-side attenuation: schism applies `MIXING_ATTENUATION
-        // = 5` (`include/player/cmixer.h:8`) as a final >> 5 shift on
-        // every voice's contribution before summing. That's eight
-        // bits of headroom the mixer reserves so dozens of voices can
-        // stack without overflowing the i32 mix bus.
-        //
-        // Two of those five bits are already absorbed in our chain:
-        // schism reads `mixing_volume` then does `<< 2` to widen the
-        // domain (`sndmix.c:1101`), whereas we read `mix_volume`
-        // already pre-divided by 128 — that's a `>> 7` on the same
-        // bus, so the relative shift between the two pipelines is
-        // `5 - 2 = 3` more bits of attenuation we owe to the voice
-        // bus.
-        //
-        // 3 bits = factor 1/8. Apply it once at load so the mixer's
-        // hot path stays a plain multiply.
-        const MIXER_HEADROOM_DIV: f32 = 8.0;
         Self {
-            sample_rate,
+            sample_rate: sr,
             channel: channels,
             pool: VoicePool::new(voice_pool_capacity),
-            global_volume: 1.0,
-            amplification: 1.0,
-            volume_slide_speed: 0.0,
+            global_volume: Volume::FULL,
+            amplification: Amplification::UNITY,
+            volume_slide_speed: Q15::ZERO,
             volume_slide_fine: true,
             row_has_global_volume_slide: false,
             pending_midi_events: Vec::new(),
-            // `module.mix_volume` is the format-specific headroom
-            // (IT reads the header, XM/MOD/S3M align on schism's
-            // 48/128 default — see the importers in the `xmrs`
-            // crate). We fold the engine's MIXER_HEADROOM_DIV in
-            // here so the mix loop only multiplies once.
-            mix_volume: module.mix_volume.clamp(0.0, 1.0) / MIXER_HEADROOM_DIV,
         }
     }
 
     // --- Accessors / mutators (used by the facade to expose public API) ---
 
-    pub fn global_volume(&self) -> f32 {
+    /// Q1.15 song-driven master volume.
+    pub fn global_volume(&self) -> Volume {
         self.global_volume
     }
-    pub fn set_global_volume(&mut self, v: f32) {
-        self.global_volume = v.clamp(0.0, 1.0);
+    /// Set song-driven master volume.
+    pub fn set_global_volume(&mut self, v: Volume) {
+        self.global_volume = v;
     }
-    pub fn amplification(&self) -> f32 {
+    /// Alias kept for the older `_q` naming convention.
+    #[doc(hidden)]
+    pub fn global_volume_q(&self) -> Volume {
+        self.global_volume
+    }
+    /// Alias kept for the older `_q` naming convention.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn set_global_volume_q(&mut self, v: Volume) {
+        self.global_volume = v;
+    }
+
+    /// Q4.12 user-driven amplification (up to 8×).
+    pub fn amplification(&self) -> Amplification {
         self.amplification
     }
-    pub fn set_amplification(&mut self, a: f32) {
+    /// Set user-driven amplification.
+    pub fn set_amplification(&mut self, a: Amplification) {
         self.amplification = a;
     }
-    pub fn sample_rate(&self) -> f32 {
+    /// Alias kept for the older `_q` naming convention.
+    #[doc(hidden)]
+    pub fn amplification_q(&self) -> Amplification {
+        self.amplification
+    }
+    /// Alias kept for the older `_q` naming convention.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn set_amplification_q(&mut self, a: Amplification) {
+        self.amplification = a;
+    }
+
+    /// Output sample-rate in Hz.
+    pub fn sample_rate(&self) -> SampleRate {
+        self.sample_rate
+    }
+    /// Alias kept for the older `_q` naming convention.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn sample_rate_q(&self) -> SampleRate {
         self.sample_rate
     }
     pub fn num_channels(&self) -> usize {
@@ -217,7 +221,7 @@ impl<'a> Voices<'a> {
     /// clears what it safely can without touching pitch. Mirrors the
     /// previous behaviour of the old `XmrsPlayer::goto` cleanup loop.
     pub(crate) fn reset_for_goto(&mut self) {
-        self.global_volume = 1.0;
+        self.global_volume = Volume::FULL;
         // Split borrow: take `&mut self.channel` and `&mut self.pool`
         // separately so the loop body can mutate both.
         let pool = &mut self.pool;
@@ -275,12 +279,13 @@ impl<'a> Voices<'a> {
         for gfx in &cell.global_effects {
             match gfx {
                 GlobalEffect::Volume(volume) => {
-                    self.global_volume = volume.clamp(0.0, 1.0);
+                    // Pure Q-format: `Voices.global_volume` is `Volume`.
+                    self.global_volume = *volume;
                 }
                 GlobalEffect::VolumeSlide { speed: s, fine: f } => {
                     if *f {
                         // Fine slide: apply once at tick 0.
-                        self.global_volume = (self.global_volume + *s).clamp(0.0, 1.0);
+                        self.global_volume = self.global_volume.with_tremolo(*s);
                     }
                     // Latch the speed so non-fine slides apply on subsequent ticks.
                     self.volume_slide_speed = *s;
@@ -321,7 +326,7 @@ impl<'a> Voices<'a> {
         // Apply rolling global volume slide, if the current row carries a
         // non-fine one. Fine slides were already applied at row-start.
         if self.row_has_global_volume_slide && !self.volume_slide_fine {
-            self.global_volume = (self.global_volume + self.volume_slide_speed).clamp(0.0, 1.0);
+            self.global_volume = self.global_volume.with_tremolo(self.volume_slide_speed);
         }
     }
 
@@ -330,54 +335,49 @@ impl<'a> Voices<'a> {
     /// Fold each channel's sample into a single stereo output, applying the
     /// final mixer gain (`global_volume * amplification`) when requested.
     ///
-    /// Hot path: walks channels once with a `(f32, f32)` accumulator and
-    /// never allocates. At 48 kHz stereo this is the function that runs
-    /// 48 000 times a second.
+    /// Hot path: walks channels once with an `i32` Q1.15
+    /// accumulator and never allocates. Returns the
+    /// **un-clamped** stereo pre-gain sum so the caller can
+    /// apply final gain (Volume × Amplification × MixVolume)
+    /// and clamp to `i16` in a single step without losing
+    /// headroom that the gain stage would have brought back
+    /// in range.
     ///
-    /// When `per_channel_out` is `Some(buffer)`, each channel's post-mute
-    /// `(left, right)` pair is also written into the buffer at its channel
-    /// index — used by the facade to feed `ChannelsObserver`s without a
-    /// second pass over the channel list. The buffer length must be at
-    /// least `self.channel.len()`; any trailing entries are left untouched.
-    /// Pass `None` to skip the capture (the common path, when no channels
-    /// observer is registered).
+    /// `per_channel_out`, when `Some`, is filled with each
+    /// channel's saturated `i16` pair (already clamped to the
+    /// Q1.15 range — observers don't get the un-saturated
+    /// accumulator; if a single channel ever saturates it's
+    /// the channel's own gain mistake, not a mix-bus stacking
+    /// issue).
     pub(crate) fn mix(
         &mut self,
-        apply_volume: bool,
-        per_channel_out: Option<&mut [(f32, f32)]>,
-    ) -> (f32, f32) {
-        let (mut left, mut right) = (0.0f32, 0.0f32);
+        per_channel_out: Option<&mut [(i16, i16)]>,
+    ) -> (i32, i32) {
+        let mut left: i32 = 0;
+        let mut right: i32 = 0;
 
-        // Split the capture path from the plain path so the no-capture case
-        // keeps its tight loop without a per-iteration `Option` check.
         let pool = &mut self.pool;
         match per_channel_out {
             None => {
                 for ch in &mut self.channel {
                     if let Some((l, r)) = ch.next_sample(pool) {
                         if !ch.is_muted() {
-                            left += l;
-                            right += r;
+                            l.accumulate_into(&mut left);
+                            r.accumulate_into(&mut right);
                         }
                     }
-                    // `None` from a channel (no active instrument) contributes
-                    // zero; muted channels are advanced (so position tracking
-                    // stays correct when they unmute) but their output is
-                    // discarded.
                 }
             }
             Some(buf) => {
                 for (idx, ch) in self.channel.iter_mut().enumerate() {
                     let val = match ch.next_sample(pool) {
                         Some((l, r)) if !ch.is_muted() => {
-                            left += l;
-                            right += r;
-                            (l, r)
+                            l.accumulate_into(&mut left);
+                            r.accumulate_into(&mut right);
+                            (l.as_q15_i16(), r.as_q15_i16())
                         }
-                        _ => (0.0, 0.0),
+                        _ => (0, 0),
                     };
-                    // Index is bounded by self.channel.len(); the facade
-                    // guarantees the buffer was sized to match.
                     if idx < buf.len() {
                         buf[idx] = val;
                     }
@@ -385,47 +385,61 @@ impl<'a> Voices<'a> {
             }
         }
 
-        if apply_volume {
-            // `mix_volume` is an IT-specific constant headroom
-            // multiplier (see field doc). For non-IT modules it's
-            // 1.0 so this is free.
-            //
-            // Hard clip on the way out: schism, OpenMPT and the
-            // wider tracker family all do this — saturation in the
-            // last mix stage with no shaping. If the gain chain is
-            // properly calibrated the clamp never fires; if it
-            // does, the audible distortion points us at the
-            // miscalibration instead of masking it under a soft
-            // curve.
-            let g = self.global_volume * self.amplification * self.mix_volume;
-            ((left * g).clamp(-1.0, 1.0), (right * g).clamp(-1.0, 1.0))
-        } else {
-            // Capture path for per-channel observers — leave the
-            // signal untouched so observers see the linear pre-clip
-            // signal. The final mix still goes through the
-            // `apply_volume = true` branch and is clamped on its
-            // way out.
-            (left, right)
-        }
+        (left, right)
     }
 
-    /// Return one `(left, right)` sample per channel, pre-mix, pre-gain.
-    /// Allocates a `Vec`; used by the rarely-hit
-    /// `XmrsPlayer::samples_from_channels` API for per-channel graphic
-    /// effects. Kept for compatibility with pre-refactor callers.
-    pub(crate) fn samples_from_channels(&mut self) -> Vec<(f32, f32)> {
+    /// Apply `global_volume × amplification` to a pre-gain
+    /// accumulator and saturate to `i16` Q1.15. Matches the OLD
+    /// f32 iterator path's gain composition: `mix_volume` is
+    /// kept in `self` for the rarely-used `voices.mix(true, _)`
+    /// path but is **NOT** folded in here, because the OLD
+    /// iterator path didn't apply it either — folding it now
+    /// would attenuate the output by `module.mix_volume / 8`
+    /// (≈ 21× quieter / −26 dB on XM modules where
+    /// `mix_volume = 48/128`).
+    pub(crate) fn apply_final_gain(&self, sum: (i32, i32)) -> (i16, i16) {
+        let gv = self.global_volume.as_q15_i32() as i64; // Q1.15
+        let amp = self.amplification.as_q4_12_i32() as i64; // Q4.12
+
+        // Q1.15 × Q4.12 = Q5.27. Apply to sample (i32 Q1.15) →
+        // Q6.42. Narrow `>> 27` round-half.
+        let g_q27 = gv.max(0) * amp.max(0); // Q5.27
+
+        let bias: i64 = 1 << 26;
+        let apply = |s: i32| -> i16 {
+            let prod: i64 = (s as i64).wrapping_mul(g_q27);
+            let r = if prod >= 0 {
+                (prod + bias) >> 27
+            } else {
+                -(((-prod) + bias) >> 27)
+            };
+            r.clamp(i16::MIN as i64, i16::MAX as i64) as i16
+        };
+        (apply(sum.0), apply(sum.1))
+    }
+
+    /// Saturate a pre-gain mix accumulator to Q1.15 `i16`
+    /// without applying gain. Used for the pre-gain observer
+    /// dispatch.
+    #[inline]
+    pub(crate) fn saturate_to_i16(sum: (i32, i32)) -> (i16, i16) {
+        (
+            sum.0.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            sum.1.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+        )
+    }
+
+    /// Return one `(left, right)` sample per channel, pre-mix,
+    /// pre-gain. Q1.15 `i16` PCM. Allocates a `Vec`; used by
+    /// the rarely-hit `XmrsPlayer::samples_from_channels` API
+    /// for per-channel graphic effects.
+    pub(crate) fn samples_from_channels(&mut self) -> Vec<(i16, i16)> {
         let pool = &mut self.pool;
         self.channel
             .iter_mut()
             .map(|ch| match ch.next_sample(pool) {
-                Some(fval) => {
-                    if ch.is_muted() {
-                        (0.0, 0.0)
-                    } else {
-                        fval
-                    }
-                }
-                None => (0.0, 0.0),
+                Some((l, r)) if !ch.is_muted() => (l.as_q15_i16(), r.as_q15_i16()),
+                _ => (0, 0),
             })
             .collect()
     }

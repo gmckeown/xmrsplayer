@@ -111,12 +111,18 @@ fn rodio_play(
 
     let player = Arc::new(Mutex::new(XmrsPlayer::new(
         module,
-        SAMPLE_RATE as f32,
+        SAMPLE_RATE,
         song,
     )));
     {
         let mut player_lock = player.lock().unwrap();
-        player_lock.set_amplification(amplification);
+        // Q4.12 Q-format amplification — convert the f32 CLI
+        // arg at the boundary.
+        player_lock.set_amplification(Amplification::from_raw_q4_12(
+            ((amplification * 4096.0)
+                .round()
+                .clamp(i16::MIN as f32, i16::MAX as f32)) as i16,
+        ));
         if debug {
             println!("Debug on");
             println!("Module format: {:?}", module.profile.format);

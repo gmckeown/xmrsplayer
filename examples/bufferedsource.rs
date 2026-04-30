@@ -29,10 +29,12 @@ impl<'a> BufferedSource<'a> {
     fn generate_samples(&mut self) {
         let numsamples = self.buffer.len() / 2;
         for i in 0..numsamples {
+            // Player API now produces `i16` PCM. rodio expects
+            // f32 in [-1, 1] — convert at this demo boundary.
             match self.player.lock().unwrap().sample(true) {
                 Some((left, right)) => {
-                    self.buffer[2 * i] = left;
-                    self.buffer[2 * i + 1] = right;
+                    self.buffer[2 * i] = left as f32 / i16::MAX as f32;
+                    self.buffer[2 * i + 1] = right as f32 / i16::MAX as f32;
                 }
                 None => {}
             }

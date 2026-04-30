@@ -201,13 +201,6 @@ impl<'a> Sequencer<'a> {
         self.pattern_loop.len()
     }
 
-    /// Ticks-per-second at the current BPM. FT2 manual: `tps = BPM * 0.4`.
-    /// Useful to compute "samples per tick" on the facade side
-    /// (`sample_rate / tps`).
-    pub fn ticks_per_second(&self) -> f32 {
-        self.bpm as f32 * 0.4
-    }
-
     // --- Cursor manipulation ---
 
     /// Jump to `(table_position, row)` at `speed`; if `speed == 0`, reset to

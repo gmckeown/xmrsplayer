@@ -54,13 +54,23 @@ pub struct XmrsPlayer<'a> {
     /// Scratch buffer that `Voices::mix` fills when the channels-observer
     /// list is non-empty. Pre-allocated to `num_channels` at construction
     /// and reused on every `sample()` so the hot path never allocates.
-    per_channel_buffer: Vec<(f32, f32)>,
+    /// Per-channel pre-gain mix snapshot in `i16` PCM —
+    /// what observers and `samples_from_channels` return.
+    /// Pre-allocated to `num_channels` at construction and
+    /// reused on every `sample()` so the hot path never
+    /// allocates.
+    per_channel_buffer: Vec<(i16, i16)>,
 
-    /// Facade-owned sample clock: fractional samples remaining before the
-    /// next song tick boundary. Decremented once per sample; when it
-    /// reaches 0 we step the sequencer.
-    remaining_samples_in_tick: f32,
-    sample_rate: f32,
+    /// Facade-owned sample clock. Q.16 sample accumulator —
+    /// decremented by `1 << 16` each output sample, refilled
+    /// by `samples_per_tick_q16` on tick boundaries. Keeps the
+    /// fractional samples-per-tick (for BPMs that don't divide
+    /// the sample rate evenly) without ever touching f32.
+    remaining_samples_in_tick: i64,
+    /// Cached integer sample rate. Used both by the user-facing
+    /// `f32` getter (lossless widen) and by the integer Q.16
+    /// clock arithmetic.
+    sample_rate_hz: u32,
 
     /// Running total of stereo samples produced. Exposed read-only — writing
     /// it from outside would desync the internal clock, which is why the
@@ -74,7 +84,7 @@ pub struct XmrsPlayer<'a> {
     /// `None` when the next `Iterator::next()` should pull a new stereo
     /// sample; `Some(r)` when we already produced the left half and owe
     /// the caller the right.
-    right_sample: Option<f32>,
+    right_sample: Option<i16>,
 
     pause: bool,
 
@@ -95,7 +105,7 @@ impl<'a> XmrsPlayer<'a> {
     /// is driven entirely by `module.profile.format`. `ModuleFormat::Xm`
     /// activates the canonical FT2 reference behaviour, all other
     /// formats use their own native semantics.
-    pub fn new(module: &'a Module, sample_rate: f32, song: usize) -> Self {
+    pub fn new(module: &'a Module, sample_rate: u32, song: usize) -> Self {
         Self::new_with_voice_pool_capacity(module, sample_rate, song, DEFAULT_VOICE_POOL_CAPACITY)
     }
 
@@ -116,10 +126,11 @@ impl<'a> XmrsPlayer<'a> {
     ///   even 256 voices is too much state to keep around.
     pub fn new_with_voice_pool_capacity(
         module: &'a Module,
-        sample_rate: f32,
+        sample_rate: u32,
         song: usize,
         voice_pool_capacity: usize,
     ) -> Self {
+        let sample_rate = sample_rate.max(1);
         let sequencer = Sequencer::new(module, song);
         let voices = Voices::new_with_voice_pool_capacity(
             module,
@@ -138,9 +149,9 @@ impl<'a> XmrsPlayer<'a> {
             audio_mix_observers: Vec::new(),
             audio_channels_observers: Vec::new(),
             midi_observers: Vec::new(),
-            per_channel_buffer: vec![(0.0, 0.0); num_channels],
-            remaining_samples_in_tick: 0.0,
-            sample_rate,
+            per_channel_buffer: vec![(0, 0); num_channels],
+            remaining_samples_in_tick: 0,
+            sample_rate_hz: sample_rate,
             generated_samples: 0,
             right_sample: None,
             pause: false,
@@ -264,8 +275,17 @@ impl<'a> XmrsPlayer<'a> {
 
     // --- Clock / cursor accessors (preserve pre-0.10 API) ---
 
-    pub fn get_sample_rate(&self) -> f32 {
-        self.sample_rate
+    /// Output sample-rate in Hz.
+    pub fn get_sample_rate(&self) -> u32 {
+        self.sample_rate_hz
+    }
+
+    /// Alias of [`Self::get_sample_rate`] returning the typed
+    /// `SampleRate` newtype. Kept for the older `_q` naming
+    /// convention.
+    #[doc(hidden)]
+    pub fn get_sample_rate_q(&self) -> xmrs::fixed::units::SampleRate {
+        xmrs::fixed::units::SampleRate::from_hz(self.sample_rate_hz)
     }
 
     pub fn get_tempo(&self) -> usize {
@@ -316,19 +336,31 @@ impl<'a> XmrsPlayer<'a> {
 
     // --- Global gain accessors (replace pre-0.10 `pub` fields) ---
 
-    pub fn global_volume(&self) -> f32 {
+    /// Q1.15 song-driven master volume.
+    pub fn global_volume(&self) -> xmrs::fixed::units::Volume {
         self.voices.global_volume()
     }
-
-    pub fn set_global_volume(&mut self, v: f32) {
+    /// Set song-driven master volume.
+    pub fn set_global_volume(&mut self, v: xmrs::fixed::units::Volume) {
+        self.voices.set_global_volume(v);
+    }
+    /// Alias kept for the older `_q` naming convention.
+    #[doc(hidden)]
+    pub fn set_global_volume_q(&mut self, v: xmrs::fixed::units::Volume) {
         self.voices.set_global_volume(v);
     }
 
-    pub fn amplification(&self) -> f32 {
+    /// Q4.12 user-driven amplification (up to 8×).
+    pub fn amplification(&self) -> xmrs::fixed::units::Amplification {
         self.voices.amplification()
     }
-
-    pub fn set_amplification(&mut self, a: f32) {
+    /// Set user-driven amplification.
+    pub fn set_amplification(&mut self, a: xmrs::fixed::units::Amplification) {
+        self.voices.set_amplification(a);
+    }
+    /// Alias kept for the older `_q` naming convention.
+    #[doc(hidden)]
+    pub fn set_amplification_q(&mut self, a: xmrs::fixed::units::Amplification) {
         self.voices.set_amplification(a);
     }
 
@@ -344,7 +376,7 @@ impl<'a> XmrsPlayer<'a> {
         }
         self.voices.reset_for_goto();
         // Force next()/sample() to re-tick immediately.
-        self.remaining_samples_in_tick = 0.0;
+        self.remaining_samples_in_tick = 0;
         // Clear the "song end" latch so a post-song goto re-enables playback
         // (if `max_loop_count` still gates it, SongEnd will re-fire; that's OK).
         self.song_end_notified = false;
@@ -359,7 +391,7 @@ impl<'a> XmrsPlayer<'a> {
     ///
     /// Returns `false` to signal end-of-song.
     fn step(&mut self) -> bool {
-        if self.remaining_samples_in_tick <= 0.0 {
+        if self.remaining_samples_in_tick <= 0 {
             match self.sequencer.advance_tick() {
                 TickOutcome::SongEnd => {
                     if !self.song_end_notified {
@@ -467,10 +499,27 @@ impl<'a> XmrsPlayer<'a> {
                 self.last_propagated_tempo = cur_tempo;
             }
 
-            /* FT2 manual: number of ticks / second = BPM * 0.4 */
-            self.remaining_samples_in_tick += self.sample_rate / self.sequencer.ticks_per_second();
+            // FT2 manual: number of ticks / second = BPM × 0.4 =
+            //   BPM × 2 / 5. So samples_per_tick = sample_rate ×
+            //   5 / (BPM × 2). In Q.16 raw:
+            //     samples_per_tick_q16 =
+            //         (sample_rate × 5 << 16) / (bpm × 2)
+            //       = (sample_rate << 15) × 5 / bpm
+            // Worst case at 192 kHz / 1 BPM: ~3 × 10^10, fits u64.
+            //
+            // BPM is clamped to ≥ 1 to avoid divide-by-zero on
+            // pathological modules. The OLD f32 path silently
+            // returned `inf` and stalled the clock; the integer
+            // path keeps stepping by holding the previous tick
+            // duration.
+            let bpm = self.sequencer.bpm().max(1) as u64;
+            let samples_per_tick_q16: u64 =
+                ((self.sample_rate_hz as u64) << 15) * 5 / bpm;
+            self.remaining_samples_in_tick =
+                self.remaining_samples_in_tick.saturating_add(samples_per_tick_q16 as i64);
         }
-        self.remaining_samples_in_tick -= 1.0;
+        // Decrement by one whole sample (= 1.0 in Q.16).
+        self.remaining_samples_in_tick -= 1 << 16;
         true
     }
 
@@ -489,9 +538,9 @@ impl<'a> XmrsPlayer<'a> {
     /// `Iterator` impl; they are **not** fired when samples are pulled
     /// through `samples_from_channels`, to avoid double dispatch if a
     /// caller mixes both APIs.
-    pub fn samples_from_channels(&mut self) -> Option<Vec<(f32, f32)>> {
+    pub fn samples_from_channels(&mut self) -> Option<Vec<(i16, i16)>> {
         if self.pause {
-            return Some(vec![(0.0, 0.0); self.voices.num_channels()]);
+            return Some(vec![(0, 0); self.voices.num_channels()]);
         }
         if !self.step() {
             return None;
@@ -502,64 +551,85 @@ impl<'a> XmrsPlayer<'a> {
     }
 
     /// Sum per-channel samples into a stereo pair, without gain.
-    pub fn samples_to_sample(&self, samples: &[(f32, f32)]) -> (f32, f32) {
-        samples
+    /// Saturating i32 accumulator so 64+ stacked channels can't
+    /// overflow in pathological mixes — clamps to `i16` on the
+    /// way out.
+    pub fn samples_to_sample(&self, samples: &[(i16, i16)]) -> (i16, i16) {
+        let (al, ar) = samples
             .iter()
-            .fold((0.0, 0.0), |(acc_l, acc_r), (l, r)| (acc_l + l, acc_r + r))
+            .fold((0i32, 0i32), |(acc_l, acc_r), (l, r)| {
+                (acc_l + *l as i32, acc_r + *r as i32)
+            });
+        (
+            al.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            ar.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+        )
     }
 
-    /// Apply `global_volume * amplification` to a per-channel sample set and
-    /// fold to a single stereo pair. Intended to be paired with
-    /// [`samples_from_channels`](Self::samples_from_channels).
-    pub fn samples_apply_volume(&self, samples: &[(f32, f32)]) -> (f32, f32) {
-        let g = self.voices.global_volume() * self.voices.amplification();
+    /// Apply `global_volume * amplification` to a per-channel
+    /// sample set and fold to a single stereo pair. Intended to
+    /// be paired with [`samples_from_channels`](Self::samples_from_channels).
+    /// Pure integer Q-format — `Volume` (Q1.15) and `Amplification`
+    /// (Q4.12) compose to Q5.27 then narrow back to `i16`.
+    pub fn samples_apply_volume(&self, samples: &[(i16, i16)]) -> (i16, i16) {
+        let gv = self.voices.global_volume().as_q15_i32(); // Q1.15
+        let amp = self.voices.amplification().as_q4_12_i32(); // Q4.12
         let (l, r) = self.samples_to_sample(samples);
-        (l * g, r * g)
+        // sample × gv × amp: Q1.15 × Q4.12 → Q5.27, narrow with
+        // round-half bias before clamp to i16.
+        let scale_q27 = gv as i64 * amp as i64;
+        let l64 = (l as i64).wrapping_mul(scale_q27);
+        let r64 = (r as i64).wrapping_mul(scale_q27);
+        let bias = 1i64 << 26;
+        let li = if l64 >= 0 { (l64 + bias) >> 27 } else { -(((-l64) + bias) >> 27) };
+        let ri = if r64 >= 0 { (r64 + bias) >> 27 } else { -(((-r64) + bias) >> 27) };
+        (
+            li.clamp(i16::MIN as i64, i16::MAX as i64) as i16,
+            ri.clamp(i16::MIN as i64, i16::MAX as i64) as i16,
+        )
     }
 
-    /// Return the sum of the samples from all channels, optionally scaled by
-    /// `global_volume * amplification`. This is the hot path used by the
-    /// `Iterator` impl.
+    /// Return the sum of the samples from all channels,
+    /// optionally scaled by `global_volume * amplification`.
+    /// Hot path used by the `Iterator` impl. Output is `i16`
+    /// PCM.
     ///
-    /// Semantically identical to `samples_from_channels().map(samples_apply_volume)`,
-    /// but walks channels once with an `(f32, f32)` accumulator and never
-    /// allocates a per-sample `Vec`.
-    ///
-    /// While paused, returns `Some((0.0, 0.0))` and still fires audio
-    /// observers with zero samples (documented contract — recorders
-    /// capturing silence, oscilloscopes drawing flatlines). Player-side
-    /// observers are not notified during pause because no song events
-    /// happen.
-    pub fn sample(&mut self, apply_volume: bool) -> Option<(f32, f32)> {
+    /// While paused, returns `Some((0, 0))` and still fires
+    /// audio observers with zero samples (documented contract —
+    /// recorders capturing silence, oscilloscopes drawing
+    /// flatlines). Player-side observers are not notified
+    /// during pause because no song events happen.
+    pub fn sample(&mut self, apply_volume: bool) -> Option<(i16, i16)> {
         if self.pause {
             self.notify_audio_observers_paused();
-            return Some((0.0, 0.0));
+            return Some((0, 0));
         }
         if !self.step() {
             return None;
         }
 
-        // Gate per-channel capture on actually having channels observers —
-        // the buffer fill has a cost even when nobody consumes it.
         let capture = !self.audio_channels_observers.is_empty();
-        let mix_pre_gain = if capture {
+        let mix_pre_gain_i32 = if capture {
             let buf = self.per_channel_buffer.as_mut_slice();
-            // Pass `false` for apply_volume — we handle gain below and we
-            // want the pre-gain value both for the channels slice and for
-            // the mix observers.
-            self.voices.mix(false, Some(buf))
+            self.voices.mix(Some(buf))
         } else {
-            self.voices.mix(false, None)
+            self.voices.mix(None)
         };
 
-        self.notify_audio_observers(mix_pre_gain);
+        // Pre-gain mix as i16 for the observer dispatch — saturating
+        // narrowing happens here. Observers see what would have hit
+        // the gain stage if it were a no-op.
+        let mix_pre_gain_i16 = Voices::saturate_to_i16(mix_pre_gain_i32);
+        self.notify_audio_observers(mix_pre_gain_i16);
 
-        // Produce the value the caller actually asked for.
         let s = if apply_volume {
-            let g = self.voices.global_volume() * self.voices.amplification();
-            (mix_pre_gain.0 * g, mix_pre_gain.1 * g)
+            // Apply final gain (gv × amp × mix_volume) to the
+            // un-clamped i32 accumulator and saturate to i16.
+            // Single-pass Q9.39 multiply — no intermediate
+            // clamp that would lose mix-bus headroom.
+            self.voices.apply_final_gain(mix_pre_gain_i32)
         } else {
-            mix_pre_gain
+            mix_pre_gain_i16
         };
 
         self.generated_samples += 1;
@@ -567,17 +637,13 @@ impl<'a> XmrsPlayer<'a> {
     }
 
     /// Dispatch audio observers for a real (non-paused) sample.
-    /// Channels observers first, then mix observers. Called only from
-    /// `sample()` — centralised so both the pause path and the normal
-    /// path share the same ordering.
-    fn notify_audio_observers(&mut self, mix: (f32, f32)) {
-        let global_volume = self.voices.global_volume();
-        let amplification = self.voices.amplification();
+    /// Channels observers first, then mix observers.
+    fn notify_audio_observers(&mut self, mix: (i16, i16)) {
+        let global_volume = self.voices.global_volume_q();
+        let amplification = self.voices.amplification_q();
 
         if !self.audio_channels_observers.is_empty() {
-            // The buffer was filled during `voices.mix(_, Some(buf))` above.
-            // Borrow immutably for the dispatch loop.
-            let channels: &[(f32, f32)] = self.per_channel_buffer.as_slice();
+            let channels: &[(i16, i16)] = self.per_channel_buffer.as_slice();
             let ctx = ChannelsContext {
                 channels,
                 global_volume,
@@ -601,20 +667,17 @@ impl<'a> XmrsPlayer<'a> {
         }
     }
 
-    /// Same as `notify_audio_observers` but for the paused path: every
-    /// per-channel entry is zero, and the mix is zero.
+    /// Same as `notify_audio_observers` but for the paused path:
+    /// every per-channel entry is zero, and the mix is zero.
     fn notify_audio_observers_paused(&mut self) {
-        let global_volume = self.voices.global_volume();
-        let amplification = self.voices.amplification();
+        let global_volume = self.voices.global_volume_q();
+        let amplification = self.voices.amplification_q();
 
         if !self.audio_channels_observers.is_empty() {
-            // Zero out the buffer — the contract says paused observers see
-            // silence across all channels. Write in place so we don't
-            // allocate on the hot path.
             for entry in self.per_channel_buffer.iter_mut() {
-                *entry = (0.0, 0.0);
+                *entry = (0, 0);
             }
-            let channels: &[(f32, f32)] = self.per_channel_buffer.as_slice();
+            let channels: &[(i16, i16)] = self.per_channel_buffer.as_slice();
             let ctx = ChannelsContext {
                 channels,
                 global_volume,
@@ -627,8 +690,8 @@ impl<'a> XmrsPlayer<'a> {
 
         if !self.audio_mix_observers.is_empty() {
             let ctx = MixContext {
-                left: 0.0,
-                right: 0.0,
+                left: 0,
+                right: 0,
                 global_volume,
                 amplification,
             };
@@ -638,8 +701,12 @@ impl<'a> XmrsPlayer<'a> {
         }
     }
 
-    /// Returns samples one after the other, starting with the left channel.
-    fn sample_one(&mut self) -> Option<f32> {
+    /// Returns samples one after the other, starting with the
+    /// left channel. Sample values are signed 16-bit PCM
+    /// (`i16::MIN..=i16::MAX`) — the format every embedded
+    /// audio codec speaks natively. Drivers that prefer a
+    /// different format do the conversion themselves.
+    fn sample_one(&mut self) -> Option<i16> {
         match self.right_sample {
             Some(right) => {
                 self.right_sample = None;
@@ -657,7 +724,7 @@ impl<'a> XmrsPlayer<'a> {
 }
 
 impl<'a> Iterator for XmrsPlayer<'a> {
-    type Item = f32;
+    type Item = i16;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.sample_one()

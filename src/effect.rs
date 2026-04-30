@@ -1,7 +1,9 @@
-pub trait EffectPlugin {
-    fn tick0(&mut self, param1: f32, param2: f32) -> f32;
-    fn tick(&mut self) -> f32;
-    fn in_progress(&self) -> bool;
-    fn retrigger(&mut self) -> f32;
-    fn value(&self) -> f32;
-}
+//! Effect-plugin module.
+//!
+//! Historically defined a `EffectPlugin` trait with `tick(&mut)
+//! -> f32` and friends, used by `EffectArpeggio` and
+//! `EffectVibratoTremolo`. The Q-format migration removed the
+//! last `f32` consumers; the trait was unused (no `dyn`, no
+//! generics, identical method names called on each concrete
+//! type) and has been deleted entirely. Inherent methods now
+//! return Q-format types or `()`.

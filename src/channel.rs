@@ -1,23 +1,26 @@
-// Float math backend (only needed when `std` is disabled).
-// Priority: std > libm > micromath.
-#[cfg(all(not(feature = "std"), not(feature = "libm"), feature = "micromath"))]
-#[allow(unused_imports)]
-use micromath::F32Ext;
-#[cfg(all(not(feature = "std"), feature = "libm"))]
-#[allow(unused_imports)]
-use num_traits::float::Float;
 use xmrs::waveform::WaveformState;
 
-use crate::effect::*;
+// Required for `Vec` under `no_std` (the `std` prelude
+// otherwise provides it). Other places in this file already use
+// the fully-qualified `alloc::vec::Vec` path, but `ghosts:
+// Vec<VoiceId>` in the channel struct definition needs the type
+// in scope.
+use alloc::vec::Vec;
+
 use crate::effect_arpeggio::EffectArpeggio;
 use crate::effect_vibrato_tremolo::EffectVibratoTremolo;
 use crate::triggerkeep::*;
 
-use crate::helper::*;
+// `helper::*` import removed: all f32 slide / lerp helpers
+// have been replaced by Q-typed `Period::saturating_add_signed`,
+// `Period::clamp`, `Period::slide_towards`, etc.
 use crate::midi_observer::MidiEvent;
 use crate::state_instr_default::StateInstrDefault;
 use crate::voice::Voice;
 use crate::voice_pool::{VoiceId, VoicePool};
+use xmrs::fixed::fixed::{Q15, Q8_8};
+use xmrs::fixed::units::Pitch as PitchQ;
+use xmrs::fixed::units::{Amp, ChannelVolume, Panning, Period, PitchDelta, SampleRate, Volume};
 use xmrs::prelude::*;
 
 /// Simplified DCT tag, extracted once from the nested
@@ -39,17 +42,57 @@ struct NoteRetrigState {
     volume_modifier: NoteRetrigOperator,
 }
 
+// =====================================================================
+// PHASE 2 TRANSITION BRIDGES (pitch chain f32 ↔ Q-format)
+// =====================================================================
+// Tour 4 status: `StateSample.{finetune}` and the
+// `get_finetuned_pitch` chain are typed `Finetune` /
+// `PitchDelta`. Note triggers compose the played MIDI note
+// (`Pitch::value() as i16` semitones) with the finetune
+// `PitchDelta` directly into a Q8.8 `PitchQ`, no f32 round
+// trip. The remaining f32 surfaces are concentrated in
+// `update_frequency`'s Amiga `log2` shim, `StateSample::set_step`
+// (mixer phase), and the public API entry points.
+
+/// Compose the played note (`Pitch::value() as i16` semitones)
+/// with the sample's finetune contribution (semitones) into the
+/// `Channel.note` field's Q8.8 `PitchQ`.
+///
+/// `played.value()` is `0..=119` (`C0..=B9`), well within the
+/// `i16 << 8` range; `finetune` is `PitchDelta` Q8.8 carrying
+/// at most `relative_pitch as i16 + ±1 semitone`. The sum
+/// saturates inside the Q8.8 i16 range — `relative_pitch` is
+/// import-clamped to `[-95, +96]` so the worst-case sum is
+/// `(119 + 96 + 1) × 256 = 55296`, comfortably below
+/// `i16::MAX = 32767 × ?` — wait, `55296 > 32767`. So we DO
+/// saturate at high keys with high `relative_pitch`. That
+/// matches the OLD f32 behaviour as far as the downstream
+/// period table is concerned (clamped at note 119) — and the
+/// XM/IT reference players also clamp there.
+#[inline]
+fn compose_played_pitch(played: Pitch, finetune: PitchDelta) -> PitchQ {
+    let played_q = (played.value() as i16).saturating_mul(256);
+    let raw = played_q.saturating_add(finetune.as_q8_8_i16());
+    PitchQ::from_q8_8_i16(raw)
+}
+
 #[derive(Clone)]
 pub struct Channel<'a> {
     module: &'a Module,
     period_helper: PeriodHelper,
-    rate: f32,
+    rate: SampleRate,
 
-    note: f32,
+    /// Last triggered note in Q8.8 semitones (was `f32`). Bakes
+    /// in finetune from the sample at trigger time. Used by
+    /// `TonePortamento` to recompute the target period and by
+    /// the arpeggio quirk clamp (FT2). Distinct from
+    /// [`current_note`] (legacy enum, integer semitones).
+    note: PitchQ,
     /// The last Pitch enum value triggered on this channel. Parallels
-    /// `note` (which is a float that bakes in finetune); this one
-    /// keeps the clean integer-semitone identity used by DCT::Note.
-    /// `None` until the channel has seen any valid note trigger.
+    /// `note` (which is a Q8.8 semitone count baking finetune in);
+    /// this one keeps the clean integer-semitone identity used by
+    /// DCT::Note. `None` until the channel has seen any valid note
+    /// trigger.
     current_note: Option<Pitch>,
 
     /// IT MIDI-macro selector: which parametric macro slot (0..15)
@@ -67,11 +110,19 @@ pub struct Channel<'a> {
 
     pub current: TrackUnit,
 
-    period: f32,
+    /// Current period (was `f32`). Slides accumulate `i16`
+    /// deltas via `Period::saturating_add_signed`. Loss of
+    /// sub-period precision against the OLD f32 storage is
+    /// at most one LSB of period per slide step — far below a
+    /// cent of pitch.
+    period: Period,
 
-    channel_volume: f32,
-    volume: f32,  /* Ideally between 0 (muted) and 1 (loudest) */
-    panning: f32, /* Between 0 (left) and 1 (right); 0.5 is centered */
+    channel_volume: ChannelVolume,
+    /// Per-voice running volume, Q1.15 in `[0, 1]`. Was `f32`.
+    volume: Volume,
+    /// Pan position, Q1.15 in `[0, 1]`. Was `f32`. `0` = full
+    /// left, `0.5` = centre, `1` = full right.
+    panning: Panning,
 
     // Instrument
     /// 1.4 — live voice in the shared pool.
@@ -84,7 +135,8 @@ pub struct Channel<'a> {
     effect_note_retrig_backup: NoteRetrigState,
     effect_note_retrig_counter: usize,
     effect_panbrello: EffectVibratoTremolo,
-    effect_tone_portamento_goal: f32,
+    /// Tone-portamento target period. Was `f32`; now `Period`.
+    effect_tone_portamento_goal: Period,
     effect_tremolo: EffectVibratoTremolo,
     effect_tremor: bool,
     effect_tremor_on: usize,
@@ -125,7 +177,7 @@ pub struct Channel<'a> {
 
     pub muted: bool,
 
-    actual_volume: [f32; 2],
+    actual_volume: [Volume; 2],
 
     // --- IT New Note Action / past-note state ---
     //
@@ -170,7 +222,7 @@ impl<'a> Channel<'a> {
     /// effect so its FT2 LUT is usable on the very first row. The
     /// player must subsequently call [`Self::set_tempo`] whenever the
     /// song tempo changes (Fxx effect) to keep the LUT index in sync.
-    pub(crate) fn new(module: &'a Module, rate: f32, tempo: usize) -> Self {
+    pub(crate) fn new(module: &'a Module, rate: SampleRate, tempo: usize) -> Self {
         let period_helper = PeriodHelper::new(
             module.frequency_type,
             module.profile.quirks.ft2_arpeggio_note_clamp,
@@ -179,15 +231,15 @@ impl<'a> Channel<'a> {
             module,
             period_helper: period_helper.clone(),
             rate,
-            channel_volume: 1.0,
-            volume: 1.0,
-            panning: 0.5,
-            note: 0.0,
+            channel_volume: ChannelVolume::FULL,
+            volume: Volume::FULL,
+            panning: Panning::CENTER,
+            note: PitchQ::from_q8_8(Q8_8::ZERO),
             current_note: None,
             midi_parametric_selector: 0,
             surround: false,
             current: TrackUnit::default(),
-            period: 0.0,
+            period: Period::ZERO,
             live: None,
             instr_midi_mute: false,
             effect_arpeggio: EffectArpeggio::new(module.profile.quirks.ft2_arpeggio_lut, tempo),
@@ -211,12 +263,12 @@ impl<'a> Channel<'a> {
             effect_vibrato: EffectVibratoTremolo::new(Waveform::Sine),
             vibrato_retrig_on_new_note: true,
             tremolo_retrig_on_new_note: true,
-            effect_tone_portamento_goal: 0.0,
+            effect_tone_portamento_goal: Period::ZERO,
             effect_semitone: false,
             effect_note_delay: 0,
             muted: false,
             track_index: 0,
-            actual_volume: [0.0, 0.0],
+            actual_volume: [Volume::SILENT, Volume::SILENT],
             ghosts: Vec::new(),
             nna_override: None,
             // `XorShift32::default()` uses the type's canonical
@@ -227,21 +279,14 @@ impl<'a> Channel<'a> {
         }
     }
 
-    /// Signed uniform random in `[-1.0, 1.0]`. Wraps
-    /// `XorShift32::next_f32` (which is `[0, 1]`) and centres.
-    #[inline]
-    fn rng_bipolar(&mut self) -> f32 {
-        self.rng.next_f32() * 2.0 - 1.0
-    }
-
     /// Set the channel's resting panning before any pattern row has
     /// been processed. Used by [`Voices::new`] to apply per-channel
     /// pan defaults from the module header (`Module.channel_defaults
     /// [i].panning`). For formats that don't carry per-channel pan
     /// hints, the channel stays at its centre default.
     #[inline(always)]
-    pub(crate) fn set_initial_panning(&mut self, panning: f32) {
-        self.panning = panning.clamp(0.0, 1.0);
+    pub(crate) fn set_initial_panning(&mut self, panning: Panning) {
+        self.panning = panning;
     }
 
     /// Set the channel volume before any pattern row has been
@@ -249,8 +294,8 @@ impl<'a> Channel<'a> {
     /// `initial_channel_volume` header bytes via
     /// `Module.channel_defaults[i].volume`.
     #[inline(always)]
-    pub(crate) fn set_initial_channel_volume(&mut self, volume: f32) {
-        self.channel_volume = volume.clamp(0.0, 1.0);
+    pub(crate) fn set_initial_channel_volume(&mut self, volume: ChannelVolume) {
+        self.channel_volume = volume;
     }
 
     /// Set the channel's mute flag before any pattern row has been
@@ -348,7 +393,7 @@ impl<'a> Channel<'a> {
 
     fn cut_pitch(&mut self) {
         /* NB: this is not the same as Key Off */
-        self.volume = 0.0;
+        self.volume = Volume::SILENT;
     }
 
     /// Release the currently-sustaining note.
@@ -847,8 +892,11 @@ impl<'a> Channel<'a> {
     /// normalised volume produces the same musically-meaningful
     /// value for any correctly-authored macro.
     fn macro_subst_volume(&self) -> u8 {
-        let v = (self.volume * 127.0).clamp(1.0, 127.0);
-        v as u8
+        // Q-format integer conversion: Volume Q1.15 raw `v_q` ∈
+        // `[0, 32767]` → `(v_q × 127) >> 15`, clamp `[1, 127]`.
+        let v_q = self.volume.as_q15_i16().max(0) as u32;
+        let v = ((v_q * 127) >> 15) as u8;
+        v.clamp(1, 127)
     }
 
     /// `x` — channel pan, saturated at 127. xmrs stores pan as
@@ -856,8 +904,11 @@ impl<'a> Channel<'a> {
     /// at substitution time. The musical mapping is the same once
     /// the saturation point lands at "fully right".
     fn macro_subst_pan(&self) -> u8 {
-        let p = (self.panning * 127.0).clamp(0.0, 127.0);
-        p as u8
+        // Q-format integer conversion: Panning Q1.15 raw `p_q` ∈
+        // `[0, 32767]` → `(p_q × 127) >> 15`, clamp `[0, 127]`.
+        let p_q = self.panning.as_q15_i16().max(0) as u32;
+        let p = ((p_q * 127) >> 15) as u8;
+        p.min(127)
     }
 
     /// `y` — "final" channel pan after pan envelope and pan-swing
@@ -1193,7 +1244,7 @@ impl<'a> Channel<'a> {
                         i.key_off(); // = fx_key_off
                         i.cut_pitch(); // = p->volume = 0
                         i.volume_fading_out = true;
-                        i.volume_fadeout = 0.0;
+                        i.volume_fadeout = Volume::SILENT;
                     }
                 }
                 DuplicateCheckAction::NoteOff(_) => {
@@ -1282,7 +1333,9 @@ impl<'a> Channel<'a> {
                 // For non-IT formats, default_note_volume is 1.0 so
                 // this folds to the previous behaviour.
                 let dnv = instr.current_sample_default_note_volume();
-                self.volume = (instr.volume * dnv).clamp(0.0, 1.0);
+                // Pure Q1.15: `voice_start = instr.volume × dnv`.
+                // `Volume::scaled_by` is a saturating Q15 mul.
+                self.volume = instr.volume.scaled_by(dnv);
             }
 
             // Panning reset: driven by the format's
@@ -1301,15 +1354,29 @@ impl<'a> Channel<'a> {
                 self.panning = instr.panning;
 
                 let pps = instr.pitch_pan_separation();
-                if pps != 0.0 {
-                    let note_i = self.note as i32;
+                if pps != Q15::ZERO {
+                    // `self.note` is a `Pitch` (Q8.8 semitones).
+                    // Truncate to integer semitones for the
+                    // pitch-pan separation centre comparison.
+                    let note_i = self.note.as_q8_8_i32() / 256;
                     let ppc = instr.pitch_pan_center_semitones();
-                    let shift = pps * ((note_i - ppc) as f32) / 60.0;
-                    self.panning = (self.panning + shift).clamp(0.0, 1.0);
+                    // Pure Q1.15:
+                    //   note_factor = (note_i - ppc) / 60      (small ratio)
+                    //   shift       = pps × note_factor        (Q15 sat mul)
+                    //   panning'    = panning.shifted_by(shift)
+                    //
+                    // `Q15::from_ratio` saturates the rational form
+                    // (note range up to ±71 semitones, /60 → can
+                    // exceed +1 — saturation is benign because the
+                    // pan output `shifted_by` clamps to `[0, 1]`).
+                    let note_factor = Q15::from_ratio(note_i - ppc, 60);
+                    let shift = pps.mul(note_factor);
+                    self.panning = self.panning.shifted_by(shift);
                 }
             }
 
             if !contains(flags, TRIGGER_KEEP_PERIOD) {
+                // Pitch → Period direct (no f32 round-trip).
                 self.period = self.period_helper.note_to_period(self.note);
 
                 // Reset the effect vibrato / tremolo phase on a new-note
@@ -1318,16 +1385,16 @@ impl<'a> Channel<'a> {
                 // take the `TRIGGER_KEEP_PERIOD` path above and skip this
                 // block entirely — they don't count as new-note triggers.
                 if self.vibrato_retrig_on_new_note {
-                    self.effect_vibrato.retrigger();
+                    self.effect_vibrato.retrigger_q();
                 }
                 if self.tremolo_retrig_on_new_note {
-                    self.effect_tremolo.retrigger();
+                    self.effect_tremolo.retrigger_q();
                 }
 
                 instr.update_frequency(
                     self.period,
-                    0.0,
-                    self.effect_vibrato.value(),
+                    PitchDelta::ZERO,
+                    self.effect_vibrato.value_pitch_delta(),
                     self.effect_semitone,
                 );
             }
@@ -1347,60 +1414,98 @@ impl<'a> Channel<'a> {
                     instr.random_volume_variation(),
                     instr.random_pan_variation(),
                 ),
-                None => (0.0, 0.0),
+                None => (Q15::ZERO, Q15::ZERO),
             };
-            if rvv > 0.0 {
-                let d = self.rng_bipolar() * rvv;
-                self.volume = (self.volume * (1.0 + d)).clamp(0.0, 1.0);
+            if rvv > Q15::ZERO {
+                // Pure Q1.15:
+                //   d  = next_q15_bipolar × rvv          (signed Q15)
+                //   δ  = volume × d                      (signed Q15)
+                //   v' = volume.with_tremolo(δ)          (sat add + clamp)
+                //
+                // Linearises `volume × (1 + d)` as
+                // `volume + volume × d`, which is exactly the
+                // semantic the f32 site computed (small
+                // multiplicative perturbation around unity).
+                let d = self.rng.next_q15_bipolar().mul(rvv);
+                let delta = self.volume.raw().mul(d);
+                self.volume = self.volume.with_tremolo(delta);
             }
-            if rpv > 0.0 {
-                let d = self.rng_bipolar() * rpv;
-                self.panning = (self.panning + d).clamp(0.0, 1.0);
+            if rpv > Q15::ZERO {
+                // Pure Q1.15: signed delta added to pan,
+                // saturating with clamp via `Panning::shifted_by`.
+                let d = self.rng.next_q15_bipolar().mul(rpv);
+                self.panning = self.panning.shifted_by(d);
             }
         }
     }
 
     fn tickn_update_instr(&mut self, pool: &mut VoicePool<'a>) {
         if let Some(instr) = self.live_mut(pool) {
-            // Panning
-            let space_from_center = (0.5 - (self.panning - 0.5).abs()) * 2.0;
-            let instr_env_pan_val = instr.envelope_panning.value - 0.5;
-            let panbrello = self.effect_panbrello.value();
-            let panning: f32 = self.panning
-                + instr_env_pan_val * space_from_center
-                + panbrello * space_from_center;
-            let panning = panning.clamp(0.0, 1.0);
+            // Panning chain in pure Q1.15 raw arithmetic.
+            //
+            //   pan      = self.panning             (Q1.15 [0, 32768])
+            //   spc      = 1 − 2·|pan − 0.5|        (Q1.15 [0, 32768])
+            //              = 32768 − 2·|pan − 16384|
+            //   env_off  = envelope.value − 0.5     (Q1.15 signed
+            //                                       [-16384, +16384])
+            //   panbrello = LFO output              (Q1.15 signed
+            //                                       [-32768, +32767])
+            //   panning  = pan
+            //            + (env_off    × spc) >> 15
+            //            + (panbrello  × spc) >> 15
+            //   panning = clamp(panning, 0, 32767)
+            const HALF: i32 = 16384; // 0.5 in Q1.15 raw
+            const ONE: i32 = 32768; // 1.0 in Q1.15 raw (same as Volume::FULL+1)
+            let pan_q15: i32 = self.panning.as_q15_i32();
+            let dist = (pan_q15 - HALF).abs();
+            let spc_q15: i32 = ONE - 2 * dist; // [0, 32768]
+            let env_off_q15: i32 = instr.envelope_panning.value.as_q15_i32() - HALF;
+            let panbrello_q15: i32 = self.effect_panbrello.value_q15().raw() as i32;
 
-            // Volume
-            let mut volume = 0.0;
-            if !self.effect_tremor {
-                volume = self.volume + self.effect_tremolo.value();
-                volume = volume.clamp(0.0, 1.0);
-                volume *= instr.get_volume();
-                volume *= self.channel_volume;
-            }
+            // Q1.15 × Q1.15 = Q2.30, narrow >> 15 → Q1.15.
+            // The intermediate fits in i32: max 32768 × 16384 = 5 × 10^8.
+            let env_contrib = (env_off_q15 * spc_q15) >> 15;
+            let panbrello_contrib = (panbrello_q15 * spc_q15) >> 15;
+            let panning = Panning::from_q15(Q15::from_i32_unsigned_sat(
+                pan_q15 + env_contrib + panbrello_contrib,
+            ));
 
-            // Volume and Freq in one
-            // Tracker panning is linear: 0.0 => full left, 1.0 => full right.
-            // actual_volume[0] multiplies the left sample channel,
-            // actual_volume[1] the right. This matches every historical
-            // tracker (PT/ST3/FT2/IT) and schism's `sndmix.c:544`:
-            //   chan->left_volume_new  = (realvol * pan) >> 8;
-            //   chan->right_volume_new = (realvol * (256 - pan)) >> 8;
-            self.actual_volume[0] = volume * (1.0 - panning);
-            self.actual_volume[1] = volume * panning;
+            // Volume chain: pure Q1.15 from `self.volume` to the
+            // final `Volume`.
+            //
+            //   volume.with_tremolo(tremolo)             // Volume + Q15
+            //         .scaled_by(instr.get_volume())     // × Volume
+            //         .let cv.applied_to(...)            // × ChannelVolume
+            let volume_q = if !self.effect_tremor {
+                let v = self
+                    .volume
+                    .with_tremolo(self.effect_tremolo.value_q15())
+                    .scaled_by(instr.get_volume());
+                self.channel_volume.applied_to(v)
+            } else {
+                Volume::SILENT
+            };
+
+            // Tracker panning is linear: 0 → full left, FULL → full
+            // right. `actual_volume[0]` multiplies the left sample
+            // channel, `actual_volume[1]` the right (every
+            // historical tracker — PT/ST3/FT2/IT — and schism's
+            // `sndmix.c:544`).
+            let (pan_left, pan_right) = panning.stereo_split_linear();
+            self.actual_volume[0] = volume_q.scaled_by(pan_left);
+            self.actual_volume[1] = volume_q.scaled_by(pan_right);
 
             // Frequency
             let arp_pitch = if self.current.has_arpeggio() {
-                self.effect_arpeggio.value()
+                self.effect_arpeggio.value_pitch_delta()
             } else {
-                0.0
+                PitchDelta::ZERO
             };
 
             instr.update_frequency(
                 self.period,
                 arp_pitch,
-                self.effect_vibrato.value(),
+                self.effect_vibrato.value_pitch_delta(),
                 self.effect_semitone,
             )
         }
@@ -1450,7 +1555,7 @@ impl<'a> Channel<'a> {
                     half2: n2,
                 } => {
                     if current_tick == 0 {
-                        self.effect_arpeggio.tick0(n1 as f32, n2 as f32);
+                        self.effect_arpeggio.tick0_semitones(n1, n2);
                     } else {
                         if n1 != 0 || n2 != 0 {
                             self.effect_arpeggio.tick();
@@ -1458,15 +1563,13 @@ impl<'a> Channel<'a> {
                     }
                 }
                 TrackEffect::ChannelVolume(v) => {
-                    self.channel_volume = v.clamp(0.0, 1.0);
+                    // Both sides typed: direct assignment, no bridge.
+                    self.channel_volume = v;
                 }
                 TrackEffect::ChannelVolumeSlide { speed, fine } => {
-                    // Same tick scoping as VolumeSlide: fine slides
-                    // fire once at tick 0; non-fine slides fire on
-                    // ticks > 0 only. Channel volume stays clamped
-                    // to [0, 1] (→ 0..64 in IT units).
+                    // Pure Q1.15 slide via `ChannelVolume::shifted_by`.
                     if fine == (current_tick == 0) {
-                        self.channel_volume = (self.channel_volume + speed).clamp(0.0, 1.0);
+                        self.channel_volume = self.channel_volume.shifted_by(speed);
                     }
                 }
                 TrackEffect::Glissando(glissando) => {
@@ -1478,6 +1581,7 @@ impl<'a> Channel<'a> {
                     if current_tick == 0 {
                         if let Some(pitch) = self.current.note.pitch() {
                             if let Some(instr) = self.live_mut(pool) {
+                                // `Finetune` is now end-to-end Q-typed.
                                 instr.set_finetune(finetune);
                                 // Recomputing the playback frequency
                                 // after a finetune change must use the
@@ -1487,7 +1591,10 @@ impl<'a> Channel<'a> {
                                 // to the input-note pitch and break the
                                 // remap.
                                 let played = instr.played_pitch_for(pitch);
-                                self.note = played.value() as f32 + instr.get_finetuned_pitch();
+                                self.note = compose_played_pitch(
+                                    played,
+                                    instr.get_finetuned_pitch(),
+                                );
                                 self.period = self.period_helper.note_to_period(self.note);
                             }
                         }
@@ -1711,19 +1818,27 @@ impl<'a> Channel<'a> {
                                 // No volume modification, just retrigger.
                             }
                             NoteRetrigOperator::Sum(delta) => {
-                                self.volume = (self.volume + delta).clamp(0.0, 1.0);
+                                // Pure Q1.15: saturating add of a
+                                // signed Q15 modulation, clamped to
+                                // `[0, 1]` by `with_tremolo`.
+                                self.volume = self.volume.with_tremolo(delta);
                             }
                             NoteRetrigOperator::Mul(factor) => {
-                                self.volume = (self.volume * factor).clamp(0.0, 1.0);
+                                // Pure Q1.15: Q3.13 × Q1.15 with
+                                // saturation, all in
+                                // `RetrigMul::applied_to`.
+                                self.volume = factor.applied_to(self.volume);
                             }
                         }
                     }
                 }
                 TrackEffect::Panbrello { speed: s, depth: d } => {
                     if current_tick == 0 {
-                        self.effect_panbrello.tick0(s, d);
+                        // Q-format entry: speed Q8.8, depth Q15
+                        // (panbrello modulates panning amplitude).
+                        self.effect_panbrello.tick0_q(s, d.raw());
                     } else {
-                        self.effect_panbrello.tick();
+                        self.effect_panbrello.tick_q();
                     }
                 }
                 TrackEffect::PanbrelloWaveform {
@@ -1732,18 +1847,19 @@ impl<'a> Channel<'a> {
                 } => {
                     self.effect_panbrello.data.waveform = WaveformState::new(w);
                     if r {
-                        self.effect_panbrello.retrigger();
+                        self.effect_panbrello.retrigger_q();
                     }
                 }
                 TrackEffect::Panning(p) => {
                     if current_tick == 0 {
-                        self.panning = p.clamp(0.0, 1.0);
+                        // Both sides typed — direct assignment.
+                        self.panning = p;
                     }
                 }
                 TrackEffect::PanningSlide { speed: s, fine: f } => {
-                    // Fine slides fire once at tick 0; non-fine slides fire on ticks > 0 only.
+                    // Pure Q1.15 slide via `Panning::shifted_by`.
                     if f == (current_tick == 0) {
-                        self.panning = (self.panning + s).clamp(0.0, 1.0);
+                        self.panning = self.panning.shifted_by(s);
                     }
                 }
                 TrackEffect::Portamento { speed: p, fine: f } => {
@@ -1791,38 +1907,44 @@ impl<'a> Channel<'a> {
                         current_tick != 0
                     };
                     if fires {
-                        let new_period = self.period + p;
-                        // The FT2 signed-overflow quirk is **only** in
-                        // pitchSlideDown (p > 0 = period grows). FT2's
-                        // pitchSlideUp has a plain min-clamp, not a
-                        // max-clamp, so a portamento up that happens
-                        // to land in the [32000, 32767] window must
-                        // NOT snap to 31999 — it just passes through.
-                        // Gated on `p > 0.0`.
-                        if self.module.profile.quirks.ft2_pitch_slide_overflow && p > 0.0 {
-                            let wrapped = (new_period as i32).rem_euclid(65536) as i16;
+                        // Pure integer slide: u16 + i16 → u16
+                        // (saturating). One LSB of period
+                        // precision per slide step versus the OLD
+                        // f32 storage; well below an audible cent
+                        // of pitch.
+                        let new_period = self.period.saturating_add_signed(p);
+                        if self.module.profile.quirks.ft2_pitch_slide_overflow && p > 0 {
+                            // The FT2 signed-overflow quirk is *only*
+                            // in pitchSlideDown (`p > 0` = period
+                            // grows). The clamp uses a signed `int16_t`
+                            // comparison: values in `[32000, 32767]`
+                            // snap to 31999, but once the period crosses
+                            // 32768 (i16-negative on FT2's side) the
+                            // check silently fails and the slide
+                            // freewheels into ultrasonic. Some XM
+                            // modules rely on this — preserve verbatim.
+                            //
+                            // `saturating_add_signed` already pinned
+                            // `new_period` to `≤ 0xFFFF`; the i16
+                            // sign re-emerges via `as i16`.
+                            let wrapped = new_period.raw() as i16;
                             if (32000..=32767).contains(&(wrapped as i32)) {
-                                self.period = 31999.0;
+                                self.period = Period::from_raw(31999);
                             } else {
-                                // wrapped < 32000: still climbing
-                                //   through the normal range.
-                                // wrapped ≥ 32768 (i16-negative):
-                                //   FT2's signed check fails, no clamp
-                                //   fires, period keeps growing.
-                                self.period = new_period.max(1.0);
+                                // wrapped < 32000 (kept climbing) or
+                                // wrapped ≥ 32768 (FT2 quirk lets the
+                                // period grow past the clamp).
+                                self.period = if new_period == Period::ZERO {
+                                    Period::from_raw(1)
+                                } else {
+                                    new_period
+                                };
                             }
                         } else if let Some((clamp_min, clamp_max)) =
                             self.module.profile.quirks.period_clamp
                         {
-                            // The module requests a hard period clamp.
-                            // ST3 uses this when `amigalimits` is on in
-                            // the masterflags (`[453, 3424]` in ST3
-                            // units = `[113.25, 856]` in xmrs Amiga
-                            // units — dig.c:setmasterflags, setspd).
-                            // A module authored with a clamp expects
-                            // pitch slides to stop at those bounds
-                            // rather than freewheel into ultrasonic or
-                            // sub-audible territory.
+                            // ST3 `amigalimits` clamp (e.g. `[113,
+                            // 856]`).
                             self.period = new_period.clamp(clamp_min, clamp_max);
                         } else {
                             // No explicit clamp: fall back to the
@@ -1832,30 +1954,38 @@ impl<'a> Channel<'a> {
                             // slide reach "infinitely high note" —
                             // ST3 convention without amigalimits).
                             let min_period = if self.module.profile.quirks.allow_zero_period {
-                                0.0
+                                Period::ZERO
                             } else {
-                                1.0
+                                Period::from_raw(1)
                             };
-                            self.period = new_period.clamp(min_period, 32000.0 - 1.0);
+                            self.period = new_period.clamp(min_period, Period::from_raw(31999));
                         }
                     }
                 }
                 TrackEffect::TonePortamento(p) => {
                     if current_tick == 0 {
+                        // Pitch → Period direct (no f32 round-trip).
                         self.effect_tone_portamento_goal =
                             self.period_helper.note_to_period(self.note);
                     } else {
                         if self.period != self.effect_tone_portamento_goal {
-                            slide_towards(&mut self.period, self.effect_tone_portamento_goal, p);
+                            // Pure integer slide via
+                            // `Period::slide_towards`. Stops
+                            // exactly at the goal.
+                            self.period = self
+                                .period
+                                .slide_towards(self.effect_tone_portamento_goal, p);
                         }
                     }
                 }
                 TrackEffect::Tremolo { speed: s, depth: d } => {
                     if current_tick == 0 {
+                        // Q-format entry: speed Q8.8, depth Q15
+                        // (tremolo modulates volume amplitude).
                         self.effect_tremolo.data.speed = s;
-                        self.effect_tremolo.data.depth = d;
+                        self.effect_tremolo.data.depth = d.raw();
                     } else {
-                        self.effect_tremolo.tick();
+                        self.effect_tremolo.tick_q();
                     }
                 }
                 TrackEffect::TremoloWaveform {
@@ -1940,14 +2070,16 @@ impl<'a> Channel<'a> {
                     // importer emits the normal-mode value; apply
                     // the 2× scale here on replay so the same
                     // pattern data sounds right in both modes.
-                    let d = if self.module.profile.quirks.it_old_effects {
-                        d * 2.0
+                    let depth_raw = if self.module.profile.quirks.it_old_effects {
+                        d.as_q8_8_i16().saturating_mul(2)
                     } else {
-                        d
+                        d.as_q8_8_i16()
                     };
                     if current_tick == 0 {
+                        // Vibrato depth is `PitchDelta` (Q8.8
+                        // semitones); pass the raw `i16` to the LFO.
                         self.effect_vibrato.data.speed = s;
-                        self.effect_vibrato.data.depth = d;
+                        self.effect_vibrato.data.depth = depth_raw;
                         // IT 2.14+ in normal mode advances the
                         // vibrato LFO every tick, including tick 0.
                         // Other formats (XM/MOD/S3M, and IT with
@@ -1961,10 +2093,10 @@ impl<'a> Channel<'a> {
                         if self.module.profile.quirks.it_vibrato_ticks_at_row_zero
                             && !self.module.profile.quirks.it_old_effects
                         {
-                            self.effect_vibrato.tick();
+                            self.effect_vibrato.tick_q();
                         }
                     } else {
-                        self.effect_vibrato.tick();
+                        self.effect_vibrato.tick_q();
                     }
                 }
                 TrackEffect::VibratoSpeed(s) => {
@@ -1974,7 +2106,7 @@ impl<'a> Channel<'a> {
                 }
                 TrackEffect::VibratoDepth(d) => {
                     if current_tick == 0 {
-                        self.effect_vibrato.data.depth = d;
+                        self.effect_vibrato.data.depth = d.as_q8_8_i16();
                     } else if self.module.profile.quirks.volcol_b_advances_vibrato
                         && !self.current.has_vibrato()
                     {
@@ -1992,7 +2124,7 @@ impl<'a> Channel<'a> {
                         // When a main Vibrato IS on the row, its own arm
                         // (below) calls `tick()`, so we must NOT double-
                         // tick here — hence the `!has_vibrato()` guard.
-                        self.effect_vibrato.tick();
+                        self.effect_vibrato.tick_q();
                     }
                 }
                 TrackEffect::VibratoWaveform {
@@ -2006,13 +2138,15 @@ impl<'a> Channel<'a> {
                 }
                 TrackEffect::Volume { value: v, tick: t } => {
                     if current_tick == t {
-                        self.volume = v.clamp(0.0, 1.0);
+                        // Both sides typed — direct assignment.
+                        self.volume = v;
                     }
                 }
                 TrackEffect::VolumeSlide { speed: s, fine: f } => {
-                    // Fine slides fire once at tick 0; non-fine slides fire on ticks > 0 only.
+                    // Pure Q1.15 slide via `Volume::with_tremolo`
+                    // (same shape: saturating add + clamp).
                     if f == (current_tick == 0) {
-                        self.volume = (self.volume + s).clamp(0.0, 1.0);
+                        self.volume = self.volume.with_tremolo(s);
                     }
                 }
             }
@@ -2060,7 +2194,12 @@ impl<'a> Channel<'a> {
                     // importers leave NNA = NoteCut (the default).
                     self.spawn_ghost_for_outgoing(pool);
                     let state =
-                        StateInstrDefault::new(id, instrnr, self.period_helper.clone(), self.rate);
+                        StateInstrDefault::new(
+                            id,
+                            instrnr,
+                            self.period_helper.clone(),
+                            self.rate,
+                        );
                     self.install_live(pool, state, id.midi_mute_computer);
                     // Consume any one-shot S73–S76 override — it
                     // only affects this one trigger.
@@ -2188,7 +2327,7 @@ impl<'a> Channel<'a> {
                         // key on a drum kit would slide to the
                         // wrong pitch.
                         let played = instr.played_pitch_for(pitch);
-                        self.note = played.value() as f32 + s.get_finetuned_pitch();
+                        self.note = compose_played_pitch(played, s.get_finetuned_pitch());
                         self.current_note = Some(pitch);
                         return;
                     }
@@ -2242,7 +2381,7 @@ impl<'a> Channel<'a> {
                         // unchanged and this matches the previous
                         // behaviour byte-for-byte.
                         let played = instr.played_pitch_for(pitch);
-                        self.note = played.value() as f32 + s.get_finetuned_pitch();
+                        self.note = compose_played_pitch(played, s.get_finetuned_pitch());
                     }
                     self.current_note = Some(pitch);
 
@@ -2366,43 +2505,60 @@ impl<'a> Channel<'a> {
     /// `VoicePool` to access ghost voices. Step 1.4 will move the
     /// live voice into the pool too, at which point this becomes a
     /// pure pool-driven mix loop.
-    pub(crate) fn next_sample(&mut self, pool: &mut VoicePool<'a>) -> Option<(f32, f32)> {
-        let mut left = 0.0f32;
-        let mut right = 0.0f32;
+    pub(crate) fn next_sample(&mut self, pool: &mut VoicePool<'a>) -> Option<(Amp, Amp)> {
+        // Q-format integer accumulation: each contributing voice
+        // is `(Amp, Amp)` Q1.15 (raw `i16`). Promote to `i32`
+        // for the sum so 64+ stacked voices can't overflow the
+        // accumulator before we narrow back to `Amp` at the
+        // bottom. Saturating clamp on each accumulation step is
+        // belt-and-braces (rare to need it in practice — a
+        // typical 32-channel mix sums to ≤ ±16 of `Amp::FULL`).
+        let mut left: i32 = 0;
+        let mut right: i32 = 0;
         let mut any = false;
 
         // Live voice.
         if let Some(i) = self.live_mut(pool) {
             if let Some((l, r)) = i.next() {
-                left += l * self.actual_volume[0];
-                right += r * self.actual_volume[1];
+                // Pure Q1.15 path. Apply `actual_volume[ch]`
+                // (Q1.15) to the raw audio (Q1.15) → Q1.15
+                // saturating, then accumulate in i32.
+                self.actual_volume[0].apply(l).accumulate_into(&mut left);
+                self.actual_volume[1].apply(r).accumulate_into(&mut right);
                 any = true;
             }
         }
 
-        // Ghost voices. Each ghost owns its frozen gain / pan, so
-        // we just accumulate. Stale handles (which 1.3 shouldn't
-        // produce but the pool tolerates) are skipped silently.
+        // Ghost voices. Each ghost owns its frozen gain / pan,
+        // so we just accumulate.
         for id in &self.ghosts {
             if let Some(g) = pool.get_mut(*id) {
                 if let Some((l, r)) = g.next() {
-                    left += l;
-                    right += r;
+                    l.accumulate_into(&mut left);
+                    r.accumulate_into(&mut right);
                     any = true;
                 }
             }
         }
 
         if any {
-            // S91 surround: invert the right channel's phase. This
-            // is IT's canonical pseudo-stereo trick — the signal
-            // folds to silence in mono and reads as unusually wide
-            // in a stereo field. Applied post-mix so it covers both
-            // live and ghost contributions with the same phase.
+            // S91 surround: invert the right channel's phase.
+            // Negate at the i32 layer so we don't clip a
+            // silent-into-silent fold. The accumulator can't
+            // reach `i32::MIN` (each voice contributes
+            // ≤ ±0x7FFF, hundreds of voices ≪ 2^31).
             if self.surround {
                 right = -right;
             }
-            Some((left, right))
+            // Narrow back to Q1.15 with saturation. The
+            // per-channel accumulator may exceed one Q1.15
+            // unit when several voices stack at full volume —
+            // that's expected; the final mix-bus saturation
+            // happens in `voices.mix`.
+            Some((
+                Amp::from_q15_i32_sat(left),
+                Amp::from_q15_i32_sat(right),
+            ))
         } else {
             None
         }
