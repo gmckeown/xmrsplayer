@@ -93,14 +93,3 @@ path = "examples/arp_bug.rs"
 name = "rodio_player"
 path = "examples/rodio_player.rs"
 required-features = ["demo"]
-
-[[example]]
-name = "sizetest"
-path = "examples/sizetest.rs"
-
-[profile.release-bloat]
-inherits = "release"
-lto = false
-codegen-units = 16
-strip = false
-debug = false
