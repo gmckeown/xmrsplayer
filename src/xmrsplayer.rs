@@ -99,12 +99,21 @@ impl<'a> XmrsPlayer<'a> {
     /// (`Another Life` and the like), use
     /// [`Self::new_with_voice_pool_capacity`] to raise this limit.
     ///
-    /// Format-specific FT2/XM behaviour — arpeggio LUT, E60 pattern-
-    /// loop bug, arpeggio period clamp, portamento-down signed-
-    /// overflow, K00-eats-note, vol-col `Bx` advancing the vibrato —
-    /// is driven entirely by `module.profile.format`. `ModuleFormat::Xm`
-    /// activates the canonical FT2 reference behaviour, all other
-    /// formats use their own native semantics.
+    /// Per-format runtime behaviour — FT2's arpeggio LUT and
+    /// `E60` pattern-loop bug, the arpeggio period clamp,
+    /// portamento-down signed overflow, `K00`-eats-note, vol-col
+    /// `Bx` advancing the vibrato; IT's persistent tremor state,
+    /// pan-reset policy, and tick-zero vibrato; the per-format
+    /// `Sample.volume` semantics; and so on — is driven by
+    /// individual flags on `module.profile.quirks`
+    /// ([`PlaybackQuirks`](xmrs::module::PlaybackQuirks)). The
+    /// `module.profile.format` field is metadata only (display,
+    /// export, editor UI). Importers populate the quirks via
+    /// `CompatibilityProfile::ft2()` / `it214()` / `pt()` /
+    /// `st3()` / `modern()`, which preset coherent quirk
+    /// bundles per format; an editor or modern authored module
+    /// can compose the quirks freely without lying about the
+    /// format tag.
     pub fn new(module: &'a Module, sample_rate: u32, song: usize) -> Self {
         Self::new_with_voice_pool_capacity(module, sample_rate, song, DEFAULT_VOICE_POOL_CAPACITY)
     }

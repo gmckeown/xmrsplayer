@@ -398,28 +398,31 @@ impl<'a> Channel<'a> {
 
     /// Release the currently-sustaining note.
     ///
-    /// Behaviour depends on the module's canonical format (`module.profile.format`),
-    /// not on the FT2-quirks flag, because "how a note-off should sound" is
-    /// a format-level semantic, not an FT2 bug:
+    /// Behaviour is driven by
+    /// `module.profile.quirks.keyoff_cuts_without_vol_env`,
+    /// which the importers preset per format because "how a
+    /// note-off should sound" is a format-level semantic, not
+    /// an FT2 bug:
     ///
-    /// * `ModuleFormat::Xm` — reproduce `ft2_replayer.c:keyOff()`:
-    ///   if the instrument has a volume envelope, flip `sustained` so the
-    ///   envelope enters its release segment and `volume_fadeout` starts
+    /// * Quirk **on** (XM via `CompatibilityProfile::ft2()`) —
+    ///   reproduce `ft2_replayer.c:keyOff()`: if the instrument
+    ///   has a volume envelope, flip `sustained` so the envelope
+    ///   enters its release segment and `volume_fadeout` starts
     ///   counting down; otherwise CUT the channel volume to zero
     ///   immediately. The FT2 source branches identically on
     ///   `volEnvFlags & ENV_ENABLED`.
     ///
-    /// * `ModuleFormat::It` / `Mod` / `S3m` / `Unknown` — rely on
-    ///   `StateInstrDefault::key_off()` which flips `sustained = false`
-    ///   (and cuts iff the instrument has no envelope AND zero fadeout).
-    ///   This is the IT release model and the sensible fallback
-    ///   elsewhere.
+    /// * Quirk **off** (IT / MOD / S3M / modern) — rely on
+    ///   `StateInstrDefault::key_off()` which flips
+    ///   `sustained = false` (and cuts iff the instrument has
+    ///   no envelope AND zero fadeout). This is the IT release
+    ///   model and the sensible fallback elsewhere.
     ///
-    /// The `tick` parameter is kept in the signature so callers (Kxx
-    /// effect at ticks > 0, note-column `===` at tick 0, note-delay
-    /// paths) don't need to case-split. FT2 itself also ignores which
-    /// tick the key-off lands on — the branch on envelope is the only
-    /// real decision.
+    /// The `tick` parameter is kept in the signature so callers
+    /// (Kxx effect at ticks > 0, note-column `===` at tick 0,
+    /// note-delay paths) don't need to case-split. FT2 itself
+    /// also ignores which tick the key-off lands on — the branch
+    /// on envelope is the only real decision.
     fn key_off(&mut self, _tick: usize, pool: &mut VoicePool<'a>) {
         let Some(i) = self.live_mut(pool) else {
             self.cut_pitch();
@@ -429,11 +432,12 @@ impl<'a> Channel<'a> {
         let had_vol_env = i.has_volume_envelope();
         i.key_off();
 
-        // XM canonical: FT2's `keyOff()` cuts `realVol` / `outVol`
-        // to zero (quick-ramped, anti-click) when the instrument has
-        // no volume envelope. This is not an FT2 bug — it is how XM
-        // modules are meant to sound — so it is gated on the module's
-        // declared format, not on the FT2-quirks opt-in.
+        // FT2's `keyOff()` cuts `realVol` / `outVol` to zero
+        // (quick-ramped, anti-click) when the instrument has no
+        // volume envelope. This isn't an FT2 bug — it's how XM
+        // modules are meant to sound — so it lives on
+        // `keyoff_cuts_without_vol_env`, which the FT2 profile
+        // sets and others leave off.
         if self.module.profile.quirks.keyoff_cuts_without_vol_env && !had_vol_env {
             self.cut_pitch();
         }
@@ -2424,11 +2428,13 @@ impl<'a> Channel<'a> {
         // of that row is effectively dropped.
         //
         // Key constraints:
-        //   - This is canonical XM behaviour: `module.profile.format ==
-        //     ModuleFormat::Xm` is now the single source of truth for
-        //     "apply FT2 replay semantics", so every XM module gets
-        //     this quirk automatically. (There is no longer a separate
-        //     `ft2_quirks` flag — format IS the switch.)
+        //   - This is canonical FT2/XM behaviour, gated on
+        //     `module.profile.quirks.k00_eats_note`. The FT2
+        //     `CompatibilityProfile` sets it; modern / IT / S3M /
+        //     MOD profiles leave it off. (Per the
+        //     `PlaybackQuirks` design contract, runtime decisions
+        //     never test `module.profile.format` directly — the
+        //     format is metadata only.)
         //   - Only K00 (param 0) short-circuits. For Kxy with y > 0 FT2
         //     takes the normal getNewNote path and then fires keyOffCmd at
         //     tick y, which means the note DOES play. Use
