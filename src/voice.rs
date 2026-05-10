@@ -275,11 +275,27 @@ impl<'a> Voice<'a> {
         if !self.instr.is_enabled() {
             return false;
         }
-        // Only voices that are explicitly fading AND have run their
-        // fadeout register to zero are dead. Everything else — held
-        // sustain, in-release with no fade armed yet, mid-fade —
-        // stays alive.
-        !(self.instr.volume_fading_out && self.instr.volume_fadeout.raw() == Q15::ZERO)
+        // Schism's reap condition is `CHN_NOTEFADE && (fadeout|left|right) == 0`.
+        // We have the fadeout-register half here; the envelope-driven half
+        // covers the case where the volume envelope walks past its last
+        // point AND that last point is zero — at which point the voice's
+        // contribution is permanently silent regardless of the fadeout
+        // register, but the existing predicate would keep it alive forever
+        // on instruments authored with `fadeout = 0` and NNA != Cut
+        // (a legal IT combination — see myheart.it inst 1 / 7).
+        if self.instr.volume_fading_out {
+            // Half 1: explicit fade ran the register to zero.
+            if self.instr.volume_fadeout.raw() == Q15::ZERO {
+                return false;
+            }
+            // Half 2: envelope settled at zero past its last point.
+            if self.instr.envelope_volume.is_past_last_point()
+                && self.instr.envelope_volume.value.is_silent()
+            {
+                return false;
+            }
+        }
+        true
     }
 
     /// Produce one stereo sample. Mirrors the gain formula used in

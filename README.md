@@ -28,6 +28,7 @@ Minimal example (desktop, `std`):
 
 ```rust
 use xmrs::prelude::*;
+use xmrs::fixed::units::Amplification;
 use xmrsplayer::prelude::*;
 
 let bytes = std::fs::read("song.xm")?;
@@ -36,13 +37,16 @@ let module = Module::load(&bytes)?;
 // Default voice pool capacity (256, matching schism's MAX_VOICES) —
 // see `XmrsPlayer::new_with_voice_pool_capacity` if you need more
 // (NNA-heavy modules) or fewer (embedded targets).
-let mut player = XmrsPlayer::new(&module, 48_000.0, /* song */ 0);
-player.set_amplification(1.0);        // unity by default; raise for more presence
-player.set_max_loop_count(1);         // 0 = loop forever
+let mut player = XmrsPlayer::new(&module, 48_000, /* song */ 0);
+player.set_amplification(Amplification::UNITY); // unity by default; raise for more presence
+player.set_max_loop_count(1);                   // 0 = loop forever
 
-// The player is an Iterator<Item = f32> producing interleaved L/R samples.
+// The player is an `Iterator<Item = i16>` producing Q1.15 interleaved
+// L/R samples. Most audio backends (cpal, rodio, hound, ...) accept i16
+// natively; if your backend wants f32, divide each sample by 32768.0 at
+// the boundary.
 for sample in player.by_ref().take(48_000 * 2) {
-    // hand `sample` to your audio backend (cpal, rodio, hound, ...)
+    // hand `sample` to your audio backend
 }
 ```
 
@@ -54,7 +58,7 @@ the pool capacity at construction:
 
 ```rust
 let mut player = XmrsPlayer::new_with_voice_pool_capacity(
-    &module, 48_000.0, /* song */ 0, /* capacity */ 1024
+    &module, 48_000, /* song */ 0, /* capacity */ 1024
 );
 ```
 
@@ -62,6 +66,31 @@ The default is sized to match how the original trackers behaved — go
 above it only when you have evidence the song needs it.
 
 The player also exposes a subscription API — hook into row/tick changes with `PlayerObserver`, into the produced audio stream with `MixObserver` / `ChannelsObserver` (VU-meters, WAV recorders, visualisers), or into MIDI events emitted by IT `Zxx` macros with `MidiObserver` (bridge to external synths or hardware). See [OBSERVERS.md](OBSERVERS.md).
+
+### Talking to the player in `f32`
+
+The player's API is fixed-point: `Amplification` is Q4.12, the iterator yields Q1.15 `i16`. Most desktop integrations want to expose a slider in linear `f32` units, so `xmrs` provides one-line bridges from / to `f32` for every Q-format newtype, gated behind the `float-helpers` cargo feature.
+
+The default `xmrsplayer` build (the `std` feature is on) already forwards `xmrs/float-helpers`, so the conversions are available out of the box on desktop:
+
+```rust
+use xmrs::fixed::units::Amplification;
+
+// f32 → Amplification: clamps to Q4.12's representable range
+// `[-8.0, +8.0)`. Use this at the UI boundary, exactly once per
+// numeric edit; store the resulting `Amplification`, don't keep
+// the f32 around as the source of truth (every f32 ↔ Q round
+// trip drifts by up to one LSB).
+let user_slider: f32 = 1.5;
+player.set_amplification(Amplification::from_f32(user_slider));
+
+// Amplification → f32: read back for display.
+let current: f32 = player.amplification().to_f32();
+```
+
+`Volume`, `Panning`, `Amp`, `EnvValue`, `Frequency`, `Period`, etc. all expose the same `from_f32` / `to_f32` pair under the same feature.
+
+If you're targeting `no_std` (`default-features = false`), or you want the smallest possible build with no soft-float pull-in, leave the feature off and stay in fixed-point: `Amplification::UNITY`, `Amplification::from_int(2)` (= 2× gain), or `Amplification::from_raw_q4_12(0x1800)` (= 1.5× gain) cover the common cases without any `f32`.
 
 ## Cargo features
 
@@ -142,7 +171,7 @@ Interactive keys while playing: `Space` to pause, `←`/`→` to move, `Enter`/`
 - **Safety first.** Both this crate and its dependency `xmrs` are `#![forbid(unsafe_code)]`.
 - **Dependencies are lean**, and gated behind features — this matters not only for embedded.
 - **Concert pitch by default.** Notes resolve to MIDI-aligned frequencies (A-4 = 440 Hz exactly), so tracker output mixes cleanly with any 440-Hz-aligned source. The legacy FT2 / ProTracker reference values (≈ −2 cents in linear mode, ≈ +17 cents in Amiga mode) are still available in `xmrs::fixed::tables` for bit-numerical comparison against reference players.
-- **FT2/XM quirks are format-driven.** Setting `module.format = ModuleFormat::Xm` activates the canonical FT2 reference behaviour (arpeggio LUT, `E60` pattern-loop bug, arpeggio period clamp, portamento-down signed-overflow, `K00`-eats-note, vol-col `Bx` advancing vibrato). There is no separate `ft2_quirks` flag — the format *is* the switch.
+- **Playback decisions are quirk-driven.** Per-format runtime behaviour — FT2's arpeggio LUT and `E60` pattern-loop bug, IT's persistent tremor state and pan-reset policy, the per-format `Sample.volume` semantics, and so on — is exposed as individual flags on `PlaybackQuirks` inside `Module::profile`. `module.profile.format` itself is metadata only (used for display, export, and editor UI). The `CompatibilityProfile::ft2()`, `it214()`, `pt()`, etc. constructors preset coherent quirk bundles per format; an editor or modern authored module can compose the quirks freely without lying about the format tag. See `xmrs::module::PlaybackQuirks` for the canonical list.
 - **Embedded-friendly.** The code should be progressively degradable to older processors through successive optimizations, and it would be a lot of fun to see what LLVM can do with it on float-less architectures like the [Z80](https://github.com/jacobly0/llvm-project), the [MOS 6502 family](https://github.com/llvm-mos/llvm-mos), or on the 68k target.
 
 ## Contributing
