@@ -92,10 +92,7 @@ impl<'a> Voices<'a> {
     ) -> Self {
         let num_channels = module.get_num_channels();
         let sr = SampleRate::from_hz(sample_rate.max(1));
-        let mut channels = vec![
-            Channel::new(module, sr, initial_tempo);
-            num_channels
-        ];
+        let mut channels = vec![Channel::new(module, sr, initial_tempo); num_channels];
         // Apply per-channel defaults from the module header.
         // Each entry can carry a pan, a volume override, a mute
         // flag, and a surround flag — populated by importers whose
@@ -349,10 +346,7 @@ impl<'a> Voices<'a> {
     /// accumulator; if a single channel ever saturates it's
     /// the channel's own gain mistake, not a mix-bus stacking
     /// issue).
-    pub(crate) fn mix(
-        &mut self,
-        per_channel_out: Option<&mut [(i16, i16)]>,
-    ) -> (i32, i32) {
+    pub(crate) fn mix(&mut self, per_channel_out: Option<&mut [(i16, i16)]>) -> (i32, i32) {
         let mut left: i32 = 0;
         let mut right: i32 = 0;
 

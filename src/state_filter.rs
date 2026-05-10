@@ -232,10 +232,8 @@ impl StateFilter {
         // sin(omega) and cos(omega) as Q1.15. `cos = sin(· + π/2)`
         // is a quarter-cycle phase shift.
         let sin_q15 = xmrs::fixed::tables::sine(phase).raw() as i32;
-        let cos_q15 = xmrs::fixed::tables::sine(
-            phase.shifted(xmrs::fixed::units::Phase::QUARTER),
-        )
-        .raw() as i32;
+        let cos_q15 = xmrs::fixed::tables::sine(phase.shifted(xmrs::fixed::units::Phase::QUARTER))
+            .raw() as i32;
 
         // alpha = sin / (2Q). Q-format:
         //   alpha_q15 = (sin_q15 × 65536) / two_q_q16_16

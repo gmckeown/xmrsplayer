@@ -62,7 +62,18 @@ impl<'a> StateEnvelope<'a> {
         let num_points = self.env.point.len();
 
         if num_points == 0 {
-            self.value = EnvValue::default();
+            // No envelope points: hold the caller-provided default
+            // (`VOLUME_DEFAULT` = 1.0 for volume envelopes,
+            // `PAN_DEFAULT` = 0.5 for pan / pitch envelopes), not
+            // `EnvValue::default()` which is the Q1.15 zero —
+            // that would silence volume and hard-pan-left the
+            // pan envelope. Defensive: importers normally replace
+            // invalid envelopes with `Envelope::default()` whose
+            // `enabled = false`, so `tick()` shouldn't fire here in
+            // practice, but a malformed module slipping through
+            // with `enabled = true, point = []` would otherwise go
+            // silent.
+            self.value = self.default_value;
             return;
         }
 

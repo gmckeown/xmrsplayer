@@ -1323,19 +1323,38 @@ impl<'a> Channel<'a> {
 
             if !contains(flags, TRIGGER_KEEP_VOLUME) {
                 instr.volume_reset();
-                // IT's volume cascade at note-trigger time:
-                //   voice_start = Sample.volume * default_note_volume
-                //                 (i.e., GvL * Vol in IT terms)
-                // A V-column override later in effect processing
-                // replaces `self.volume` wholesale, at which point
-                // Vol is cleanly gone but GvL still scales the sample
-                // on every sample-mixer tick via `StateInstrDefault`.
-                // For non-IT formats, default_note_volume is 1.0 so
-                // this folds to the previous behaviour.
+                // Volume cascade at note-trigger time depends on
+                // the format's `Sample.volume` semantics:
+                //
+                //   IT  : `Sample.volume` (GvL) keeps scaling the
+                //         voice on every mixer tick inside
+                //         `StateInstrDefault::get_volume`. At
+                //         trigger time, only the per-sample Vol
+                //         (`default_note_volume`) seeds the
+                //         channel volume — GvL is already in the
+                //         downstream chain. A V-column override
+                //         later in effect processing replaces
+                //         `self.volume` wholesale, at which
+                //         point Vol is cleanly gone but GvL
+                //         still scales the sample.
+                //
+                //   MOD/XM/S3M : `Sample.volume` is consumed once
+                //         here as the channel's initial volume.
+                //         `default_note_volume` is 1.0 for these
+                //         formats, so this is effectively
+                //         `self.volume = Sample.volume`. The
+                //         downstream `get_volume` then skips its
+                //         `× self.volume` step (see the
+                //         `sample_volume_is_static_gain` branch
+                //         there), avoiding the squaring that
+                //         used to silently attenuate every
+                //         reduced-volume sample.
                 let dnv = instr.current_sample_default_note_volume();
-                // Pure Q1.15: `voice_start = instr.volume × dnv`.
-                // `Volume::scaled_by` is a saturating Q15 mul.
-                self.volume = instr.volume.scaled_by(dnv);
+                self.volume = if self.module.profile.quirks.sample_volume_is_static_gain {
+                    dnv
+                } else {
+                    instr.volume.scaled_by(dnv)
+                };
             }
 
             // Panning reset: driven by the format's
@@ -1591,10 +1610,8 @@ impl<'a> Channel<'a> {
                                 // to the input-note pitch and break the
                                 // remap.
                                 let played = instr.played_pitch_for(pitch);
-                                self.note = compose_played_pitch(
-                                    played,
-                                    instr.get_finetuned_pitch(),
-                                );
+                                self.note =
+                                    compose_played_pitch(played, instr.get_finetuned_pitch());
                                 self.period = self.period_helper.note_to_period(self.note);
                             }
                         }
@@ -2193,13 +2210,13 @@ impl<'a> Channel<'a> {
                     // modules this is a cheap no-op because their
                     // importers leave NNA = NoteCut (the default).
                     self.spawn_ghost_for_outgoing(pool);
-                    let state =
-                        StateInstrDefault::new(
-                            id,
-                            instrnr,
-                            self.period_helper.clone(),
-                            self.rate,
-                        );
+                    let state = StateInstrDefault::new(
+                        id,
+                        instrnr,
+                        self.period_helper.clone(),
+                        self.rate,
+                        self.module.profile.quirks.sample_volume_is_static_gain,
+                    );
                     self.install_live(pool, state, id.midi_mute_computer);
                     // Consume any one-shot S73–S76 override — it
                     // only affects this one trigger.
@@ -2555,10 +2572,7 @@ impl<'a> Channel<'a> {
             // unit when several voices stack at full volume —
             // that's expected; the final mix-bus saturation
             // happens in `voices.mix`.
-            Some((
-                Amp::from_q15_i32_sat(left),
-                Amp::from_q15_i32_sat(right),
-            ))
+            Some((Amp::from_q15_i32_sat(left), Amp::from_q15_i32_sat(right)))
         } else {
             None
         }

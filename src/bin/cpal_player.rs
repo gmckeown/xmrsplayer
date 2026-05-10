@@ -163,11 +163,7 @@ fn play_music(
     // straight through to the (now Q-typed) player ctor.
     let sample_rate_hz: u32 = sample_rate;
 
-    let player = Arc::new(Mutex::new(XmrsPlayer::new(
-        module,
-        sample_rate_hz,
-        song,
-    )));
+    let player = Arc::new(Mutex::new(XmrsPlayer::new(module, sample_rate_hz, song)));
 
     {
         let mut player_lock = player.lock().unwrap();

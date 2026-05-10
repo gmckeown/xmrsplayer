@@ -327,8 +327,19 @@ mod tests {
     fn fresh_ghost() -> Voice<'static> {
         let instr: &'static InstrDefault = Box::leak(Box::new(InstrDefault::default()));
         let ph = PeriodHelper::new(FrequencyType::LinearFrequencies, false);
-        let state = StateInstrDefault::new(instr, 0, ph, SampleRate::from_hz(44100));
-        Voice::new_ghost(state, 0, Volume::FULL, ChannelVolume::FULL, Panning::CENTER, None, None, Period::ZERO)
+        // `true` mirrors the historical unconditional `× self.volume`
+        // and keeps these NNA-bookkeeping tests behaviour-stable.
+        let state = StateInstrDefault::new(instr, 0, ph, SampleRate::from_hz(44100), true);
+        Voice::new_ghost(
+            state,
+            0,
+            Volume::FULL,
+            ChannelVolume::FULL,
+            Panning::CENTER,
+            None,
+            None,
+            Period::ZERO,
+        )
     }
 
     #[test]

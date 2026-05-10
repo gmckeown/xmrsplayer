@@ -91,6 +91,14 @@ pub struct StateInstrDefault<'a> {
     /// note-trigger, used by `volume_reset`.
     volume_orig: Volume,
 
+    /// Whether `Sample.volume` keeps acting as a static gain in
+    /// `get_volume` (IT semantics — "GvL"), or whether it has
+    /// already been consumed by the channel at trigger time
+    /// (MOD/XM/S3M). Mirrors
+    /// `PlaybackQuirks::sample_volume_is_static_gain` from
+    /// the owning `Module` and is set by the constructor caller.
+    sample_volume_is_static_gain: bool,
+
     /// Current panning, Q1.15 in `[0, 1]`. Was `f32`.
     pub panning: Panning,
 
@@ -108,6 +116,7 @@ impl<'a> StateInstrDefault<'a> {
         num: usize,
         period_helper: PeriodHelper,
         rate: SampleRate,
+        sample_volume_is_static_gain: bool,
     ) -> Self {
         let v = &instr.voice.vibrato;
         let ve = &instr.voice.volume_envelope;
@@ -135,6 +144,7 @@ impl<'a> StateInstrDefault<'a> {
             volume_fadeout: Volume::FULL,
             volume: Volume::FULL,
             volume_orig: Volume::FULL,
+            sample_volume_is_static_gain,
             panning: Panning::CENTER,
             filter,
         }
@@ -230,9 +240,7 @@ impl<'a> StateInstrDefault<'a> {
                 self.cut_pitch();
                 self.volume_fadeout = Volume::SILENT;
             }
-        } else if env.loop_enabled
-            && self.instr.voice.volume_fadeout != Volume::SILENT
-        {
+        } else if env.loop_enabled && self.instr.voice.volume_fadeout != Volume::SILENT {
             // Looped envelope with non-zero fadeout: schism's
             // `fx_key_off` line 166-167 also engages CHN_NOTEFADE
             // here. Without this trigger the looped envelope would
@@ -279,18 +287,36 @@ impl<'a> StateInstrDefault<'a> {
         // saturating Q15 mul (`Volume::scaled_by`); no float
         // anywhere.
         //
-        //   final = fadeout × env × per_voice × per_instrument
+        //   IT:        final = fadeout × env × per_instrument × per_voice(GvL)
+        //   MOD/XM/S3M: final = fadeout × env × per_instrument
         //
         // `EnvValue::applied_to` returns a `Volume` (the
         // envelope acts as a gain multiplier on the fadeout).
         // From there it's straight `Volume × Volume → Volume`.
         // `instr.voice.volume` (per-instrument scalar) is IT's
         // global-volume byte — full unity for non-IT formats.
-        self.envelope_volume
+        //
+        // For IT, `self.volume` carries `Sample.volume` (GvL) as
+        // a static gain that keeps scaling the voice on every
+        // tick. For MOD/XM/S3M, `Sample.volume` is consumed at
+        // trigger time as the channel's initial volume (see
+        // `Channel::trigger_pitch`) and `self.volume` here would
+        // be the same `Sample.volume` again — applying it would
+        // square it. The `sample_volume_is_static_gain` flag,
+        // forwarded from the module's
+        // `PlaybackQuirks::sample_volume_is_static_gain`, selects
+        // which path runs.
+        let v = self
+            .envelope_volume
             .value
             .applied_to(self.volume_fadeout)
-            .scaled_by(self.volume)
-            .scaled_by(self.instr.voice.volume)
+            .scaled_by(self.instr.voice.volume);
+
+        if self.sample_volume_is_static_gain {
+            v.scaled_by(self.volume)
+        } else {
+            v
+        }
     }
 
     /// The current sample's `default_note_volume` — IT's per-sample
@@ -613,7 +639,6 @@ impl<'a> StateInstrDefault<'a> {
 // `update_frequency` body is integer-only end-to-end.
 
 impl<'a> StateInstrDefault<'a> {
-
     /// Resolve the *output* pitch for a given input note, applying
     /// the instrument's keyboard remap if any.
     ///
@@ -763,7 +788,9 @@ mod tests {
         // doesn't actually consult the period helper, but
         // StateInstrDefault::new requires one.
         let ph = PeriodHelper::new(FrequencyType::LinearFrequencies, false);
-        StateInstrDefault::new(instr, 0, ph, SampleRate::from_hz(44100))
+        // `true` mirrors the historical default and keeps these
+        // pitch-only tests unaffected by the volume routing change.
+        StateInstrDefault::new(instr, 0, ph, SampleRate::from_hz(44100), true)
     }
 
     #[test]
@@ -889,7 +916,8 @@ mod tests {
         for _ in 0..49 {
             state.tick();
             assert_eq!(
-                state.volume_fadeout, Volume::FULL,
+                state.volume_fadeout,
+                Volume::FULL,
                 "fadeout must not decay while the release section is still playing"
             );
             assert!(

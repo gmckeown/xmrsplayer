@@ -62,7 +62,7 @@ impl<'a> StateAutoVibrato<'a> {
     pub fn tick(&mut self, _sustain: bool) {
         let speed_q16 = Self::q8_8_to_q16(self.vibrato.speed);
         let sweep_q16 = Self::q8_8_to_q16(self.vibrato.sweep);
-        let depth_raw = self.vibrato.depth.as_q8_8_i32() ; // Q8.8 i16 widened.
+        let depth_raw = self.vibrato.depth.as_q8_8_i32(); // Q8.8 i16 widened.
 
         // Advance the phase accumulator. `wrapping_add` is safe
         // here — the `u32` headroom is enormous (~4.2 M ticks

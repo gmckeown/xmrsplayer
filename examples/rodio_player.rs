@@ -109,11 +109,7 @@ fn rodio_play(
     // stream_handle.log_on_drop(false);
     let sink = rodio::Player::connect_new(&stream_handle.mixer());
 
-    let player = Arc::new(Mutex::new(XmrsPlayer::new(
-        module,
-        SAMPLE_RATE,
-        song,
-    )));
+    let player = Arc::new(Mutex::new(XmrsPlayer::new(module, SAMPLE_RATE, song)));
     {
         let mut player_lock = player.lock().unwrap();
         // Q4.12 Q-format amplification — convert the f32 CLI

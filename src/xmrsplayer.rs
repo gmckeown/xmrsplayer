@@ -513,10 +513,10 @@ impl<'a> XmrsPlayer<'a> {
             // path keeps stepping by holding the previous tick
             // duration.
             let bpm = self.sequencer.bpm().max(1) as u64;
-            let samples_per_tick_q16: u64 =
-                ((self.sample_rate_hz as u64) << 15) * 5 / bpm;
-            self.remaining_samples_in_tick =
-                self.remaining_samples_in_tick.saturating_add(samples_per_tick_q16 as i64);
+            let samples_per_tick_q16: u64 = ((self.sample_rate_hz as u64) << 15) * 5 / bpm;
+            self.remaining_samples_in_tick = self
+                .remaining_samples_in_tick
+                .saturating_add(samples_per_tick_q16 as i64);
         }
         // Decrement by one whole sample (= 1.0 in Q.16).
         self.remaining_samples_in_tick -= 1 << 16;
@@ -555,11 +555,9 @@ impl<'a> XmrsPlayer<'a> {
     /// overflow in pathological mixes — clamps to `i16` on the
     /// way out.
     pub fn samples_to_sample(&self, samples: &[(i16, i16)]) -> (i16, i16) {
-        let (al, ar) = samples
-            .iter()
-            .fold((0i32, 0i32), |(acc_l, acc_r), (l, r)| {
-                (acc_l + *l as i32, acc_r + *r as i32)
-            });
+        let (al, ar) = samples.iter().fold((0i32, 0i32), |(acc_l, acc_r), (l, r)| {
+            (acc_l + *l as i32, acc_r + *r as i32)
+        });
         (
             al.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
             ar.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
@@ -581,8 +579,16 @@ impl<'a> XmrsPlayer<'a> {
         let l64 = (l as i64).wrapping_mul(scale_q27);
         let r64 = (r as i64).wrapping_mul(scale_q27);
         let bias = 1i64 << 26;
-        let li = if l64 >= 0 { (l64 + bias) >> 27 } else { -(((-l64) + bias) >> 27) };
-        let ri = if r64 >= 0 { (r64 + bias) >> 27 } else { -(((-r64) + bias) >> 27) };
+        let li = if l64 >= 0 {
+            (l64 + bias) >> 27
+        } else {
+            -(((-l64) + bias) >> 27)
+        };
+        let ri = if r64 >= 0 {
+            (r64 + bias) >> 27
+        } else {
+            -(((-r64) + bias) >> 27)
+        };
         (
             li.clamp(i16::MIN as i64, i16::MAX as i64) as i16,
             ri.clamp(i16::MIN as i64, i16::MAX as i64) as i16,

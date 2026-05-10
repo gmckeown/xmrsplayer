@@ -515,8 +515,18 @@ mod tests {
         // of the test process. Acceptable in #[cfg(test)] only.
         let instr: &'static InstrDefault = Box::leak(Box::new(InstrDefault::default()));
         let ph = PeriodHelper::new(FrequencyType::LinearFrequencies, false);
-        let state = StateInstrDefault::new(instr, 0, ph, SampleRate::from_hz(44100));
-        Voice::new_ghost(state, 0, Volume::FULL, ChannelVolume::FULL, Panning::CENTER, None, None, Period::ZERO)
+        // `true` mirrors the historical unconditional `× self.volume`.
+        let state = StateInstrDefault::new(instr, 0, ph, SampleRate::from_hz(44100), true);
+        Voice::new_ghost(
+            state,
+            0,
+            Volume::FULL,
+            ChannelVolume::FULL,
+            Panning::CENTER,
+            None,
+            None,
+            Period::ZERO,
+        )
     }
 
     #[test]
@@ -561,11 +571,23 @@ mod tests {
         let make_voice = |vol: Volume| -> Voice<'static> {
             let instr: &'static InstrDefault = Box::leak(Box::new(InstrDefault::default()));
             let ph = PeriodHelper::new(FrequencyType::LinearFrequencies, false);
-            let mut state = StateInstrDefault::new(instr, 0, ph, SampleRate::from_hz(44100));
+            // `true` keeps `state.volume` (which the test sets just
+            // below) flowing into `get_volume`, matching the eviction-
+            // score arithmetic this test was written against.
+            let mut state = StateInstrDefault::new(instr, 0, ph, SampleRate::from_hz(44100), true);
             // `state.volume` is the per-voice scalar that flows into
             // `get_volume()` and from there into the pool's score.
             state.volume = vol;
-            Voice::new_ghost(state, 0, Volume::FULL, ChannelVolume::FULL, Panning::CENTER, None, None, Period::ZERO)
+            Voice::new_ghost(
+                state,
+                0,
+                Volume::FULL,
+                ChannelVolume::FULL,
+                Panning::CENTER,
+                None,
+                None,
+                Period::ZERO,
+            )
         };
 
         let mut pool = VoicePool::new(2);
@@ -673,10 +695,22 @@ mod tests {
     fn sustained_voice(vol: Volume) -> Voice<'static> {
         let instr: &'static InstrDefault = Box::leak(Box::new(InstrDefault::default()));
         let ph = PeriodHelper::new(FrequencyType::LinearFrequencies, false);
-        let mut state = StateInstrDefault::new(instr, 0, ph, SampleRate::from_hz(44100));
+        // `true` keeps `state.volume` in the gain chain so the
+        // eviction-score paths exercised below see the value the
+        // test assigns just below.
+        let mut state = StateInstrDefault::new(instr, 0, ph, SampleRate::from_hz(44100), true);
         state.volume = vol;
         // sustained=true is the default. Don't call key_off.
-        Voice::new_ghost(state, 0, Volume::FULL, ChannelVolume::FULL, Panning::CENTER, None, None, Period::ZERO)
+        Voice::new_ghost(
+            state,
+            0,
+            Volume::FULL,
+            ChannelVolume::FULL,
+            Panning::CENTER,
+            None,
+            None,
+            Period::ZERO,
+        )
     }
 
     /// Helper: a voice that's already in fadeout (evictable).
