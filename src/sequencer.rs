@@ -109,6 +109,17 @@ pub struct Sequencer<'a> {
     row_loop_count: Vec<Vec<usize>>,
     loop_count: usize,
     max_loop_count: usize,
+
+    /// One-shot terminator latched by an explicit end-of-song
+    /// signal — currently set by `GlobalEffect::Speed(0)` on
+    /// modules whose `PlaybackQuirks::speed_zero_ends_song` is
+    /// on (ProTracker `F00` convention). Once latched,
+    /// `is_exhausted` returns `true` for every subsequent
+    /// `advance_tick`, which guarantees `SongEnd` fires even
+    /// when `tempo` was zeroed and the row would otherwise
+    /// freeze. Cleared by `goto` so the caller can jump past
+    /// the terminator and keep playing.
+    song_end_requested: bool,
 }
 
 impl<'a> Sequencer<'a> {
@@ -148,6 +159,7 @@ impl<'a> Sequencer<'a> {
             row_loop_count: vec![vec![0; MAX_NUM_ROWS]; song_len],
             loop_count: 0,
             max_loop_count: 0,
+            song_end_requested: false,
         }
     }
 
@@ -235,6 +247,12 @@ impl<'a> Sequencer<'a> {
         // Force the next advance_tick to be treated as a row-start tick.
         self.current_tick = 0;
 
+        // Clear any latched end-of-song so the caller can jump
+        // past an `F00` terminator and keep playing — matches
+        // ProTracker's "press space to restart" behaviour after
+        // the song flag was cleared.
+        self.song_end_requested = false;
+
         true
     }
 
@@ -285,7 +303,8 @@ impl<'a> Sequencer<'a> {
     }
 
     fn is_exhausted(&self) -> bool {
-        self.max_loop_count > 0 && self.loop_count >= self.max_loop_count
+        self.song_end_requested
+            || (self.max_loop_count > 0 && self.loop_count >= self.max_loop_count)
     }
 
     /// Core of the row-start tick: apply pending jumps, consume the row's
@@ -498,7 +517,32 @@ impl<'a> Sequencer<'a> {
                         }
                     }
                     GlobalEffect::Speed(speed) => {
-                        self.tempo = speed;
+                        if speed == 0 {
+                            if self.module.profile.quirks.speed_zero_ends_song {
+                                // ProTracker `F00` / XM `F00`:
+                                // latch end-of-song. Leave
+                                // `self.tempo` untouched so the
+                                // *current* row finishes its
+                                // tick run at its previous
+                                // speed — `SongEnd` fires
+                                // before the next row's
+                                // `row_start_tick` would run.
+                                self.song_end_requested = true;
+                            }
+                            // else: `Axx` with xx=0 in S3M/IT
+                            // is documented as "ignored" (ST3
+                            // source: `if (param) speed =
+                            // param`). Leaving `self.tempo`
+                            // untouched is the correct
+                            // no-op — assigning `tempo = 0`
+                            // would freeze the row scheduler
+                            // forever (the previous behaviour
+                            // here, which was a real bug for
+                            // any S3M/IT that ever emitted
+                            // `A00`).
+                        } else {
+                            self.tempo = speed;
+                        }
                     }
                     GlobalEffect::Volume(_) | GlobalEffect::VolumeSlide { .. } => {
                         // Volume-side effects belong to `Voices`, not here.

@@ -1,10 +1,104 @@
 use clap::Parser;
 use console::{Key, Term};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
+use xmrs::duration::ModuleDuration;
 use xmrs::prelude::*;
 use xmrsplayer::prelude::*;
+
+/// Render a `Duration` as `MM:SS`. Seconds are truncated (not
+/// rounded) to match what the listener saw on the playback
+/// counter at the moment the player exited. Songs longer than
+/// 99 minutes overflow the minute field naturally
+/// (`123:45` for 2:03:45) — fine for the rare progressive-trance
+/// outlier and avoids any conditional hour-field branching.
+fn format_mm_ss(d: Duration) -> String {
+    let total = d.as_secs();
+    format!("{:02}:{:02}", total / 60, total % 60)
+}
+
+/// `println!` analogue that renders correctly when the tty is
+/// in raw mode. The reader thread in `play_music` keeps the
+/// terminal raw nearly all the time (via the
+/// `console::Term::read_key` loop, which toggles `termios` on
+/// every read), and in that mode the kernel's `\n → \r\n`
+/// translation is off — a plain `println!` then produces
+/// staircase output, each line starting at the previous
+/// line's last column instead of column 0.
+///
+/// Emitting `\r\n` explicitly works in both raw and cooked
+/// modes: the extra `\r` is a no-op in cooked mode because the
+/// `ONLCR` postprocessing already moved the cursor to column 0
+/// when it expanded the `\n`.
+macro_rules! tprintln {
+    () => {{
+        use std::io::Write as _;
+        let _ = std::io::stdout().write_all(b"\r\n");
+    }};
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        print!($($arg)*);
+        let _ = std::io::stdout().write_all(b"\r\n");
+    }};
+}
+
+/// Restore the controlling terminal to a sane cooked state.
+/// Called at the tail of `play_music` so the listener's shell
+/// is usable after the binary returns.
+///
+/// The keyboard reader thread holds the tty in raw mode (the
+/// `console::Term::read_key` API saves and restores `termios`
+/// around each individual `read`, but the thread spends
+/// essentially 100 % of its time *inside* `read_key` waiting
+/// for the next byte — so the tty is effectively always
+/// raw). When `play_music` returns and main exits, the OS
+/// reaps the reader thread without giving its current
+/// `read_key` call a chance to run the cleanup path, and the
+/// `termios` settings *persist* in the tty driver. The next
+/// process to use that tty — typically the user's shell —
+/// inherits the broken state (no echo, no line buffering, no
+/// `\n → \r\n`).
+///
+/// `stty sane` is the canonical fix for that condition. We
+/// only invoke it on Unix-like targets — Windows consoles use
+/// a different API that doesn't have the same persistence
+/// issue.
+fn restore_terminal() {
+    #[cfg(unix)]
+    {
+        // Ignore failures: if `stty` is missing or the
+        // process isn't attached to a tty, there's nothing
+        // useful to do, and we're on the exit path anyway.
+        let _ = std::process::Command::new("stty").arg("sane").status();
+    }
+}
+
+/// Observer that latches a shared boolean when the player fires
+/// `on_song_end`. The interactive event loop polls the flag
+/// every keyboard-poll tick so the binary exits as soon as
+/// the song finishes, instead of waiting for the listener to
+/// press a key.
+///
+/// `on_row` is mandatory on `PlayerObserver` (no default body),
+/// so we provide a no-op implementation; this observer only
+/// cares about the terminal event.
+struct ExitOnSongEnd {
+    flag: Arc<AtomicBool>,
+}
+
+impl PlayerObserver for ExitOnSongEnd {
+    fn on_row(&mut self, _ctx: &RowContext<'_>) {}
+    fn on_song_end(&mut self) {
+        // `Relaxed` is enough — there's no other state guarded
+        // by this flag, and the main loop only needs eventual
+        // visibility (it polls on a 50 ms cadence anyway).
+        self.flag.store(true, Ordering::Relaxed);
+    }
+}
 
 #[cfg(feature = "import_sid")]
 use xmrs::import::sid::sid_module::SidModule;
@@ -51,6 +145,18 @@ struct Cli {
     #[arg(short = 'e', long, default_value = "0")]
     speed: usize,
 
+    /// Compute the song's theoretical duration and exit without
+    /// playing anything. The duration is reported as `MM:SS`,
+    /// using the row-scheduler walker from `xmrs::duration` —
+    /// every tempo / BPM / pattern-jump / pattern-loop /
+    /// position-jump effect on the song's flow control is
+    /// honoured, so the result is the same length the
+    /// interactive player would produce (modulo the same caveats
+    /// the estimator itself documents: infinite loops are
+    /// capped, pattern-delay stacking is honoured).
+    #[arg(short = 'D', long, default_value = "false")]
+    duration: bool,
+
     /// Test SID player as a Proof of Concept
     #[cfg(feature = "import_sid")]
     #[arg(short = 'z', long, default_value = "false")]
@@ -78,6 +184,15 @@ fn sid_test_player(cli: &Cli) {
 
     let leaked_modules: &'static [Module] = Box::leak(modules.into_boxed_slice());
     let module_ref: &'static Module = &leaked_modules[0];
+
+    // `--duration` short-circuits here too — the SID-test path
+    // can answer the question without ever spinning up an audio
+    // stream.
+    if cli.duration {
+        let d = module_ref.duration(cli.song);
+        println!("{}", format_mm_ss(d));
+        return;
+    }
 
     play_music(
         module_ref,
@@ -113,6 +228,15 @@ fn main() -> Result<(), std::io::Error> {
         match Module::load(&contents) {
             Ok(module) => {
                 drop(contents); // cleanup memory
+                // `--duration` short-circuits before any audio
+                // setup: we just want the theoretical length of
+                // the chosen sub-song. Print as `MM:SS` and
+                // exit — no playback, no device probing.
+                if cli.duration {
+                    let d = module.duration(cli.song);
+                    println!("{}", format_mm_ss(d));
+                    return Ok(());
+                }
                 println!("Playing {} !", module.name);
 
                 let module = Box::new(module);
@@ -165,6 +289,19 @@ fn play_music(
 
     let player = Arc::new(Mutex::new(XmrsPlayer::new(module, sample_rate_hz, song)));
 
+    // Keep a clone alive past the consumption paths below — we
+    // need to read `generated_samples()` once playback is done
+    // (either the WAV writer is exhausted or the user quits the
+    // interactive loop) so we can compare actual elapsed time
+    // against the duration estimator's prediction.
+    let player_summary = Arc::clone(&player);
+
+    // Latched by `ExitOnSongEnd::on_song_end` from the cpal
+    // callback thread; read by the interactive event loop
+    // below. When set, the loop exits — the binary returns to
+    // `main` without waiting for the listener to press a key.
+    let song_ended = Arc::new(AtomicBool::new(false));
+
     {
         let mut player_lock = player.lock().unwrap();
         // Q4.12 Q-format amplification — convert the f32 CLI
@@ -175,12 +312,22 @@ fn play_music(
                 .clamp(i16::MIN as f32, i16::MAX as f32)) as i16,
         ));
         if debug {
-            println!("Debug on");
-            println!("Module format: {:?}", module.profile.format);
+            tprintln!("Debug on");
+            tprintln!("Module format: {:?}", module.profile.format);
             // In 0.10+ the inline `debug(bool)` toggle has been replaced by a
             // standalone observer — register it explicitly.
             player_lock.add_observer(Box::new(DebugObserver::new()));
         }
+        // Auto-exit observer — registered for both consumption
+        // paths so the same flag drives the interactive loop's
+        // exit condition. (The WAV path doesn't need it, since
+        // `write_wave` runs the iterator to natural exhaustion,
+        // but registering unconditionally keeps the setup
+        // symmetrical and the observer's overhead is one
+        // atomic store on the song-end event.)
+        player_lock.add_observer(Box::new(ExitOnSongEnd {
+            flag: Arc::clone(&song_ended),
+        }));
         if ch != 0 {
             player_lock.mute_all(true);
             player_lock.set_mute_channel((ch - 1).into(), false);
@@ -190,7 +337,7 @@ fn play_music(
     }
 
     if let Some(output) = output {
-        println!("writing {}...", output);
+        tprintln!("writing {}...", output);
         write_wave(player, output.as_str()).unwrap();
     } else {
         let player_clone = Arc::clone(&player);
@@ -216,81 +363,164 @@ fn play_music(
 
         stream.play().expect("failed to play stream");
 
-        let stdout = Term::stdout();
-        println!(
+        // Keyboard input is blocking on the main thread by
+        // default — once we enter `read_key()` we lose the
+        // ability to react to song-end notifications coming
+        // from the cpal callback thread. Move input to its own
+        // thread and bridge to the event loop through an mpsc
+        // channel, so the loop can `recv_timeout` on it and
+        // poll the `song_ended` flag between waits.
+        //
+        // The reader thread is detached: when the binary exits,
+        // the OS reclaims it. We don't try to wake it up — it
+        // sits in a blocking stdin read until the process dies.
+        let (tx, rx) = mpsc::channel::<Key>();
+        thread::spawn(move || {
+            let stdout = Term::stdout();
+            while let Ok(key) = stdout.read_key() {
+                if tx.send(key).is_err() {
+                    // Receiver dropped — main thread exited the
+                    // event loop. Nothing more to do.
+                    break;
+                }
+            }
+        });
+
+        tprintln!(
             "Enter and i keys for info, Space for pause, left or right arrow to move, escape key to exit..."
         );
         let mut playing = true;
-        loop {
-            if let Ok(character) = stdout.read_key() {
-                match character {
-                    Key::Enter => {
-                        let ti = player.lock().unwrap().get_current_table_index();
-                        let p = player.lock().unwrap().get_current_pattern();
-                        println!("current table index:{:02x}, current pattern:{:02x}", ti, p);
-                    }
-                    Key::Escape => {
-                        println!("Have a nice day!");
-                        return;
-                    }
-                    Key::Char('q') => {
-                        println!("Have a nice day!");
-                        return;
-                    }
-                    Key::ArrowLeft => {
-                        let i = player.lock().unwrap().get_current_table_index();
-                        if i != 0 {
-                            player.lock().unwrap().goto(i - 1, 0, 0);
-                        }
-                    }
-                    Key::ArrowRight => {
-                        let len = module.pattern_order[song].len();
-                        let i = player.lock().unwrap().get_current_table_index();
-                        if i + 1 < len {
-                            player.lock().unwrap().goto(i + 1, 0, 0);
-                        }
-                    }
-                    Key::Char(' ') => {
-                        if playing {
-                            println!("Pause, press space to continue");
-                            player.lock().unwrap().pause(true);
-                            playing = false;
-                            {
-                                let player_lock = player.lock().unwrap();
-                                let ti = player_lock.get_current_table_index();
-                                let p = player_lock.get_current_pattern();
-                                let row = player_lock.get_current_row();
-                                println!("Pattern [{:02X}]={:02X}, Row {:02X}", ti, p, row);
-                            }
-                        } else {
-                            println!("Playing");
-                            player.lock().unwrap().pause(false);
-                            playing = true;
-                        }
-                    }
-                    Key::Char('i') => {
-                        let player_lock = player.lock().unwrap();
-                        println!(
-                            "name:{}\ncomment:{}",
-                            player_lock.module.name, player_lock.module.comment
-                        );
-                        println!(
-                            "speed={}, generated samples:{}, loop count:{}",
-                            player_lock.get_tempo(),
-                            player_lock.generated_samples(),
-                            player_lock.get_loop_count()
-                        );
-                        for (i, instr) in player_lock.module.instrument.iter().enumerate() {
-                            if !instr.name.is_empty() {
-                                println!("instrument {:2}: {}", i, instr.name);
-                            }
-                        }
-                    }
-                    _ => {}
+        // The interactive loop now exits on any of three
+        // signals: an explicit user quit (Escape/q), the
+        // `song_ended` observer flag (set when the player's
+        // sequencer emits `SongEnd`), or the keyboard channel
+        // disconnecting (which would mean the reader thread
+        // crashed). Polling cadence: 50 ms — short enough that
+        // the song-end exit feels instantaneous to a
+        // listener, long enough that we don't burn CPU on
+        // empty loops.
+        'event_loop: loop {
+            if song_ended.load(Ordering::Relaxed) {
+                tprintln!("Song finished.");
+                break 'event_loop;
+            }
+            let character = match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(k) => k,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break 'event_loop,
+            };
+            match character {
+                Key::Enter => {
+                    let ti = player.lock().unwrap().get_current_table_index();
+                    let p = player.lock().unwrap().get_current_pattern();
+                    tprintln!("current table index:{:02x}, current pattern:{:02x}", ti, p);
                 }
+                Key::Escape | Key::Char('q') => {
+                    tprintln!("Have a nice day!");
+                    break 'event_loop;
+                }
+                Key::ArrowLeft => {
+                    let i = player.lock().unwrap().get_current_table_index();
+                    if i != 0 {
+                        player.lock().unwrap().goto(i - 1, 0, 0);
+                    }
+                }
+                Key::ArrowRight => {
+                    let len = module.pattern_order[song].len();
+                    let i = player.lock().unwrap().get_current_table_index();
+                    if i + 1 < len {
+                        player.lock().unwrap().goto(i + 1, 0, 0);
+                    }
+                }
+                Key::Char(' ') => {
+                    if playing {
+                        tprintln!("Pause, press space to continue");
+                        player.lock().unwrap().pause(true);
+                        playing = false;
+                        {
+                            let player_lock = player.lock().unwrap();
+                            let ti = player_lock.get_current_table_index();
+                            let p = player_lock.get_current_pattern();
+                            let row = player_lock.get_current_row();
+                            tprintln!("Pattern [{:02X}]={:02X}, Row {:02X}", ti, p, row);
+                        }
+                    } else {
+                        tprintln!("Playing");
+                        player.lock().unwrap().pause(false);
+                        playing = true;
+                    }
+                }
+                Key::Char('i') => {
+                    let player_lock = player.lock().unwrap();
+                    tprintln!(
+                        "name:{}\ncomment:{}",
+                        player_lock.module.name, player_lock.module.comment
+                    );
+                    tprintln!(
+                        "speed={}, generated samples:{}, loop count:{}",
+                        player_lock.get_tempo(),
+                        player_lock.generated_samples(),
+                        player_lock.get_loop_count()
+                    );
+                    // Live duration probe: what has been
+                    // played so far vs the estimator's
+                    // prediction for the whole song. Same
+                    // computation as the end-of-playback
+                    // summary at the tail of `play_music`,
+                    // but the listener can ask for it at
+                    // any moment.
+                    let actual_frames = player_lock.generated_samples();
+                    let sr = player_lock.get_sample_rate();
+                    let actual =
+                        Duration::from_secs(actual_frames / sr as u64);
+                    let theoretical = module.duration(song);
+                    tprintln!(
+                        "Duration: {} / {}",
+                        format_mm_ss(actual),
+                        format_mm_ss(theoretical),
+                    );
+                    for (i, instr) in player_lock.module.instrument.iter().enumerate() {
+                        if !instr.name.is_empty() {
+                            tprintln!("instrument {:2}: {}", i, instr.name);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
+
+    // ---- Duration summary --------------------------------------------
+    //
+    // `generated_samples()` is the number of stereo frames the
+    // player actually produced (paused frames do not count — see
+    // `XmrsPlayer::sample` early-return). Divide by the
+    // sample-rate (Hz, already in frames-per-second) to recover
+    // wall-clock seconds of music heard.
+    //
+    // Theoretical duration comes from the row-scheduler walker
+    // in `xmrs::duration` — it honours every flow-control effect
+    // the same playback engine does, so on a healthy module the
+    // two numbers should agree closely whenever the song was
+    // played to completion (WAV path, or an interactive listener
+    // that let it run out). When the listener quit early, the
+    // played value is naturally smaller and the ratio reveals
+    // how far through the song they got.
+    let (actual_frames, sample_rate_hz_actual) = {
+        let lock = player_summary.lock().unwrap();
+        (lock.generated_samples(), lock.get_sample_rate())
+    };
+    let actual = Duration::from_secs(actual_frames / sample_rate_hz_actual as u64);
+    let theoretical = module.duration(song);
+    tprintln!(
+        "Duration: {} / {}",
+        format_mm_ss(actual),
+        format_mm_ss(theoretical),
+    );
+
+    // Reset the tty to a cooked state for the caller's shell.
+    // See `restore_terminal` doc for why this is necessary.
+    restore_terminal();
 }
 
 use hound::{SampleFormat, WavSpec, WavWriter};
