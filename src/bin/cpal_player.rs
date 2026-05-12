@@ -228,10 +228,10 @@ fn main() -> Result<(), std::io::Error> {
         match Module::load(&contents) {
             Ok(module) => {
                 drop(contents); // cleanup memory
-                // `--duration` short-circuits before any audio
-                // setup: we just want the theoretical length of
-                // the chosen sub-song. Print as `MM:SS` and
-                // exit — no playback, no device probing.
+                                // `--duration` short-circuits before any audio
+                                // setup: we just want the theoretical length of
+                                // the chosen sub-song. Print as `MM:SS` and
+                                // exit — no playback, no device probing.
                 if cli.duration {
                     let d = module.duration(cli.song);
                     println!("{}", format_mm_ss(d));
@@ -454,7 +454,8 @@ fn play_music(
                     let player_lock = player.lock().unwrap();
                     tprintln!(
                         "name:{}\ncomment:{}",
-                        player_lock.module.name, player_lock.module.comment
+                        player_lock.module.name,
+                        player_lock.module.comment
                     );
                     tprintln!(
                         "speed={}, generated samples:{}, loop count:{}",
@@ -471,8 +472,7 @@ fn play_music(
                     // any moment.
                     let actual_frames = player_lock.generated_samples();
                     let sr = player_lock.get_sample_rate();
-                    let actual =
-                        Duration::from_secs(actual_frames / sr as u64);
+                    let actual = Duration::from_secs(actual_frames / sr as u64);
                     let theoretical = module.duration(song);
                     tprintln!(
                         "Duration: {} / {}",
