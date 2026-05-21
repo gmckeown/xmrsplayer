@@ -15,10 +15,11 @@
 //! Allocation is split into two methods reflecting two different
 //! callers:
 //!
-//! - [`VoicePool::allocate_live`]: must succeed (the pattern's note
-//!   has to play). Falls back to evicting any voice — including a
-//!   sustained one — when no evictable victim exists.
-//! - [`VoicePool::allocate_ghost`]: may refuse (the NNA spawn is
+//! - [`crate::voice_pool::VoicePool::allocate_live`]: must succeed
+//!   (the pattern's note has to play). Falls back to evicting any
+//!   voice — including a sustained one — when no evictable victim
+//!   exists.
+//! - [`crate::voice_pool::VoicePool::allocate_ghost`]: may refuse (the NNA spawn is
 //!   optional). Returns `None` when every voice is sustained-and-
 //!   audible, mirroring schism's `csf_get_nna_channel` returning 0.
 

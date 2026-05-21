@@ -51,14 +51,13 @@ pub struct StateInstrDefault<'a> {
     /// into 0..1 via `to_envelope_struct_signed`, with 0.5 = 0-offset.
     /// When `instr.voice.pitch_envelope_as_low_pass_filter` is set (IT's
     /// "use pitch envelope as filter" flag), the same envelope state
-    /// is read by the filter engine instead — that path lands with
-    /// the filter work in IT_ROADMAP §4.
+    /// is read by the filter engine instead.
     pub envelope_pitch: StateEnvelope<'a>,
 
     // Volume sustained?
     pub sustained: bool,
     /// Whether the voice is in its "fadeout" phase (schism's
-    /// `CHN_NOTEFADE`). Independent from [`sustained`] because IT
+    /// `CHN_NOTEFADE`). Independent from [`Self::sustained`] because IT
     /// distinguishes two stages after a key-off:
     ///   1. release — sustain is gone but the envelope is still
     ///      walking through its release section. Fadeout has NOT
@@ -376,7 +375,7 @@ impl<'a> StateInstrDefault<'a> {
     /// instrument's "pitch envelope as low-pass filter" flag is
     /// set — in the latter case the envelope drives the filter
     /// cutoff rather than pitch, and the filter engine reads the
-    /// envelope value directly (Phase 4 of IT_ROADMAP).
+    /// envelope value directly.
     /// Pitch envelope contribution as a [`PitchDelta`] (Q8.8
     /// semitones). Q-format throughout — no f32 round trip.
     ///

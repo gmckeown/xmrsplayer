@@ -19,6 +19,7 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use xmrs::prelude::*;
 
 use crate::audio_observer::{ChannelsContext, ChannelsObserver, MixContext, MixObserver};
+use crate::humanize::HumanizeMode;
 use crate::midi_observer::MidiObserver;
 use crate::observer::{PatternChangeContext, PlayerObserver, RowContext, TickContext};
 use crate::sequencer::{Sequencer, TickOutcome};
@@ -90,6 +91,11 @@ pub struct XmrsPlayer<'a> {
 
     /// `on_song_end` must fire at most once per song-termination event.
     song_end_notified: bool,
+
+    /// Humanisation mode for `InstrumentType::Euclidean` pulses.
+    /// Default [`crate::humanize::HumanizeMode::Disabled`] preserves cycle-exact
+    /// strict playback.
+    humanize_mode: HumanizeMode,
 }
 
 impl<'a> XmrsPlayer<'a> {
@@ -106,7 +112,7 @@ impl<'a> XmrsPlayer<'a> {
     /// pan-reset policy, and tick-zero vibrato; the per-format
     /// `Sample.volume` semantics; and so on — is driven by
     /// individual flags on `module.profile.quirks`
-    /// ([`PlaybackQuirks`](xmrs::module::PlaybackQuirks)). The
+    /// ([`xmrs::module::PlaybackQuirks`]). The
     /// `module.profile.format` field is metadata only (display,
     /// export, editor UI). Importers populate the quirks via
     /// `CompatibilityProfile::ft2()` / `it214()` / `pt()` /
@@ -165,6 +171,7 @@ impl<'a> XmrsPlayer<'a> {
             right_sample: None,
             pause: false,
             song_end_notified: false,
+            humanize_mode: HumanizeMode::default(),
         }
     }
 
@@ -270,6 +277,19 @@ impl<'a> XmrsPlayer<'a> {
 
     pub fn set_max_loop_count(&mut self, max_loop_count: usize) {
         self.sequencer.set_max_loop_count(max_loop_count);
+    }
+
+    /// Configure how `InstrumentType::Euclidean` pulses are
+    /// humanized at playback. Default is [`crate::humanize::HumanizeMode::Disabled`]
+    /// — cycle-exact strict.
+    pub fn set_humanize_mode(&mut self, mode: HumanizeMode) {
+        self.humanize_mode = mode;
+        self.voices.set_humanize_mode(mode);
+    }
+
+    /// Currently active humanisation mode.
+    pub fn humanize_mode(&self) -> HumanizeMode {
+        self.humanize_mode
     }
 
     pub fn get_loop_count(&self) -> usize {
@@ -392,6 +412,66 @@ impl<'a> XmrsPlayer<'a> {
         true
     }
 
+    /// Euclidean humanisation scheduler: after the current row's
+    /// triggers have fired, peek at the NEXT row's cells; for each
+    /// channel armed by a prior Euclidean trigger, if the next-row
+    /// cell is a `Play(_)` of the same wrapper, roll humanize and
+    /// schedule a fire-early intent inside the current row's tick
+    /// run.
+    fn schedule_humanize_intents(&mut self) {
+        // After row_start_tick(), `playing_pattern`/`playing_row`
+        // hold the row we just processed; `current_row` points to
+        // the next row to play *within the same pattern* (the
+        // sequencer's pending jumps for cross-pattern moves are
+        // out of scope for this lookahead — pulses that would
+        // jump patterns just don't humanize).
+        let song = self.sequencer.current_song();
+        let next_pat = self.sequencer.playing_pattern();
+        let next_row = self.sequencer.current_row();
+        let speed = self.sequencer.tempo();
+        if speed < 2 {
+            // Need at least one non-row-start tick to fire early.
+            return;
+        }
+        let next_cells = self.module.row_at(song, next_pat, next_row);
+        let n_channels = self.voices.num_channels();
+        for ch_idx in 0..n_channels {
+            let humanize = match self.voices.channel_humanize_mut(ch_idx) {
+                Some(h) => h,
+                None => continue,
+            };
+            let front = match humanize.armed_front() {
+                Some(f) => f,
+                None => continue,
+            };
+            // Resolve InstrEkn params on the front wrapper.
+            let (prob, max_adv) = match &self.module.instrument[front].instr_type {
+                InstrumentType::Euclidean(ekn) => {
+                    (ekn.humanize_probability, ekn.humanize_advance_max_ticks)
+                }
+                _ => continue,
+            };
+            // Only humanize a real Play(_) trigger of the same wrapper.
+            let cell = match next_cells.get(ch_idx) {
+                Some(c) => c,
+                None => continue,
+            };
+            if !matches!(cell.note, xmrs::cell_note::CellNote::Play(_)) {
+                continue;
+            }
+            if cell.instrument != Some(front) {
+                continue;
+            }
+            // Roll humanize. On hit, fire at tick (speed - advance)
+            // inside the current row, clamped to [1, speed-1].
+            if let Some(advance) = humanize.roll(prob, max_adv) {
+                let s = speed as u8;
+                let fire_tick = s.saturating_sub(advance).max(1).min(s.saturating_sub(1));
+                humanize.schedule_fire(fire_tick, cell.clone());
+            }
+        }
+    }
+
     // --- Sample generation hot path ---
 
     /// Advance one sample's worth of time: stepping the sequencer when a
@@ -417,8 +497,10 @@ impl<'a> XmrsPlayer<'a> {
                     pattern_changed,
                 } => {
                     // Fetch cells ONCE — voices and every observer share the
-                    // same borrow.
-                    let cells: &[TrackUnit] = &self.module.pattern[pattern][row];
+                    // same buffer. Resolved through the DAW timeline.
+                    let song = self.sequencer.current_song();
+                    let cells_vec: Vec<TrackUnit> = self.module.row_at(song, pattern, row);
+                    let cells: &[TrackUnit] = &cells_vec;
 
                     // 1. Voices (the built-in row consumer) processes the row.
                     self.voices.process_row(cells);
@@ -470,8 +552,21 @@ impl<'a> XmrsPlayer<'a> {
                             obs.on_row(&ctx);
                         }
                     }
+
+                    // Euclidean humanisation lookahead: after
+                    // processing the current row, peek at the next
+                    // row to see whether any armed channel can fire
+                    // its next pulse early.
+                    if self.humanize_mode != HumanizeMode::Disabled {
+                        self.schedule_humanize_intents();
+                    }
                 }
                 TickOutcome::Tick { tick } => {
+                    // Euclidean humanisation early-fire: consume
+                    // any scheduled fire-intents whose tick matches.
+                    if self.humanize_mode != HumanizeMode::Disabled {
+                        self.voices.fire_humanize_intents_at(tick as u8);
+                    }
                     // 1. Voices run per-tick effects.
                     self.voices.process_tick(tick);
 
@@ -482,7 +577,9 @@ impl<'a> XmrsPlayer<'a> {
                     if self.observers.iter().any(|obs| obs.subscribes_to_ticks()) {
                         let pat = self.sequencer.playing_pattern();
                         let row = self.sequencer.playing_row();
-                        let cells: &[TrackUnit] = &self.module.pattern[pat][row];
+                        let song = self.sequencer.current_song();
+                        let cells_vec: Vec<TrackUnit> = self.module.row_at(song, pat, row);
+                        let cells: &[TrackUnit] = &cells_vec;
                         let ctx = TickContext {
                             module: self.module,
                             song: self.sequencer.current_song(),

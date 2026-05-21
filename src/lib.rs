@@ -3,7 +3,6 @@
 
 extern crate alloc;
 
-pub(crate) mod effect;
 pub(crate) mod triggerkeep;
 
 pub(crate) mod effect_arpeggio;
@@ -61,3 +60,11 @@ pub mod debug_observer;
 pub mod debug_midi_observer;
 
 pub mod xmrsplayer;
+
+/// Toggle and policy for humanisation of
+/// `InstrumentType::Euclidean` pulses at playback.
+pub mod humanize;
+
+/// Per-channel state for Euclidean humanisation, coordinated by
+/// the player.
+pub(crate) mod state_humanize_ekn;

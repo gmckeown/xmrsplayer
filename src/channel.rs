@@ -86,7 +86,7 @@ pub struct Channel<'a> {
     /// in finetune from the sample at trigger time. Used by
     /// `TonePortamento` to recompute the target period and by
     /// the arpeggio quirk clamp (FT2). Distinct from
-    /// [`current_note`] (legacy enum, integer semitones).
+    /// [`Self::current_note`] (legacy enum, integer semitones).
     note: PitchQ,
     /// The last Pitch enum value triggered on this channel. Parallels
     /// `note` (which is a Q8.8 semitone count baking finetune in);
@@ -166,13 +166,12 @@ pub struct Channel<'a> {
 
     /// Index of this channel inside the `Voices` list. Set once at
     /// construction time (via [`Self::set_track_index`], called by
-    /// `Voices::new`) and never modified afterwards. Used today to
-    /// tag voices spawned by NNA with their originating track for
-    /// the upcoming voice-pool migration (1.3) — see
-    /// [`Voice::master_track`]. Ghosts spawned before
+    /// `Voices::new`) and never modified afterwards. Tags voices
+    /// spawned by NNA with their originating track — see
+    /// [`crate::voice::Voice::master_track`]. Ghosts spawned before
     /// `set_track_index` runs would carry index 0, which is correct
     /// for channel 0 and benign for the others (the field is purely
-    /// informational at this stage).
+    /// informational).
     track_index: usize,
 
     pub muted: bool,
@@ -209,6 +208,10 @@ pub struct Channel<'a> {
     /// determinism into the render pipeline. Updated at every
     /// note-trigger that consults `random_*_variation`.
     rng: xmrs::xorshift::XorShift32,
+
+    /// Euclidean humanisation state — see
+    /// [`crate::state_humanize_ekn`].
+    pub(crate) humanize_ekn: crate::state_humanize_ekn::StateHumanizeEkn,
 }
 
 impl<'a> Channel<'a> {
@@ -276,11 +279,12 @@ impl<'a> Channel<'a> {
             // each channel with a per-channel-unique value after
             // construction so the streams stay independent.
             rng: xmrs::xorshift::XorShift32::default(),
+            humanize_ekn: crate::state_humanize_ekn::StateHumanizeEkn::new(0xC0DE_0001),
         }
     }
 
     /// Set the channel's resting panning before any pattern row has
-    /// been processed. Used by [`Voices::new`] to apply per-channel
+    /// been processed. Used by [`crate::voices::Voices::new_with_voice_pool_capacity`] to apply per-channel
     /// pan defaults from the module header (`Module.channel_defaults
     /// [i].panning`). For formats that don't carry per-channel pan
     /// hints, the channel stays at its centre default.
@@ -290,7 +294,7 @@ impl<'a> Channel<'a> {
     }
 
     /// Set the channel volume before any pattern row has been
-    /// processed. Used by [`Voices::new`] to apply IT's
+    /// processed. Used by [`crate::voices::Voices::new_with_voice_pool_capacity`] to apply IT's
     /// `initial_channel_volume` header bytes via
     /// `Module.channel_defaults[i].volume`.
     #[inline(always)]
@@ -299,7 +303,7 @@ impl<'a> Channel<'a> {
     }
 
     /// Set the channel's mute flag before any pattern row has been
-    /// processed. Used by [`Voices::new`] to apply S3M's "channel
+    /// processed. Used by [`crate::voices::Voices::new_with_voice_pool_capacity`] to apply S3M's "channel
     /// disabled" bit and IT's `initial_channel_pan & 0x80` flag
     /// from `Module.channel_defaults[i].muted`.
     #[inline(always)]
@@ -308,7 +312,7 @@ impl<'a> Channel<'a> {
     }
 
     /// Set the channel's surround flag before any pattern row has
-    /// been processed. Used by [`Voices::new`] to apply IT's
+    /// been processed. Used by [`crate::voices::Voices::new_with_voice_pool_capacity`] to apply IT's
     /// surround sentinel (`initial_channel_pan == 100`) via
     /// `Module.channel_defaults[i].surround`. Equivalent to an
     /// S91 effect, but applied as state at song start so it
@@ -484,7 +488,7 @@ impl<'a> Channel<'a> {
     /// the per-voice resonant filter directly. Standard MIDI channel
     /// messages (`8n..En` status bytes) are packaged as
     /// [`MidiEvent`]s and pushed into `out_events`; the facade then
-    /// drains that buffer to any subscribed [`MidiObserver`]. SysEx
+    /// drains that buffer to any subscribed [`crate::midi_observer::MidiObserver`]. SysEx
     /// (`F0 .. F7`, except the IT-internal `F0 F0` prefix) is passed
     /// through as [`MidiEvent::SysEx`].
     ///
@@ -2178,7 +2182,37 @@ impl<'a> Channel<'a> {
     fn tick0_change_instr(&mut self, sample_only: bool, pool: &mut VoicePool<'a>) -> bool {
         let instrnr = self.current.instrument.unwrap();
 
-        if let InstrumentType::Default(id) = &self.module.instrument[instrnr].instr_type {
+        // Euclidean indirection: an `InstrumentType::Euclidean`
+        // wraps a Default sample-based instrument via `ekn.instr`.
+        // We follow the pointer and play the wrapped instrument's
+        // samples. The front instrument number (`instrnr`) is kept
+        // as the voice's identity so DCT/NNA comparisons match the
+        // cell's view of the world.
+        let is_euclidian;
+        let wrapped_idx = match &self.module.instrument[instrnr].instr_type {
+            InstrumentType::Euclidean(ekn) => {
+                is_euclidian = true;
+                match ekn.instr {
+                    Some(inner) if inner < self.module.instrument.len() => inner,
+                    _ => return false, // wrapper without a valid target
+                }
+            }
+            _ => {
+                is_euclidian = false;
+                instrnr
+            }
+        };
+        // Arm / disarm Euclidean humanisation tracking. An
+        // Euclidean trigger arms the channel (the NEXT pulse of
+        // the same wrapper becomes eligible); any other trigger
+        // clears it.
+        if is_euclidian {
+            self.humanize_ekn.note_euclidian_triggered(instrnr);
+        } else {
+            self.humanize_ekn.clear_euclidian();
+        }
+
+        if let InstrumentType::Default(id) = &self.module.instrument[wrapped_idx].instr_type {
             let was_same = self.live(pool).is_some_and(|i| i.num == instrnr);
 
             // Only proceed if the instrument has samples
@@ -2230,14 +2264,12 @@ impl<'a> Channel<'a> {
 
             was_same
         } else {
-            // Non-Default instrument variant (InstrMidi / InstrOpl /
-            // InstrSid / InstrRobSid / InstrEkn). xmrsplayer's
-            // sample engine only handles `InstrumentType::Default`;
-            // the specialised synth / MIDI-out paths are the
-            // responsibility of downstream code that wraps the
-            // player. Silently skipping here keeps playback running
-            // on mixed-type modules — the voice just stays on
-            // whatever sampled instrument was previously loaded.
+            // Non-renderable instrument variant (InstrMidi / InstrOpl /
+            // InstrSid / InstrRobSid, or an Euclidean whose `instr`
+            // points to one of those). xmrsplayer's sample engine
+            // only handles `InstrumentType::Default`; the specialised
+            // synth / MIDI-out paths are the responsibility of
+            // downstream code that wraps the player.
             false
         }
     }

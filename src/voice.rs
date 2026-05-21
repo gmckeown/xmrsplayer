@@ -98,7 +98,7 @@ impl<'a> Voice<'a> {
     /// Build a detached (ghost) voice from a live instrument state.
     /// Callers must then dispatch the NNA-specific action on the
     /// returned voice — see [`Voice::apply_nna_continue`] (no-op),
-    /// [`apply_nna_note_off`], [`apply_nna_note_fade_out`].
+    /// [`Voice::apply_nna_note_off`], [`Voice::apply_nna_note_fade_out`].
     /// Apply-functions live on this type so the NNA dispatch table
     /// is co-located with the voice it affects.
     ///

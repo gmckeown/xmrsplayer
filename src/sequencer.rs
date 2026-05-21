@@ -45,9 +45,9 @@ pub enum TickOutcome {
     Tick { tick: usize },
     /// A row-start tick. The sequencer has already applied any pending
     /// navigation jumps and consumed the new row's navigation global effects.
-    /// `pattern` is the pattern index in `module.pattern`, `row` is the row
-    /// index within that pattern. The caller is expected to forward the
-    /// cells at `module.pattern[pattern][row]` to voices and to observers.
+    /// `pattern` is the pattern index, `row` is the row index within that
+    /// pattern. The caller is expected to forward `module.row_at(song,
+    /// pattern, row)` to voices and to observers.
     ///
     /// `pattern_changed` is `true` when this row-start tick also crossed a
     /// pattern-order boundary (either naturally or via a jump); observers
@@ -128,13 +128,21 @@ impl<'a> Sequencer<'a> {
     /// `song` is clamped to a valid index into `module.pattern_order` (0 is
     /// used if out of range), matching the constructor's historical contract.
     pub(crate) fn new(module: &'a Module, song: usize) -> Self {
-        let current_song = if song < module.pattern_order.len() {
-            song
-        } else {
-            0
-        };
+        // Pick a valid sub-song index from the timeline_map. We accept
+        // any song that has at least one entry; fall back to 0
+        // otherwise.
+        let num_songs = module
+            .timeline_map
+            .entries
+            .iter()
+            .map(|e| e.song as usize)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        let current_song = if song < num_songs.max(1) { song } else { 0 };
         let num_channels = module.get_num_channels();
-        let song_len = module.get_song_length(current_song);
+        let song_len = module.song_length(current_song);
+        let first_pattern = module.order_pattern_idx(current_song, 0).unwrap_or(0);
 
         Self {
             module,
@@ -147,16 +155,13 @@ impl<'a> Sequencer<'a> {
             current_table_index: 0,
             current_row: 0,
             playing_row: 0,
-            playing_pattern: module.pattern_order[current_song]
-                .first()
-                .copied()
-                .unwrap_or(0),
+            playing_pattern: first_pattern,
             position_jump: false,
             pattern_break: false,
             jump_dest: 0,
             jump_row: 0,
             pattern_loop: vec![PatternLoopSlot::default(); num_channels],
-            row_loop_count: vec![vec![0; MAX_NUM_ROWS]; song_len],
+            row_loop_count: vec![vec![0; MAX_NUM_ROWS]; song_len.max(1)],
             loop_count: 0,
             max_loop_count: 0,
             song_end_requested: false,
@@ -186,10 +191,11 @@ impl<'a> Sequencer<'a> {
     pub fn current_row(&self) -> usize {
         self.current_row
     }
-    /// Pattern index (into `module.pattern`) that the current table cursor
-    /// points to.
+    /// Pattern index that the current table cursor points to.
     pub fn current_pattern(&self) -> usize {
-        self.module.pattern_order[self.current_song][self.current_table_index]
+        self.module
+            .order_pattern_idx(self.current_song, self.current_table_index)
+            .unwrap_or(0)
     }
     /// Row that is *currently sounding*, i.e. the row most recently loaded by
     /// a [`TickOutcome::RowStart`]. Stable throughout the row's tick cycle.
@@ -224,11 +230,14 @@ impl<'a> Sequencer<'a> {
     /// `Bxx` had been applied), tempo and BPM are reset, and the row counter
     /// is forced to fire `tick0` on the next step.
     pub(crate) fn goto(&mut self, table_position: usize, row: usize, speed: usize) -> bool {
-        if table_position >= self.module.get_song_length(self.current_song) {
+        if table_position >= self.module.song_length(self.current_song) {
             return false;
         }
-        let num_row = self.module.pattern_order[self.current_song][table_position];
-        if row >= self.module.get_num_rows(num_row) {
+        let num_row = self
+            .module
+            .order_pattern_idx(self.current_song, table_position)
+            .unwrap_or(0);
+        if row >= self.module.pattern_row_count(num_row) {
             return false;
         }
 
@@ -344,13 +353,16 @@ impl<'a> Sequencer<'a> {
 
         // 2. Resolve pattern_idx, guarding against an out-of-range order entry
         //    (historical behaviour: fall back to table index 0).
-        let pat_idx = {
-            let raw = self.module.pattern_order[self.current_song][self.current_table_index];
-            if raw < self.module.pattern.len() {
-                raw
-            } else {
+        let pat_idx = match self
+            .module
+            .order_pattern_idx(self.current_song, self.current_table_index)
+        {
+            Some(p) => p,
+            None => {
                 self.current_table_index = 0;
-                self.module.pattern_order[self.current_song][self.current_table_index]
+                self.module
+                    .order_pattern_idx(self.current_song, 0)
+                    .unwrap_or(0)
             }
         };
 
@@ -394,7 +406,7 @@ impl<'a> Sequencer<'a> {
         // first row of the destination, with both `new_table_index`
         // and `new_pattern` describing the same destination.
         self.current_row += 1;
-        let pattern_len = self.module.pattern[pat_idx].len();
+        let pattern_len = self.module.pattern_row_count(pat_idx);
         if !self.position_jump && !self.pattern_break && self.current_row >= pattern_len {
             self.position_jump = true;
             self.jump_dest = self.current_table_index + 1;
@@ -430,10 +442,13 @@ impl<'a> Sequencer<'a> {
         // next row either re-latches a new delta or stays silent.
         self.bpm_slide_delta = 0;
 
+        // Materialise the row through the DAW timeline layer.
+        let row_cells = self.module.row_at(self.current_song, pat_idx, row);
+
         for ch_index in 0..num_channels {
             // Defensive indexing: some malformed modules have short rows
             // relative to their declared channel count.
-            let cell = match self.module.pattern[pat_idx][row].get(ch_index) {
+            let cell = match row_cells.get(ch_index) {
                 Some(c) => c,
                 None => continue,
             };
@@ -510,7 +525,7 @@ impl<'a> Sequencer<'a> {
                         }
                     }
                     GlobalEffect::PositionJump(position) => {
-                        if position < self.module.pattern_order[self.current_song].len() {
+                        if position < self.module.song_length(self.current_song) {
                             self.position_jump = true;
                             self.jump_dest = position;
                             self.jump_row = 0;
@@ -559,8 +574,13 @@ impl<'a> Sequencer<'a> {
     }
 
     fn post_pattern_change(&mut self) {
-        if self.current_table_index >= self.module.pattern_order[self.current_song].len() {
-            self.current_table_index = self.module.restart_position;
+        if self.current_table_index >= self.module.song_length(self.current_song) {
+            // End-of-song wrap. The default is order 0; modules
+            // that want a different restart anchor (Soundtracker /
+            // older FastTracker restart byte) express it as a
+            // `GlobalEffect::PositionJump` on the last played row,
+            // which fires earlier and overrides this fallback.
+            self.current_table_index = 0;
         }
     }
 

@@ -80,7 +80,7 @@ fn step2() {
 
 // step3 ask an AI LLM to reorganise code :-)
 fn step3(tick: u8) -> u8 {
-    let note = match tick {
+    match tick {
         0 => 0,
         1 => 1,
         2 => 2,
@@ -206,8 +206,7 @@ fn step3(tick: u8) -> u8 {
         241..=242 => 2,
         243 => 0,
         244..=255 => 2,
-    };
-    note
+    }
 }
 
 // here, is the solution...

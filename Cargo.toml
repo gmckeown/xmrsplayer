@@ -1,6 +1,6 @@
 [package]
 name = "xmrsplayer"
-version = "0.11.3"
+version = "0.12.0"
 edition = "2021"
 description = "XMrsPlayer is a safe no-std soundtracker music player"
 authors = ["Sebastien Bechet"]
@@ -13,18 +13,11 @@ license = "MIT"
 keywords = ["xm", "mod", "s3m", "it", "soundtracker"]
 categories = ["multimedia::audio", "embedded", "no-std"]
 
-# Disable auto-discovery of examples so that `examples/bufferedsource.rs`
-# (a helper module used by `rodio_player.rs` via `mod bufferedsource;`)
-# is NOT compiled as a standalone example. Only the targets declared in
-# `[[example]]` sections below are built.
-autoexamples = false
-
 [dependencies]
 # `xmrs` is pulled in without default features; the `std` feature (on by
 # default here) re-enables it below.
-xmrs = { version = "0.11.3", default-features = false }
+xmrs = { version = "0.12.0", default-features = false }
 clap = { version = "4.5", optional = true, features = ["cargo", "derive"] }
-rodio = { version = "0.22", optional = true, features = ["playback"] }
 console = { version = "0.16", optional = true }
 cpal = { version = "0.17", optional = true }
 hound = { version = "3.5", optional = true }
@@ -48,12 +41,12 @@ default = ["std", "import"]
 # to skip it.
 std = ["xmrs/std", "xmrs/float-helpers"]
 
-# `demo` gates the interactive example players (cpal_player binary and
-# rodio_player example). It is a convenience feature that also turns on
-# `std` and all importers so `--no-default-features --features demo`
-# still builds.
+# `demo` gates the interactive player binary (`cpal_player.rs`) and the
+# DAW-layer inspector example. It is a convenience feature that also
+# turns on `std` and all importers so `--no-default-features --features
+# demo` still builds.
 # To install the player binary: `cargo install xmrsplayer --features demo`.
-demo = ["std", "import", "clap", "console", "cpal", "hound", "rodio"]
+demo = ["std", "import", "clap", "console", "cpal", "hound"]
 
 # ---- Historical-format importers (propagate to xmrs) ----
 # `import` is an umbrella for all importers. Downstreams that want
@@ -87,9 +80,10 @@ required-features = ["demo"]
 name = "arp_bug"
 path = "examples/arp_bug.rs"
 
-# rodio_player pulls in rodio/clap/console and the xmrs import modules,
-# all of which are gated by the `demo` feature.
+# Read-only DAW-layer dump for chasing import-time regressions.
+# Gated behind `demo` because it uses `Module::load` autodetection
+# (which pulls every importer).
 [[example]]
-name = "rodio_player"
-path = "examples/rodio_player.rs"
+name = "inspect_mod"
+path = "examples/inspect_mod.rs"
 required-features = ["demo"]

@@ -78,9 +78,14 @@ pub struct Voices<'a> {
 
     /// MIDI events emitted by macros on the current row. Filled during
     /// `apply_row_global_effects` and drained by the facade, which
-    /// dispatches to any registered [`MidiObserver`]. The buffer is
+    /// dispatches to any registered [`crate::midi_observer::MidiObserver`]. The buffer is
     /// re-used across rows — cleared on entry to each `process_row`.
     pending_midi_events: Vec<(usize, MidiEvent)>,
+
+    /// Humanisation mode for `InstrumentType::Euclidean` pulses.
+    /// Default [`crate::humanize::HumanizeMode::Disabled`] keeps
+    /// playback strictly cycle-exact.
+    humanize_mode: crate::humanize::HumanizeMode,
 }
 
 impl<'a> Voices<'a> {
@@ -135,6 +140,40 @@ impl<'a> Voices<'a> {
             volume_slide_fine: true,
             row_has_global_volume_slide: false,
             pending_midi_events: Vec::new(),
+            humanize_mode: crate::humanize::HumanizeMode::default(),
+        }
+    }
+
+    pub(crate) fn set_humanize_mode(&mut self, mode: crate::humanize::HumanizeMode) {
+        self.humanize_mode = mode;
+        // Reseed per-channel humanize RNGs when a deterministic seed
+        // is requested. Live / Disabled keep the default per-channel
+        // seeds (deterministic across runs without explicit input).
+        if let crate::humanize::HumanizeMode::Deterministic(seed) = mode {
+            for (i, ch) in self.channel.iter_mut().enumerate() {
+                ch.humanize_ekn.reseed(seed.wrapping_add(i as u32 + 1));
+            }
+        }
+    }
+
+    /// Per-channel access for the humanisation scheduler. The
+    /// facade reads/writes `humanize_ekn` here to schedule fire-
+    /// early intents and apply the suppress flag.
+    pub(crate) fn channel_humanize_mut(
+        &mut self,
+        idx: usize,
+    ) -> Option<&mut crate::state_humanize_ekn::StateHumanizeEkn> {
+        self.channel.get_mut(idx).map(|c| &mut c.humanize_ekn)
+    }
+
+    /// Trigger any fire-intent on each channel whose scheduled
+    /// tick matches `current_tick`. Called per-tick by the player
+    /// (Euclidean humanisation early-fire path).
+    pub(crate) fn fire_humanize_intents_at(&mut self, current_tick: u8) {
+        for ch in &mut self.channel {
+            if let Some(cell) = ch.humanize_ekn.take_fire_intent_at(current_tick) {
+                ch.tick0(&cell, &mut self.pool);
+            }
         }
     }
 
@@ -249,7 +288,12 @@ impl<'a> Voices<'a> {
 
         let n = self.channel.len().min(cells.len());
         for (i, cell) in cells.iter().enumerate().take(n) {
-            self.channel[i].tick0(cell, &mut self.pool);
+            // Euclidean humanisation: if a fire-early already
+            // triggered this pulse, suppress the natural row-start
+            // trigger. Global effects on the row still apply.
+            if !self.channel[i].humanize_ekn.take_suppress() {
+                self.channel[i].tick0(cell, &mut self.pool);
+            }
             self.apply_row_global_effects(i, cell);
         }
     }
@@ -307,7 +351,7 @@ impl<'a> Voices<'a> {
     /// Drain all MIDI events emitted during the most recent row.
     /// Returns an iterator yielding `(source_channel, event)` tuples.
     /// The facade calls this after `process_row` and forwards each
-    /// event to every registered [`MidiObserver`].
+    /// event to every registered [`crate::midi_observer::MidiObserver`].
     pub(crate) fn drain_midi_events(&mut self) -> alloc::vec::Drain<'_, (usize, MidiEvent)> {
         self.pending_midi_events.drain(..)
     }

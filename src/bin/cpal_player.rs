@@ -426,7 +426,7 @@ fn play_music(
                     }
                 }
                 Key::ArrowRight => {
-                    let len = module.pattern_order[song].len();
+                    let len = module.song_length(song);
                     let i = player.lock().unwrap().get_current_table_index();
                     if i + 1 < len {
                         player.lock().unwrap().goto(i + 1, 0, 0);
