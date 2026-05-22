@@ -161,7 +161,15 @@ impl<'a> Sequencer<'a> {
             jump_dest: 0,
             jump_row: 0,
             pattern_loop: vec![PatternLoopSlot::default(); num_channels],
-            row_loop_count: vec![vec![0; MAX_NUM_ROWS]; song_len.max(1)],
+            row_loop_count: (0..song_len.max(1))
+                .map(|order_idx| {
+                    let rows = module
+                        .order_pattern_idx(current_song, order_idx)
+                        .map(|p| module.pattern_row_count(p))
+                        .unwrap_or(0);
+                    vec![0; rows]
+                })
+                .collect(),
             loop_count: 0,
             max_loop_count: 0,
             song_end_requested: false,
@@ -375,8 +383,14 @@ impl<'a> Sequencer<'a> {
         //    currently active on at least one channel (FT2: `in_a_loop`
         //    suppresses max_loop_count interference).
         if !in_a_loop {
-            self.loop_count = self.row_loop_count[self.current_table_index][current_row];
-            self.row_loop_count[self.current_table_index][current_row] += 1;
+            if let Some(slot) = self
+                .row_loop_count
+                .get_mut(self.current_table_index)
+                .and_then(|order_slot| order_slot.get_mut(current_row))
+            {
+                self.loop_count = *slot;
+                *slot += 1;
+            }
         }
 
         // 5. Snapshot "playing" position so observers/voices see a stable

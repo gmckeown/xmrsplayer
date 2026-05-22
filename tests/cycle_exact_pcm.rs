@@ -6,6 +6,7 @@
 
 #![cfg(all(feature = "std", any(feature = "import_xm", feature = "import")))]
 
+use xmrs::daw::build_timeline::{Pattern, Row};
 use xmrs::prelude::*;
 use xmrsplayer::xmrsplayer::XmrsPlayer;
 

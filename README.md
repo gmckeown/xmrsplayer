@@ -11,7 +11,7 @@ It does not aim for bit-exact compatibility with every tracker ever written — 
 | Amiga Module (MOD)| Works                                                                  |
 | FastTracker XM    | Works                                                                  |
 | ScreamTracker S3M | Works                                                                  |
-| Impulse Tracker IT| WIP — loader mostly done, playback in progress                         |
+| Impulse Tracker IT| WIP — loader done, playback in progress                         |
 | SID (C64)         | Experimental — reverse-engineered from Rob Hubbard's 6510 player       |
 
 A word on **SID**: tracks and effects can already be extracted from several of Hubbard's hits and played back through the generic module engine. One thing is still needed to go further — working *per-track* to reconstruct patterns (some tracks change length, which defeats a naive pattern builder), The module engine is already generic enough; the rest is a matter of time (and motivated contributors — Rust speakers welcome!).
@@ -50,7 +50,12 @@ for sample in player.by_ref().take(48_000 * 2) {
 }
 ```
 
-See the `examples/` directory for complete players built on `cpal` and `rodio`.
+A complete CLI player built on `cpal` is shipped as the `xmrsplayer` binary
+(see *Installing the CLI player* below). The `examples/` directory contains
+two focused demos: `arp_bug.rs` (a regression check for FT2 arpeggio) and
+`inspect_mod.rs` (a diagnostic dumper that prints the parsed module's
+instruments, pattern-order, DAW tracks/clips/timeline map, detected
+Euclidean wrappers, and the result of `verify_layers_consistent`).
 
 For modules with very heavy NNA polyphony (the `Another Life`-class
 files that stack hundreds of `NNA = Continue` voices), you can raise
@@ -66,6 +71,35 @@ The default is sized to match how the original trackers behaved — go
 above it only when you have evidence the song needs it.
 
 The player also exposes a subscription API — hook into row/tick changes with `PlayerObserver`, into the produced audio stream with `MixObserver` / `ChannelsObserver` (VU-meters, WAV recorders, visualisers), or into MIDI events emitted by IT `Zxx` macros with `MidiObserver` (bridge to external synths or hardware). See [OBSERVERS.md](OBSERVERS.md).
+
+### The DAW timeline layer (transparent to the player)
+
+Since the DAW migration, every imported `Module` carries a second
+representation of the song alongside the legacy `Pattern → Row →
+TrackUnit` matrix:
+
+- `module.tracks: Vec<Track>` — one track per (song, instrument) pair,
+  carrying the actual `Vec<TrackUnit>` content.
+- `module.clips: SortedClips` — placements of those tracks on the
+  timeline (`song`, `target_channel`, `position_tick`, `end_tick`).
+- `module.timeline_map: TimelineMap` — the linearised `pattern_order`
+  used to compute absolute ticks.
+
+The player calls `Module::row_at(song, pattern, row)`, which routes
+through the DAW layer when populated (and through `Module.pattern[…]`
+otherwise) — so existing code keeps working without any opt-in. For an
+authored module you can build the DAW layer with
+`xmrs::daw::build_timeline::build_timeline_layer`; importers do it
+automatically.
+
+The same indirection also enables **Euclidean rhythm wrappers**: when
+a Track repeats a single (note, instrument, no-effect) cell on a
+strict Bjorklund pattern, `auto_convert_strict_euclidean_tracks`
+collapses the Track to a single prototype row and stashes the
+`(events, steps, rotation)` triplet in an empty `Instrument` slot
+typed as `InstrumentType::Euclidean(InstrEkn)`. The cells are
+regenerated on-the-fly by `Module::row_at`, so playback is
+bit-identical while the on-disk Track is tiny.
 
 ### Talking to the player in `f32`
 
@@ -103,7 +137,7 @@ If you're targeting `no_std` (`default-features = false`), or you want the small
 | Feature      | Effect                                                                                            |
 | ------------ | ------------------------------------------------------------------------------------------------- |
 | `std`        | Enable the standard library and forward `std` + `float-helpers` to `xmrs`. The latter exposes `f32 ↔ Q` conversions on every fixed-point type, which desktop editors / GUIs use for level-meters and numeric inputs. Embedded users skip both with `default-features = false`. |
-| `demo`       | Everything needed to build the example CLI players: pulls in `std`, `import`, `clap`, `console`, `cpal`, `hound`, `rodio`. |
+| `demo`       | Everything needed to build the example CLI player: pulls in `std`, `import`, `clap`, `console`, `cpal`, `hound`. |
 
 The whole gain / pitch / LFO / filter / sample chain is integer
 Q-format, end-to-end. No `libm`, no `micromath`, no `num-traits`. The
