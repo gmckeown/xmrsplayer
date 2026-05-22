@@ -248,10 +248,12 @@ fn restart_byte_loops_to_alternate_order() {
     );
 }
 
-/// §12.1 cycle-exactness: a Track with a Bjorklund(3, 8) pattern
-/// rendered before vs. after `auto_convert_strict_euclidean_tracks`
-/// must produce bit-identical PCM. The auto-conversion is lossless
-/// by definition (§12.1).
+/// Euclidean cycle-exactness: a Track with a Bjorklund(3, 8)
+/// pattern rendered before vs. after
+/// `auto_convert_strict_euclidean_tracks` must produce
+/// bit-identical PCM — the auto-conversion is lossless by
+/// construction (the wrapper instrument regenerates the same
+/// `(note, instrument)` cells on the same canonical pulse grid).
 #[test]
 fn euclidean_auto_conversion_is_cycle_exact() {
     // Build a 1-cycle square sample.
@@ -305,11 +307,11 @@ fn euclidean_auto_conversion_is_cycle_exact() {
             })
             .collect();
         // Run the same pipeline as `build_timeline_layer` but skip
-        // the optional §12.1 pass when `convert` is false. This is
-        // the only way to compare pre/post Euclidean conversion on
-        // identical underlying timeline data — the previous "undo"
-        // hack can't restore the row collapse the conversion now
-        // performs.
+        // the optional Euclidean-conversion pass when `convert` is
+        // false. This is the only way to compare pre/post
+        // conversion on identical underlying timeline data — the
+        // previous "undo" hack can't restore the row collapse the
+        // conversion now performs.
         let pattern_order = vec![vec![0usize]];
         let patterns = vec![pattern];
         m.timeline_map = build_timeline_map(&m, &pattern_order, &patterns);
@@ -351,11 +353,11 @@ fn euclidean_auto_conversion_is_cycle_exact() {
     assert_eq!(
         hash_pcm(&pcm_raw),
         hash_pcm(&pcm_ekn),
-        "§12.1 auto-conversion must be lossless — same PCM pre/post"
+        "Euclidean auto-conversion must be lossless — same PCM pre/post"
     );
 }
 
-/// §12.2: with `HumanizeMode::Deterministic(seed)` AND
+/// With `HumanizeMode::Deterministic(seed)` AND
 /// `humanize_probability > 0`, the player must produce a PCM
 /// *different* from the same module played with the default
 /// `HumanizeMode::Disabled`. Proves humanisation actually fires.
@@ -398,10 +400,10 @@ fn humanise_deterministic_changes_pcm() {
     );
 }
 
-/// §12.2 cycle-exactness: with `HumanizeMode::Disabled` (the default),
-/// the PCM must be identical regardless of the `InstrEkn`'s
-/// `humanize_*` parameter values. The instrument-side params describe
-/// the *shape*; the player must obey its mode-side gate.
+/// With `HumanizeMode::Disabled` (the default), the PCM must be
+/// identical regardless of the `InstrEkn`'s `humanize_*` parameter
+/// values. The instrument-side params describe the *shape*; the
+/// player must obey its mode-side gate.
 #[test]
 fn humanise_disabled_is_cycle_exact() {
     use xmrs::fixed::fixed::Q15;

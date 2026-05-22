@@ -1,6 +1,6 @@
 [package]
 name = "xmrsplayer"
-version = "0.12.1"
+version = "0.12.2"
 edition = "2021"
 description = "XMrsPlayer is a safe no-std soundtracker music player"
 authors = ["Sebastien Bechet"]
@@ -16,10 +16,27 @@ categories = ["multimedia::audio", "embedded", "no-std"]
 [dependencies]
 # `xmrs` is pulled in without default features; the `std` feature (on by
 # default here) re-enables it below.
-xmrs = { version = "0.12.1", default-features = false }
-clap = { version = "4.5", optional = true, features = ["cargo", "derive"] }
-console = { version = "0.16", optional = true }
+xmrs = { version = "0.12.2", path = "../xmrs", default-features = false }
+# `clap` defaults drop the `suggestions` feature (`-Did you mean
+# --foo?` typo correction) — it pulls in `strsim` for fuzzy
+# string match and costs ~12 KB in the final binary while
+# rarely helping a tracker-player user. Everything else is kept
+# (`color`, `error-context`, …) for readable help output.
+clap = { version = "4.5", optional = true, default-features = false, features = ["std", "help", "usage", "error-context", "color", "cargo", "derive"] }
+# `console`'s default features pull in `unicode-width` for
+# `measure_text_width` / `truncate_str` / `pad_str` — we only use
+# `Term::read_key` for the interactive keyboard and emit plain
+# ANSI codes for `clear_screen()`, so we can drop both
+# `unicode-width` and `ansi-parsing` (input-side ANSI parsing,
+# also unused).
+console = { version = "0.16", optional = true, default-features = false, features = ["std"] }
+# `cpal` exposes no `default` feature group; the desktop ALSA /
+# CoreAudio / WASAPI backend is wired in unconditionally. The
+# optional features (`asio`, `jack`, `audioworklet`, …) target
+# specific platforms and stay off by design.
 cpal = { version = "0.17", optional = true }
+# `hound` ships no feature flags — the default WAV reader/writer
+# is the only configuration available.
 hound = { version = "3.5", optional = true }
 
 [features]
