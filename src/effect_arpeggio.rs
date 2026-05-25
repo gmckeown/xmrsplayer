@@ -1,5 +1,5 @@
 use core::default::Default;
-use xmrs::fixed::units::PitchDelta;
+use xmrs::core::fixed::units::PitchDelta;
 
 #[derive(Clone, Default)]
 pub struct Arpeggio {

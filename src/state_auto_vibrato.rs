@@ -1,9 +1,9 @@
-use xmrs::fixed::fixed::Q8_8;
-use xmrs::fixed::units::PitchDelta;
-use xmrs::period_helper::{FrequencyType, PeriodHelper};
+use xmrs::core::fixed::fixed::Q8_8;
+use xmrs::core::fixed::units::PitchDelta;
 /// An Instrument Vibrato State
-use xmrs::vibrato::Vibrato;
-use xmrs::waveform::WaveformState;
+use xmrs::core::vibrato::Vibrato;
+use xmrs::core::waveform::WaveformState;
+use xmrs::tracker::period::{FrequencyType, PeriodHelper};
 
 /// Auto-vibrato runtime state. Q-format throughout: `phase` is a
 /// free-running `u32` Q.16 cycle accumulator (full cycle =
@@ -93,7 +93,7 @@ impl<'a> StateAutoVibrato<'a> {
         // wraps at one cycle).
         let wave = self
             .wfs
-            .value_q15(xmrs::fixed::units::Phase::from_raw(self.phase as u16));
+            .value_q15(xmrs::core::fixed::units::Phase::from_raw(self.phase as u16));
 
         // Modulation: `current_depth × wave / 32768` keeps
         // output in Q8.8 semitones.
@@ -115,9 +115,9 @@ impl<'a> StateAutoVibrato<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xmrs::fixed::fixed::Q8_8;
-    use xmrs::fixed::units::PitchDelta;
-    use xmrs::waveform::Waveform;
+    use xmrs::core::fixed::fixed::Q8_8;
+    use xmrs::core::fixed::units::PitchDelta;
+    use xmrs::core::waveform::Waveform;
 
     /// Regression test for the `binary_world.xm` symptom: auto-
     /// vibrato instruments (inst 14: rate=15, depth=5, sweep=65)
@@ -126,7 +126,7 @@ mod tests {
     /// bridge has zeroed the vibrato parameters.
     #[test]
     fn binary_world_inst14_auto_vibrato_is_nonzero() {
-        // XM importer mapping (mirrors xmrs::import::xm::xminstrument):
+        // XM importer mapping (mirrors xmrs::tracker::import::xm::xminstrument):
         //   speed = byte / (63 * 4) = byte / 252
         //   depth = byte / (15 * 2) = byte / 30
         //   sweep = byte / 255

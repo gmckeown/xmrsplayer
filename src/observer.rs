@@ -27,8 +27,8 @@ pub struct RowContext<'a> {
     pub song: usize,
     pub pattern: usize,
     pub row: usize,
-    /// One `TrackUnit` per channel (length = `module.get_num_channels()`).
-    pub cells: &'a [TrackUnit],
+    /// One `Cell` per channel (length = `module.get_num_channels()`).
+    pub cells: &'a [Cell],
     /// Current song speed (ticks per row) at the moment this row starts.
     pub tempo: usize,
     /// Current song BPM at the moment this row starts.
@@ -45,7 +45,7 @@ pub struct TickContext<'a> {
     /// Tick index inside the current row. 0 is reserved for row-start ticks
     /// (which never reach `on_tick`), so this value is always >= 1.
     pub tick: usize,
-    pub cells: &'a [TrackUnit],
+    pub cells: &'a [Cell],
 }
 
 /// Context passed to [`PlayerObserver::on_pattern_change`].

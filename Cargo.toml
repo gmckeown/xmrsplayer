@@ -1,6 +1,6 @@
 [package]
 name = "xmrsplayer"
-version = "0.12.2"
+version = "0.13.0"
 edition = "2021"
 description = "XMrsPlayer is a safe no-std soundtracker music player"
 authors = ["Sebastien Bechet"]
@@ -16,7 +16,7 @@ categories = ["multimedia::audio", "embedded", "no-std"]
 [dependencies]
 # `xmrs` is pulled in without default features; the `std` feature (on by
 # default here) re-enables it below.
-xmrs = { version = "0.12.2", default-features = false }
+xmrs = { version = "0.13.0", default-features = false }
 # `clap` defaults drop the `suggestions` feature (`-Did you mean
 # --foo?` typo correction) — it pulls in `strsim` for fuzzy
 # string match and costs ~12 KB in the final binary while

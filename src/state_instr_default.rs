@@ -7,8 +7,8 @@ use crate::{
     state_auto_vibrato::StateAutoVibrato, state_envelope::StateEnvelope, state_filter::StateFilter,
     state_sample::StateSample,
 };
-use xmrs::fixed::fixed::Q15;
-use xmrs::fixed::units::{Amp, EnvValue, Finetune, Panning, PitchDelta, SampleRate, Volume};
+use xmrs::core::fixed::fixed::Q15;
+use xmrs::core::fixed::units::{Amp, EnvValue, Finetune, Panning, PitchDelta, SampleRate, Volume};
 use xmrs::prelude::*;
 
 impl<'a> Deref for StateInstrDefault<'a> {
@@ -544,7 +544,7 @@ impl<'a> StateInstrDefault<'a> {
     /// state.
     pub fn update_frequency(
         &mut self,
-        period: xmrs::fixed::units::Period,
+        period: xmrs::core::fixed::units::Period,
         arp_pitch: PitchDelta,
         vibrato: PitchDelta,
         semitone: bool,
@@ -594,7 +594,7 @@ impl<'a> StateInstrDefault<'a> {
                 // pitch is meaningless, hence `.max(0)`; the i16
                 // ceiling is handled by `from_q8_8_i32_sat`).
                 let final_q88 = pitch_q88.saturating_add(delta_q88).max(0);
-                xmrs::fixed::units::Pitch::from_q8_8_i32_sat(final_q88)
+                xmrs::core::fixed::units::Pitch::from_q8_8_i32_sat(final_q88)
             }
             FrequencyType::AmigaFrequencies => {
                 // Q-format Amiga period→pitch lookup. Uses the
@@ -605,7 +605,7 @@ impl<'a> StateInstrDefault<'a> {
                 // resolution any FT2-era tracker offers on its
                 // pitch sliders. No log2 / no f32.
                 let mut pitch_q88 =
-                    xmrs::fixed::tables::amiga_period_to_pitch(period).as_q8_8_i32();
+                    xmrs::core::fixed::tables::amiga_period_to_pitch(period).as_q8_8_i32();
 
                 if semitone {
                     pitch_q88 = round_to_nearest_semitone_q88(pitch_q88);
@@ -618,7 +618,7 @@ impl<'a> StateInstrDefault<'a> {
                 }
 
                 let final_q88 = pitch_q88.saturating_add(delta_q88).max(0);
-                xmrs::fixed::units::Pitch::from_q8_8_i32_sat(final_q88)
+                xmrs::core::fixed::units::Pitch::from_q8_8_i32_sat(final_q88)
             }
         };
 
@@ -634,7 +634,7 @@ impl<'a> StateInstrDefault<'a> {
 
 // log2 / pitch_from_semitones_f32_clamped helpers removed
 // (Tour 6): both period→pitch branches in `update_frequency`
-// now use Q-format LUTs from `xmrs::fixed::tables`. The
+// now use Q-format LUTs from `xmrs::core::fixed::tables`. The
 // `update_frequency` body is integer-only end-to-end.
 
 impl<'a> StateInstrDefault<'a> {

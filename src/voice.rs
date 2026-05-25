@@ -13,8 +13,8 @@
 //! terminate when their envelope × fadeout product reaches silence.
 
 use crate::state_instr_default::StateInstrDefault;
-use xmrs::fixed::fixed::Q15;
-use xmrs::fixed::units::{Amp, ChannelVolume, Panning, Period, PitchDelta, Volume};
+use xmrs::core::fixed::fixed::Q15;
+use xmrs::core::fixed::units::{Amp, ChannelVolume, Panning, Period, PitchDelta, Volume};
 use xmrs::prelude::Pitch;
 
 // (1.5) The former `MAX_GHOST_VOICES_PER_CHANNEL` cap has been

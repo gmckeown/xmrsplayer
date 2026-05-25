@@ -1,4 +1,4 @@
-use xmrs::waveform::WaveformState;
+use xmrs::core::waveform::WaveformState;
 
 // Required for `Vec` under `no_std` (the `std` prelude
 // otherwise provides it). Other places in this file already use
@@ -18,9 +18,11 @@ use crate::midi_observer::MidiEvent;
 use crate::state_instr_default::StateInstrDefault;
 use crate::voice::Voice;
 use crate::voice_pool::{VoiceId, VoicePool};
-use xmrs::fixed::fixed::{Q15, Q8_8};
-use xmrs::fixed::units::Pitch as PitchQ;
-use xmrs::fixed::units::{Amp, ChannelVolume, Panning, Period, PitchDelta, SampleRate, Volume};
+use xmrs::core::fixed::fixed::{Q15, Q8_8};
+use xmrs::core::fixed::units::Pitch as PitchQ;
+use xmrs::core::fixed::units::{
+    Amp, ChannelVolume, Panning, Period, PitchDelta, SampleRate, Volume,
+};
 use xmrs::prelude::*;
 
 /// Simplified DCT tag, extracted once from the nested
@@ -36,8 +38,14 @@ enum Dct {
 
 #[derive(Clone, PartialEq, Default)]
 struct NoteRetrigState {
-    note: CellNote,
-    instr: Option<usize>,
+    event: CellEvent,
+    /// Track-level instrument of the cell that armed this retrig.
+    /// DAW migration Phase 1+2 moved the per-cell instrument off
+    /// `Cell`, so the retrig identity now tracks both the typed
+    /// event (carries pitch + velocity + ghost/fresh distinction) and
+    /// the resolved track instrument captured by the replayer at
+    /// row-start time.
+    track_instr: Option<usize>,
     speed: usize,
     volume_modifier: NoteRetrigOperator,
 }
@@ -108,7 +116,29 @@ pub struct Channel<'a> {
     /// triggers.
     surround: bool,
 
-    pub current: TrackUnit,
+    pub current: Cell,
+
+    /// Row's absolute song tick — set at the top of every
+    /// `tick0` call and kept stable for the row's tick run.
+    /// Used by [`Channel::apply_slides_and_glide_from_lanes`] and
+    /// the debug dual-read validators to query
+    /// `AutomationLane`s in song-tick coordinates without
+    /// re-threading the sequencer's state through every
+    /// per-tick call. DAW migration Phase 3c.1.
+    pub(crate) current_abs_tick: u32,
+    /// Current sub-song index. Set alongside
+    /// [`Self::current_abs_tick`].
+    pub(crate) current_song_idx: u16,
+
+    /// Cached `Track.instrument` for the cell currently held in
+    /// [`Self::current`]. DAW migration Phase 1+2 dropped the
+    /// per-cell `instrument: Option<usize>` from `Cell` — the value
+    /// lives on the owning Track now, and the replayer pushes it
+    /// alongside the cell through each row-start dispatch. `None` for
+    /// effect-only tracks (the
+    /// [`crate::daw::build_timeline::EFFECT_ONLY_INSTRUMENT`] sentinel
+    /// surfaces here as `None`) and for channels with no active clip.
+    pub(crate) current_track_instrument: Option<usize>,
 
     /// Current period (was `f32`). Slides accumulate `i16`
     /// deltas via `Period::saturating_add_signed`. Loss of
@@ -207,7 +237,7 @@ pub struct Channel<'a> {
     /// is meant to de-robot static samples, not to introduce non-
     /// determinism into the render pipeline. Updated at every
     /// note-trigger that consults `random_*_variation`.
-    rng: xmrs::xorshift::XorShift32,
+    rng: xmrs::core::xorshift::XorShift32,
 
     /// Euclidean humanisation state — see
     /// [`crate::state_humanize_ekn`].
@@ -226,10 +256,8 @@ impl<'a> Channel<'a> {
     /// player must subsequently call [`Self::set_tempo`] whenever the
     /// song tempo changes (Fxx effect) to keep the LUT index in sync.
     pub(crate) fn new(module: &'a Module, rate: SampleRate, tempo: usize) -> Self {
-        let period_helper = PeriodHelper::new(
-            module.frequency_type,
-            module.profile.quirks.ft2_arpeggio_note_clamp,
-        );
+        let period_helper =
+            PeriodHelper::new(module.frequency_type, module.quirks.ft2_arpeggio_note_clamp);
         Self {
             module,
             period_helper: period_helper.clone(),
@@ -241,11 +269,14 @@ impl<'a> Channel<'a> {
             current_note: None,
             midi_parametric_selector: 0,
             surround: false,
-            current: TrackUnit::default(),
+            current: Cell::default(),
+            current_abs_tick: 0,
+            current_song_idx: 0,
+            current_track_instrument: None,
             period: Period::ZERO,
             live: None,
             instr_midi_mute: false,
-            effect_arpeggio: EffectArpeggio::new(module.profile.quirks.ft2_arpeggio_lut, tempo),
+            effect_arpeggio: EffectArpeggio::new(module.quirks.ft2_arpeggio_lut, tempo),
             effect_note_retrig_backup: NoteRetrigState::default(),
             effect_note_retrig_counter: 0,
             effect_panbrello: EffectVibratoTremolo::new(Waveform::Sine),
@@ -278,7 +309,7 @@ impl<'a> Channel<'a> {
             // non-zero seed (4294967291). `Voices::new` re-seeds
             // each channel with a per-channel-unique value after
             // construction so the streams stay independent.
-            rng: xmrs::xorshift::XorShift32::default(),
+            rng: xmrs::core::xorshift::XorShift32::default(),
             humanize_ekn: crate::state_humanize_ekn::StateHumanizeEkn::new(0xC0DE_0001),
         }
     }
@@ -329,7 +360,7 @@ impl<'a> Channel<'a> {
     /// a non-zero seed.
     pub(crate) fn reseed_rng(&mut self, seed: u32) {
         let seed = if seed == 0 { 0xDEADBEEF } else { seed };
-        self.rng = xmrs::xorshift::XorShift32::new(Some(seed));
+        self.rng = xmrs::core::xorshift::XorShift32::new(Some(seed));
     }
 
     /// Record this channel's index inside the `Voices` list. Called
@@ -403,7 +434,7 @@ impl<'a> Channel<'a> {
     /// Release the currently-sustaining note.
     ///
     /// Behaviour is driven by
-    /// `module.profile.quirks.keyoff_cuts_without_vol_env`,
+    /// `module.quirks.keyoff_cuts_without_vol_env`,
     /// which the importers preset per format because "how a
     /// note-off should sound" is a format-level semantic, not
     /// an FT2 bug:
@@ -442,7 +473,7 @@ impl<'a> Channel<'a> {
         // modules are meant to sound — so it lives on
         // `keyoff_cuts_without_vol_env`, which the FT2 profile
         // sets and others leave off.
-        if self.module.profile.quirks.keyoff_cuts_without_vol_env && !had_vol_env {
+        if self.module.quirks.keyoff_cuts_without_vol_env && !had_vol_env {
             self.cut_pitch();
         }
     }
@@ -859,7 +890,7 @@ impl<'a> Channel<'a> {
     /// case, which is what schism does when `penv->midi_*` is
     /// unset.
     fn current_instr_midi(&self) -> Option<&InstrMidi> {
-        let idx = self.current.instrument?;
+        let idx = self.current_track_instrument?;
         let instr = self.module.instrument.get(idx)?;
         match &instr.instr_type {
             InstrumentType::Midi(im) => Some(im),
@@ -1358,7 +1389,7 @@ impl<'a> Channel<'a> {
                 //         used to silently attenuate every
                 //         reduced-volume sample.
                 let dnv = instr.current_sample_default_note_volume();
-                self.volume = if self.module.profile.quirks.sample_volume_is_static_gain {
+                self.volume = if self.module.quirks.sample_volume_is_static_gain {
                     dnv
                 } else {
                     instr.volume.scaled_by(dnv)
@@ -1372,9 +1403,9 @@ impl<'a> Channel<'a> {
             // when we just landed on that stored pan. A ghost
             // retrigger inherits whatever pps the previous note
             // baked in.
-            let do_pan_reset = match self.module.profile.quirks.pan_reset_policy {
+            let do_pan_reset = match self.module.quirks.pan_reset_policy {
                 PanResetPolicy::Never => false,
-                PanResetPolicy::OnInstrumentChange => self.current.instrument.is_some(),
+                PanResetPolicy::OnInstrumentChange => self.current.has_instrument_column(),
                 PanResetPolicy::Always => true,
             };
             if do_pan_reset {
@@ -1570,7 +1601,7 @@ impl<'a> Channel<'a> {
             // therefore skip the clear; the mute flag is driven
             // exclusively from the state machine in the Tremor arm
             // below.
-            if !self.module.profile.quirks.tremor_state_persists {
+            if !self.module.quirks.tremor_state_persists {
                 self.effect_tremor = false;
             }
         }
@@ -1593,12 +1624,6 @@ impl<'a> Channel<'a> {
                     // Both sides typed: direct assignment, no bridge.
                     self.channel_volume = v;
                 }
-                TrackEffect::ChannelVolumeSlide { speed, fine } => {
-                    // Pure Q1.15 slide via `ChannelVolume::shifted_by`.
-                    if fine == (current_tick == 0) {
-                        self.channel_volume = self.channel_volume.shifted_by(speed);
-                    }
-                }
                 TrackEffect::Glissando(glissando) => {
                     if current_tick == 0 {
                         self.effect_semitone = glissando;
@@ -1606,7 +1631,7 @@ impl<'a> Channel<'a> {
                 }
                 TrackEffect::InstrumentFineTune(finetune) => {
                     if current_tick == 0 {
-                        if let Some(pitch) = self.current.note.pitch() {
+                        if let Some(pitch) = self.current.pitch() {
                             if let Some(instr) = self.live_mut(pool) {
                                 // `Finetune` is now end-to-end Q-typed.
                                 instr.set_finetune(finetune);
@@ -1662,7 +1687,7 @@ impl<'a> Channel<'a> {
                     }
                 }
                 TrackEffect::InstrumentSampleOffset(seek) => {
-                    if current_tick == 0 && self.current.note.pitch().is_some() {
+                    if current_tick == 0 && self.current.pitch().is_some() {
                         if let Some(instr) = self.live_mut(pool) {
                             if let Some(sample) = &mut instr.state_sample {
                                 let sample_len = sample.sample_len();
@@ -1678,7 +1703,7 @@ impl<'a> Channel<'a> {
                                     // like IT-default (ignore); a
                                     // proper-IT module with
                                     // old_effects ON will clamp.
-                                    if self.module.profile.quirks.it_old_effects && sample_len > 0 {
+                                    if self.module.quirks.it_old_effects && sample_len > 0 {
                                         sample.set_position(sample_len - 1);
                                     }
                                     // else: ignore the offset; leave
@@ -1735,36 +1760,48 @@ impl<'a> Channel<'a> {
                 }
                 TrackEffect::NoteDelay(delay) => {
                     if current_tick == 0 {
-                        if matches!(self.current.note, CellNote::Empty) {
-                            self.trigger_pitch(
-                                TRIGGER_KEEP_SAMPLE_POSITION
-                                    | TRIGGER_KEEP_VOLUME
-                                    | TRIGGER_KEEP_PERIOD,
-                                pool,
-                            );
-                        } else if matches!(self.current.note, CellNote::KeyOff) {
-                            if self.current.instrument.is_none() {
+                        // Match the legacy `cell.note` dispatch via the
+                        // [`CellEvent`] projection. `Empty` covered
+                        // (None / InstrReset); `KeyOff` covered
+                        // (NoteOff{retrig:false/true}). The `retrig`
+                        // flag implies "instrument column present" —
+                        // mirror of the legacy `instrument.is_some()`
+                        // check below.
+                        match self.current.event {
+                            CellEvent::None | CellEvent::InstrReset => {
+                                self.trigger_pitch(
+                                    TRIGGER_KEEP_SAMPLE_POSITION
+                                        | TRIGGER_KEEP_VOLUME
+                                        | TRIGGER_KEEP_PERIOD,
+                                    pool,
+                                );
+                            }
+                            CellEvent::NoteOff { retrig: false } => {
                                 self.key_off(0, pool);
-                            } else {
+                            }
+                            CellEvent::NoteOff { retrig: true } => {
                                 self.trigger_pitch(
                                     TRIGGER_KEEP_PERIOD | TRIGGER_KEEP_ENVELOPE,
                                     pool,
                                 );
                             }
+                            _ => {}
                         }
                     } else if current_tick == delay {
                         self.tick0_load_instrument_and_pitch(pool);
                         self.tickn_effects(0, pool);
 
                         /* Special KeyOff cases */
-                        if matches!(self.current.note, CellNote::KeyOff) {
-                            if self.current.instrument.is_none() {
+                        match self.current.event {
+                            CellEvent::NoteOff { retrig: false } => {
                                 if let Some(i) = self.live_mut(pool) {
                                     i.volume_reset();
                                 }
-                            } else {
+                            }
+                            CellEvent::NoteOff { retrig: true } => {
                                 self.trigger_pitch(TRIGGER_KEEP_NONE, pool);
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -1814,8 +1851,8 @@ impl<'a> Channel<'a> {
                     }
 
                     let current_state = NoteRetrigState {
-                        note: self.current.note,
-                        instr: self.current.instrument,
+                        event: self.current.event,
+                        track_instr: self.current_track_instrument,
                         speed: s,
                         volume_modifier: m.clone(),
                     };
@@ -1857,176 +1894,17 @@ impl<'a> Channel<'a> {
                         }
                     }
                 }
-                TrackEffect::Panbrello { speed: s, depth: d } => {
-                    if current_tick == 0 {
-                        // Q-format entry: speed Q8.8, depth Q15
-                        // (panbrello modulates panning amplitude).
-                        self.effect_panbrello.tick0_q(s, d.raw());
-                    } else {
-                        self.effect_panbrello.tick_q();
-                    }
-                }
-                TrackEffect::PanbrelloWaveform {
-                    waveform: w,
-                    retrig: r,
-                } => {
-                    self.effect_panbrello.data.waveform = WaveformState::new(w);
-                    if r {
-                        self.effect_panbrello.retrigger_q();
-                    }
-                }
                 TrackEffect::Panning(p) => {
                     if current_tick == 0 {
                         // Both sides typed — direct assignment.
                         self.panning = p;
                     }
                 }
-                TrackEffect::PanningSlide { speed: s, fine: f } => {
-                    // Pure Q1.15 slide via `Panning::shifted_by`.
-                    if f == (current_tick == 0) {
-                        self.panning = self.panning.shifted_by(s);
-                    }
-                }
-                TrackEffect::Portamento { speed: p, fine: f } => {
-                    // Effect memory is resolved at import time in
-                    // `xmrs/src/import/import_memory.rs`, so by the time
-                    // this arm runs `p` is always the final (non-zero)
-                    // value — we only need to apply the slide and never
-                    // stash anything.
-                    //
-                    // `fine = false` (regular slide, e.g. 1xx/2xx in XM,
-                    // Exx/Fxx in S3M/IT when hi-nibble < 0xE) fires at
-                    // every non-zero tick. `fine = true` (E1x/E2x,
-                    // X1y/X2y, EFx/FFx, EEx/FEx) fires exactly once at
-                    // tick 0. Previously both collapsed into a single
-                    // tick-scope, causing fine slides to be over-applied
-                    // by a factor of `(speed − 1)`.
-                    //
-                    // The format-specific clamping semantics apply
-                    // identically in both scopes:
-                    //
-                    // * **S3M** clamps the period at 0 (Scream Tracker
-                    //   3 behaviour — lets the note go infinitely
-                    //   high).
-                    //
-                    // * **XM** reproduces FT2's portamento-down
-                    //   signed-overflow quirk
-                    //   (`ft2_replayer.c:pitchSlideDown` at line 1914,
-                    //   and the parallel bugs in `finePitchSlideDown`
-                    //   line 643 and `extraFinePitchSlide` line 1213 —
-                    //   all three are explicitly marked "FT2 bug" in
-                    //   the source). The clamp
-                    //   `if ((int16_t)realPeriod >= 32000)` uses a
-                    //   signed comparison: values in [32000, 32767]
-                    //   snap back to 31999, but once the period crosses
-                    //   32767 the int16 cast flips negative and the
-                    //   clamp is silently skipped, letting the period
-                    //   keep growing. Some XM modules exploit this to
-                    //   produce very deep pitch slides.
-                    //
-                    // * Other formats (Mod, It) use the plain clamp
-                    //   at 31999.
-                    let fires = if f {
-                        current_tick == 0
-                    } else {
-                        current_tick != 0
-                    };
-                    if fires {
-                        // Pure integer slide: u16 + i16 → u16
-                        // (saturating). One LSB of period
-                        // precision per slide step versus the OLD
-                        // f32 storage; well below an audible cent
-                        // of pitch.
-                        let new_period = self.period.saturating_add_signed(p);
-                        if self.module.profile.quirks.ft2_pitch_slide_overflow && p > 0 {
-                            // The FT2 signed-overflow quirk is *only*
-                            // in pitchSlideDown (`p > 0` = period
-                            // grows). The clamp uses a signed `int16_t`
-                            // comparison: values in `[32000, 32767]`
-                            // snap to 31999, but once the period crosses
-                            // 32768 (i16-negative on FT2's side) the
-                            // check silently fails and the slide
-                            // freewheels into ultrasonic. Some XM
-                            // modules rely on this — preserve verbatim.
-                            //
-                            // `saturating_add_signed` already pinned
-                            // `new_period` to `≤ 0xFFFF`; the i16
-                            // sign re-emerges via `as i16`.
-                            let wrapped = new_period.raw() as i16;
-                            if (32000..=32767).contains(&(wrapped as i32)) {
-                                self.period = Period::from_raw(31999);
-                            } else {
-                                // wrapped < 32000 (kept climbing) or
-                                // wrapped ≥ 32768 (FT2 quirk lets the
-                                // period grow past the clamp).
-                                self.period = if new_period == Period::ZERO {
-                                    Period::from_raw(1)
-                                } else {
-                                    new_period
-                                };
-                            }
-                        } else if let Some((clamp_min, clamp_max)) =
-                            self.module.profile.quirks.period_clamp
-                        {
-                            // ST3 `amigalimits` clamp (e.g. `[113,
-                            // 856]`).
-                            self.period = new_period.clamp(clamp_min, clamp_max);
-                        } else {
-                            // No explicit clamp: fall back to the
-                            // conservative `[1, 31999]` range (or
-                            // `[0, 31999]` when the module opts into
-                            // `allow_zero_period`, which lets a pitch
-                            // slide reach "infinitely high note" —
-                            // ST3 convention without amigalimits).
-                            let min_period = if self.module.profile.quirks.allow_zero_period {
-                                Period::ZERO
-                            } else {
-                                Period::from_raw(1)
-                            };
-                            self.period = new_period.clamp(min_period, Period::from_raw(31999));
-                        }
-                    }
-                }
-                TrackEffect::TonePortamento(p) => {
-                    if current_tick == 0 {
-                        // Pitch → Period direct (no f32 round-trip).
-                        self.effect_tone_portamento_goal =
-                            self.period_helper.note_to_period(self.note);
-                    } else {
-                        if self.period != self.effect_tone_portamento_goal {
-                            // Pure integer slide via
-                            // `Period::slide_towards`. Stops
-                            // exactly at the goal.
-                            self.period = self
-                                .period
-                                .slide_towards(self.effect_tone_portamento_goal, p);
-                        }
-                    }
-                }
-                TrackEffect::Tremolo { speed: s, depth: d } => {
-                    if current_tick == 0 {
-                        // Q-format entry: speed Q8.8, depth Q15
-                        // (tremolo modulates volume amplitude).
-                        self.effect_tremolo.data.speed = s;
-                        self.effect_tremolo.data.depth = d.raw();
-                    } else {
-                        self.effect_tremolo.tick_q();
-                    }
-                }
-                TrackEffect::TremoloWaveform {
-                    waveform: w,
-                    retrig: r,
-                } => {
-                    // Update the waveform and latch the retrig flag for
-                    // the next note trigger; don't reset the phase now.
-                    self.effect_tremolo.data.waveform = WaveformState::new(w);
-                    self.tremolo_retrig_on_new_note = r;
-                }
                 TrackEffect::Tremor {
                     on_time: on,
                     off_time: off,
                 } => {
-                    if self.module.profile.quirks.tremor_state_persists {
+                    if self.module.quirks.tremor_state_persists {
                         // ST3 tremor (digcmd.c:s_tremor line 803): a
                         // count-down `atremor` + on/off toggle
                         // `atreon`, both persistent across rows. On
@@ -2088,99 +1966,35 @@ impl<'a> Channel<'a> {
                         }
                     }
                 }
-                TrackEffect::Vibrato { speed: s, depth: d } => {
-                    // IT "Old Effects" quirk: with the flag ON, Hxy
-                    // and Uxy depth is doubled (`depth <<= 1` per
-                    // IT_MUSIC.ASM's Hxy handler in ITTECH). The
-                    // importer emits the normal-mode value; apply
-                    // the 2× scale here on replay so the same
-                    // pattern data sounds right in both modes.
-                    let depth_raw = if self.module.profile.quirks.it_old_effects {
-                        d.as_q8_8_i16().saturating_mul(2)
-                    } else {
-                        d.as_q8_8_i16()
-                    };
-                    if current_tick == 0 {
-                        // Vibrato depth is `PitchDelta` (Q8.8
-                        // semitones); pass the raw `i16` to the LFO.
-                        self.effect_vibrato.data.speed = s;
-                        self.effect_vibrato.data.depth = depth_raw;
-                        // IT 2.14+ in normal mode advances the
-                        // vibrato LFO every tick, including tick 0.
-                        // Other formats (XM/MOD/S3M, and IT with
-                        // old-effects on) tick only on non-row
-                        // ticks. The `!it_old_effects` gate is
-                        // essential: an IT module with the
-                        // old-effects flag set on its header keeps
-                        // the legacy "no row-tick" behaviour even
-                        // though `it_vibrato_ticks_at_row_zero` is
-                        // on in the profile.
-                        if self.module.profile.quirks.it_vibrato_ticks_at_row_zero
-                            && !self.module.profile.quirks.it_old_effects
-                        {
-                            self.effect_vibrato.tick_q();
-                        }
-                    } else {
-                        self.effect_vibrato.tick_q();
-                    }
-                }
-                TrackEffect::VibratoSpeed(s) => {
-                    if current_tick == 0 {
-                        self.effect_vibrato.data.speed = s;
-                    }
-                }
-                TrackEffect::VibratoDepth(d) => {
-                    if current_tick == 0 {
-                        self.effect_vibrato.data.depth = d.as_q8_8_i16();
-                    } else if self.module.profile.quirks.volcol_b_advances_vibrato
-                        && !self.current.has_vibrato()
-                    {
-                        // FT2 vol-column Bx quirk: when the slot carries a
-                        // vol-column vibrato-depth with NO main-effect 4xx
-                        // accompanying it, FT2's `v_Vibrato` still advances
-                        // the vibrato LFO every non-zero tick
-                        // (ft2_replayer.c:v_Vibrato calls doVibrato after
-                        // optionally updating the depth). Without this call
-                        // the LFO would freeze at its last position and
-                        // only the depth would change, which is perceptibly
-                        // wrong on XM modules that drive vibrato primarily
-                        // from the vol column.
-                        //
-                        // When a main Vibrato IS on the row, its own arm
-                        // (below) calls `tick()`, so we must NOT double-
-                        // tick here — hence the `!has_vibrato()` guard.
-                        self.effect_vibrato.tick_q();
-                    }
-                }
-                TrackEffect::VibratoWaveform {
-                    waveform: w,
-                    retrig: r,
-                } => {
-                    // Same as TremoloWaveform above: latch the flag, no
-                    // immediate phase reset.
-                    self.effect_vibrato.data.waveform = WaveformState::new(w);
-                    self.vibrato_retrig_on_new_note = r;
-                }
                 TrackEffect::Volume { value: v, tick: t } => {
                     if current_tick == t {
                         // Both sides typed — direct assignment.
                         self.volume = v;
                     }
                 }
-                TrackEffect::VolumeSlide { speed: s, fine: f } => {
-                    // Pure Q1.15 slide via `Volume::with_tremolo`
-                    // (same shape: saturating add + clamp).
-                    if f == (current_tick == 0) {
-                        self.volume = self.volume.with_tremolo(s);
-                    }
+                TrackEffect::MidiMacro(_) => {
+                    // DAW migration Phase 3c.3: the macro is
+                    // invoked from `cell.effects` by
+                    // `Voices::apply_row_per_channel_effects`. The
+                    // channel arm itself is a no-op — the macro
+                    // bytes mutate channel state through the voices
+                    // path, not here.
                 }
             }
         }
+
+        // DAW migration Phase 3c.1+3c.3 — Slide + LFO per-tick
+        // application driven entirely by `AutomationLane`s. The
+        // migrated `TrackEffect` variants have been removed from the
+        // cell side, so there is nothing in the match-loop above to
+        // advance the LFO phases or apply slides — both happen here.
+        self.apply_slides_from_lanes(current_tick);
+        self.advance_lfos_from_lanes(current_tick);
     }
 
     /// Change instr and return true if it was the same
     fn tick0_change_instr(&mut self, sample_only: bool, pool: &mut VoicePool<'a>) -> bool {
-        let instrnr = self.current.instrument.unwrap();
+        let instrnr = self.current_track_instrument.unwrap();
 
         // Euclidean indirection: an `InstrumentType::Euclidean`
         // wraps a Default sample-based instrument via `ekn.instr`.
@@ -2231,7 +2045,7 @@ impl<'a> Channel<'a> {
                     // note's "clash preferences" are resolved first,
                     // then NNA decides what happens to whatever live
                     // voice is still standing afterwards.
-                    let new_note = self.current.note.pitch();
+                    let new_note = self.current.pitch();
                     let new_sample_index = new_note
                         .and_then(|n| {
                             id.keyboard
@@ -2253,7 +2067,7 @@ impl<'a> Channel<'a> {
                         instrnr,
                         self.period_helper.clone(),
                         self.rate,
-                        self.module.profile.quirks.sample_volume_is_static_gain,
+                        self.module.quirks.sample_volume_is_static_gain,
                     );
                     self.install_live(pool, state, id.midi_mute_computer);
                     // Consume any one-shot S73–S76 override — it
@@ -2276,30 +2090,49 @@ impl<'a> Channel<'a> {
 
     /// Return true if it was the same instrument
     fn tick0_load_instrument(&mut self, pool: &mut VoicePool<'a>) -> bool {
-        if let Some(instr) = self.current.instrument {
-            if instr >= self.module.instrument.len() {
-                // Invalid instrument, cut current note
-                self.cut_pitch();
-                self.drop_live(pool);
-                return false;
+        // Determine whether this cell carries an instrument-column
+        // load (mirror of the legacy `cell.instrument.is_some()`
+        // semantic gate). The value of the instrument index lives in
+        // `self.current_track_instrument` now.
+        if self.current.has_instrument_column() {
+            if let Some(instr) = self.current_track_instrument {
+                if instr >= self.module.instrument.len() {
+                    // Invalid instrument, cut current note
+                    self.cut_pitch();
+                    self.drop_live(pool);
+                    return false;
+                }
             }
         } else {
             // No instrument to load
             return true;
         }
 
-        if self.current.has_tone_portamento() {
+        if self.row_has_tone_portamento_lane() {
             self.trigger_pitch(TRIGGER_KEEP_PERIOD | TRIGGER_KEEP_SAMPLE_POSITION, pool);
             return self.tick0_change_instr(true, pool);
         }
 
-        // Dispatch on the cell's note column. A real Play(_) falls
-        // through to the regular instrument-change path; the other
-        // variants apply their own trigger/return convention.
-        match self.current.note {
-            CellNote::Empty => {
+        // Dispatch on the cell's event. Mirrors the legacy `cell.note`
+        // / `cell.instrument` cross-product:
+        // * `InstrReset` ↔ Empty + instr column → ghost trigger +
+        //   defaults reload.
+        // * `NoteOff { retrig: true }` ↔ KeyOff + instr column → plain
+        //   KEEP_PERIOD trigger (the actual key_off fires inside
+        //   `tick0_load_pitch`).
+        // * `NoteOn { .. }` ↔ Play + instr column → standard
+        //   instrument-change path (fall through).
+        // * `NoteCut`, `NoteFade` ↔ note column variants with instr
+        //   column set: behaviour identical to the legacy
+        //   `CellNote::NoteCut` / `CellNote::NoteFade` arms
+        //   (no-op load path), see comments below.
+        // * `None`, `NoteOnGhost`, `NoteOff { retrig: false }` ↔
+        //   no instr column — the early return at the top already
+        //   handled them.
+        match self.current.event {
+            CellEvent::InstrReset => {
                 /* Ghost instrument, trigger note */
-                let trigger_flags = if self.current.has_volume_slide() {
+                let trigger_flags = if self.row_has_volume_slide_lane() {
                     TRIGGER_KEEP_SAMPLE_POSITION | TRIGGER_KEEP_PERIOD
                 } else {
                     /* Sample position is kept, but envelopes are reset */
@@ -2308,11 +2141,11 @@ impl<'a> Channel<'a> {
                 self.trigger_pitch(trigger_flags, pool);
                 return self.tick0_change_instr(true, pool);
             }
-            CellNote::KeyOff => {
+            CellEvent::NoteOff { retrig: true } => {
                 self.trigger_pitch(TRIGGER_KEEP_PERIOD, pool);
                 return true; // Keyoff does not change instrument
             }
-            CellNote::NoteFade => {
+            CellEvent::NoteFade => {
                 // IT note-fade `~~~`: same instrument-handling rule
                 // as KeyOff — the fade cell is not a "new note" and
                 // must not load a different instrument or retrigger.
@@ -2320,34 +2153,45 @@ impl<'a> Channel<'a> {
                 // `tick0_load_pitch::note_fade`.
                 return true;
             }
-            CellNote::NoteCut | CellNote::Play(_) => {
+            CellEvent::NoteCut | CellEvent::NoteOn { .. } => {
                 // Cut and Play both go through the normal path: a
                 // Cut row will be handled inside
                 // `tick0_change_instr` like an empty note (no
                 // instrument change), and Play loads its instrument
                 // and pitch.
             }
+            // Unreachable in practice (has_instrument_column above
+            // already short-circuited these), but kept as a no-op
+            // arm so the match is exhaustive without a wildcard.
+            CellEvent::None
+            | CellEvent::NoteOnGhost { .. }
+            | CellEvent::NoteOff { retrig: false } => {}
         }
 
         self.tick0_change_instr(false, pool)
     }
 
     fn tick0_load_pitch(&mut self, was_same_instr: bool, pool: &mut VoicePool<'a>) {
-        // Extract the actual pitch from the cell. For non-Play
-        // variants (KeyOff / NoteFade / NoteCut / Empty) this branch
-        // dispatches the corresponding event and returns; only
-        // Play(p) carries on to instrument/pitch loading.
-        let pitch = match self.current.note {
-            CellNote::Play(p) => p,
-            CellNote::KeyOff => {
-                if self.current.instrument.is_none() || was_same_instr {
+        // Extract the actual pitch from the cell's event. Non-trigger
+        // variants dispatch their own behaviour and return; only the
+        // two `NoteOn` flavours carry on to instrument/pitch loading.
+        let pitch = match self.current.event {
+            CellEvent::NoteOn { pitch, .. } | CellEvent::NoteOnGhost { pitch, .. } => pitch,
+            CellEvent::NoteOff { retrig } => {
+                // Mirror the legacy KeyOff branch:
+                // * no instr column (`retrig=false`) OR same instr
+                //   already held → plain key_off.
+                // * instr column present (`retrig=true`) and a
+                //   different instrument → KEEP_PERIOD trigger
+                //   followed by the channel's natural release.
+                if !retrig || was_same_instr {
                     self.key_off(0, pool);
                 } else {
                     self.trigger_pitch(TRIGGER_KEEP_PERIOD | TRIGGER_KEEP_ENVELOPE, pool);
                 }
                 return;
             }
-            CellNote::NoteFade => {
+            CellEvent::NoteFade => {
                 // IT note-column `~~~`: start fadeout without
                 // releasing the envelope. Falls through any
                 // instrument change because fade has the same
@@ -2357,17 +2201,23 @@ impl<'a> Channel<'a> {
                 self.note_fade(pool);
                 return;
             }
-            CellNote::NoteCut | CellNote::Empty => {
-                // NoteCut handled elsewhere; Empty means there's
-                // no note event on this row — nothing to do here.
+            CellEvent::NoteCut | CellEvent::None | CellEvent::InstrReset => {
+                // NoteCut handled via `TrackEffect::NoteCut`;
+                // None means no note event on this row;
+                // InstrReset is processed entirely in
+                // `tick0_load_instrument` (it never reaches here
+                // because the early return above handles the "no
+                // instrument to load" path *and* the InstrReset
+                // path completes via `tick0_change_instr`).
                 return;
             }
         };
 
         // Instr?
+        let has_tone_porta = self.row_has_tone_portamento_lane();
         if let Some(instr) = self.live_mut(pool) {
             // Portamento?
-            if self.current.has_tone_portamento() {
+            if has_tone_porta {
                 if let Some(s) = &instr.state_sample {
                     if s.is_enabled() {
                         // Same input/output split as in the SetNote
@@ -2399,10 +2249,11 @@ impl<'a> Channel<'a> {
             // this path with NNA=Cut (the default) so `spawn_ghost_
             // clone` is an inert early return there.
             //
-            // Gate on `instrument.is_none()` so the instrument-change
-            // path (which already ran `spawn_ghost_for_outgoing` in
-            // `tick0_change_instr`) doesn't double-ghost.
-            if self.current.instrument.is_none() {
+            // Gate on `!has_instrument_column()` so the
+            // instrument-change path (which already ran
+            // `spawn_ghost_for_outgoing` in `tick0_change_instr`)
+            // doesn't double-ghost.
+            if !self.current.has_instrument_column() {
                 self.spawn_ghost_clone(pool);
             }
 
@@ -2438,7 +2289,7 @@ impl<'a> Channel<'a> {
                     }
                     self.current_note = Some(pitch);
 
-                    let trigger_flag = if self.current.instrument.is_some() {
+                    let trigger_flag = if self.current.has_instrument_column() {
                         TRIGGER_KEEP_NONE
                     } else {
                         /* Ghost note: keep old volume */
@@ -2461,7 +2312,7 @@ impl<'a> Channel<'a> {
         //
         // Key constraints:
         //   - This is canonical FT2/XM behaviour, gated on
-        //     `module.profile.quirks.k00_eats_note`. The FT2
+        //     `module.quirks.k00_eats_note`. The FT2
         //     `CompatibilityProfile` sets it; modern / IT / S3M /
         //     MOD profiles leave it off. (Per the
         //     `PlaybackQuirks` design contract, runtime decisions
@@ -2477,7 +2328,7 @@ impl<'a> Channel<'a> {
         //     (see `key_off()`) and belongs on the normal tick-0 path
         //     via `tick0_load_pitch`, hence the helper distinguishes
         //     effect-Kxx from column-keyoff.
-        if self.module.profile.quirks.k00_eats_note && self.current.has_note_off_at_tick_zero() {
+        if self.module.quirks.k00_eats_note && self.current.has_note_off_at_tick_zero() {
             return;
         }
 
@@ -2492,8 +2343,465 @@ impl<'a> Channel<'a> {
         self.tick0_load_pitch(was_same_instr, pool);
     }
 
-    pub(crate) fn tick0(&mut self, pattern_slot: &TrackUnit, pool: &mut VoicePool<'a>) {
+    // `current_track_idx` was the debug-only twin of
+    // [`Self::lookup_track_idx`] used by the dual-read validators.
+    // Both validators and helper removed in DAW migration
+    // Phase 3c.3 — `lookup_track_idx` is the single survivor.
+
+    // All dual-read `validate_*_lane` helpers were removed in
+    // DAW migration Phase 3c.3 — the migrated `TrackEffect`
+    // variants are gone, so there's no cell-side source to compare
+    // against. The lanes ARE the authoritative form at runtime.
+
+    /// DAW migration Phase 3c.1 — **substitution**.
+    ///
+    /// Arm the three per-Track LFO state machines (Vibrato,
+    /// Tremolo, Panbrello) from their `AutomationLane`s. Called
+    /// at every row-start tick (`Channel::tick0`) **before**
+    /// `tickn_effects(0, pool)` so the cell-side arms see the
+    /// already-armed `effect_*.data`. The cell-side arms no
+    /// longer write the LFO params — they only drive the
+    /// per-tick `.tick_q()` advance and the format-specific
+    /// quirks (FT2 vol-col-B, IT old-effects depth doubling,
+    /// IT 2.14 row-zero tick).
+    ///
+    /// Skipped on `NoteDelay` rows since the cell-side effects
+    /// (and the LFO arm) wait for the delay tick.
+    fn arm_lfos_from_lanes(&mut self, abs_tick: u32, song: u16) {
+        use xmrs::core::daw::automation::AutomationTarget;
+        let Some(track_idx) = self.lookup_track_idx(abs_tick, song) else {
+            return;
+        };
+
+        // ---- Vibrato (TrackPitch) ---------------------------------------
+        if let Some(state) = self
+            .module
+            .lanes_for(AutomationTarget::TrackPitch(track_idx))
+            .find_map(|l| l.lfo_state_at(abs_tick))
+        {
+            if state.armed {
+                let depth = if self.module.quirks.it_old_effects {
+                    state.depth.raw().saturating_mul(2)
+                } else {
+                    state.depth.raw()
+                };
+                self.effect_vibrato.data.speed = state.speed;
+                self.effect_vibrato.data.depth = depth;
+                self.effect_vibrato.data.waveform = WaveformState::new(state.waveform);
+                self.vibrato_retrig_on_new_note = state.retrig;
+            }
+        }
+
+        // ---- Tremolo (TrackVolume) --------------------------------------
+        if let Some(state) = self
+            .module
+            .lanes_for(AutomationTarget::TrackVolume(track_idx))
+            .find_map(|l| l.lfo_state_at(abs_tick))
+        {
+            if state.armed {
+                self.effect_tremolo.data.speed = state.speed;
+                self.effect_tremolo.data.depth = state.depth.raw();
+                self.effect_tremolo.data.waveform = WaveformState::new(state.waveform);
+                self.tremolo_retrig_on_new_note = state.retrig;
+            }
+        }
+
+        // ---- Panbrello (TrackPanning) -----------------------------------
+        // Panbrello on legacy: `effect_panbrello.tick0_q(s, d.raw())`
+        // = latch params + retrigger phase. Substituted equivalent:
+        // write params from lane + `retrigger_q` when newly armed.
+        // The "newly armed" gate avoids re-zeroing the phase on
+        // every row where the lane stays armed (matches legacy
+        // semantics where the cell arm only fires when the row
+        // carries the main effect).
+        if let Some(state) = self
+            .module
+            .lanes_for(AutomationTarget::TrackPanning(track_idx))
+            .find_map(|l| l.lfo_state_at(abs_tick))
+        {
+            // Only arm + retrigger the phase when the row carries a
+            // fresh main-effect Panbrello (mirrors the legacy "cell
+            // arm fires only when `Panbrello { .. }` is on the
+            // row"). DAW migration Phase 3c.3: the cell-side
+            // check is replaced by a lane-side `events_in` query at
+            // exactly `abs_tick`.
+            let row_has_main =
+                self.lane_has_lfo_set_at(AutomationTarget::TrackPanning(track_idx), abs_tick);
+            if state.armed && row_has_main {
+                self.effect_panbrello.data.speed = state.speed;
+                self.effect_panbrello.data.depth = state.depth.raw();
+                self.effect_panbrello.data.waveform = WaveformState::new(state.waveform);
+                self.effect_panbrello.retrigger_q();
+            }
+        }
+    }
+
+    /// Active-clip → Track index lookup, non-debug version of
+    /// the debug-only `current_track_idx`. Used by
+    /// [`Self::arm_lfos_from_lanes`].
+    #[inline]
+    fn lookup_track_idx(&self, abs_tick: u32, song: u16) -> Option<u32> {
+        self.module
+            .clips
+            .active_at(song, self.track_index as u8, abs_tick)
+            .map(|(_, c)| c.track)
+    }
+
+    /// `true` when an `AutomationLane` of `target` has an
+    /// `LfoEvent::Set` whose tick exactly equals `tick`. Used by
+    /// the cell-side quirks that previously asked "does this row
+    /// carry a main `Vibrato` / `Tremolo` / `Panbrello`?" by
+    /// scanning `cell.effects` (DAW migration Phase 3c.3).
+    #[inline]
+    fn lane_has_lfo_set_at(
+        &self,
+        target: xmrs::core::daw::automation::AutomationTarget,
+        tick: u32,
+    ) -> bool {
+        use xmrs::core::daw::automation::{LaneEvent, LfoEvent};
+        self.module.lanes_for(target).any(|l| {
+            l.events_in(tick, tick.saturating_add(1))
+                .iter()
+                .any(|e| matches!(e, LaneEvent::Lfo(LfoEvent::Set { .. })))
+        })
+    }
+
+    /// `true` when an `AutomationLane` of `target` has an
+    /// `LfoEvent::DepthOnly` whose tick exactly equals `tick`.
+    /// Stand-in for the legacy "row carries a standalone
+    /// `VibratoDepth`" check (FT2 vol-col-B quirk).
+    #[inline]
+    fn lane_has_lfo_depthonly_at(
+        &self,
+        target: xmrs::core::daw::automation::AutomationTarget,
+        tick: u32,
+    ) -> bool {
+        use xmrs::core::daw::automation::{LaneEvent, LfoEvent};
+        self.module.lanes_for(target).any(|l| {
+            l.events_in(tick, tick.saturating_add(1))
+                .iter()
+                .any(|e| matches!(e, LaneEvent::Lfo(LfoEvent::DepthOnly { .. })))
+        })
+    }
+
+    /// `true` when an `AutomationLane` of `target` has a
+    /// `SlideEvent::Set` whose tick exactly equals `tick`. Used
+    /// for the FT2 `InstrReset` quirk (`has_volume_slide`-style)
+    /// and similar row-carries-a-slide questions.
+    #[inline]
+    fn lane_has_slide_set_at(
+        &self,
+        target: xmrs::core::daw::automation::AutomationTarget,
+        tick: u32,
+    ) -> bool {
+        use xmrs::core::daw::automation::{LaneEvent, SlideEvent};
+        self.module.lanes_for(target).any(|l| {
+            l.events_in(tick, tick.saturating_add(1))
+                .iter()
+                .any(|e| matches!(e, LaneEvent::Slide(SlideEvent::Set { .. })))
+        })
+    }
+
+    /// `true` when an `AutomationLane` of `target` has a
+    /// `GlideEvent::Set` whose tick exactly equals `tick`.
+    /// Stand-in for the legacy "row carries TonePortamento" check.
+    #[inline]
+    fn lane_has_glide_set_at(
+        &self,
+        target: xmrs::core::daw::automation::AutomationTarget,
+        tick: u32,
+    ) -> bool {
+        use xmrs::core::daw::automation::{GlideEvent, LaneEvent};
+        self.module.lanes_for(target).any(|l| {
+            l.events_in(tick, tick.saturating_add(1))
+                .iter()
+                .any(|e| matches!(e, LaneEvent::Glide(GlideEvent::Set { .. })))
+        })
+    }
+
+    /// Convenience: "row carries TonePortamento on the active
+    /// Track's `TrackPitch` lane". Resolves the current Track from
+    /// the cached `(abs_tick, song)` cursor.
+    #[inline]
+    fn row_has_tone_portamento_lane(&self) -> bool {
+        let Some(track_idx) = self.lookup_track_idx(self.current_abs_tick, self.current_song_idx)
+        else {
+            return false;
+        };
+        self.lane_has_glide_set_at(
+            xmrs::core::daw::automation::AutomationTarget::TrackPitch(track_idx),
+            self.current_abs_tick,
+        )
+    }
+
+    /// Convenience: "row carries a main `Vibrato` on the active
+    /// Track's `TrackPitch` lane".
+    #[inline]
+    fn row_has_vibrato_lane(&self) -> bool {
+        let Some(track_idx) = self.lookup_track_idx(self.current_abs_tick, self.current_song_idx)
+        else {
+            return false;
+        };
+        self.lane_has_lfo_set_at(
+            xmrs::core::daw::automation::AutomationTarget::TrackPitch(track_idx),
+            self.current_abs_tick,
+        )
+    }
+
+    /// Convenience: "row carries a standalone `VibratoDepth` on
+    /// the active Track's `TrackPitch` lane" — XM vol-col B quirk.
+    #[inline]
+    fn row_has_vibrato_depth_only_lane(&self) -> bool {
+        let Some(track_idx) = self.lookup_track_idx(self.current_abs_tick, self.current_song_idx)
+        else {
+            return false;
+        };
+        self.lane_has_lfo_depthonly_at(
+            xmrs::core::daw::automation::AutomationTarget::TrackPitch(track_idx),
+            self.current_abs_tick,
+        )
+    }
+
+    /// Convenience: "row carries a `VolumeSlide` on the active
+    /// Track's `TrackVolume` lane".
+    #[inline]
+    fn row_has_volume_slide_lane(&self) -> bool {
+        let Some(track_idx) = self.lookup_track_idx(self.current_abs_tick, self.current_song_idx)
+        else {
+            return false;
+        };
+        self.lane_has_slide_set_at(
+            xmrs::core::daw::automation::AutomationTarget::TrackVolume(track_idx),
+            self.current_abs_tick,
+        )
+    }
+
+    // `row_has_panbrello_lane` would be the convenience companion
+    // to the per-row Vibrato / VolumeSlide / TonePortamento helpers,
+    // but the Panbrello quirk inlines `lane_has_lfo_set_at` directly
+    // (it already has `track_idx` in scope), so the helper would be
+    // dead code.
+
+    /// DAW migration Phase 3c.1 — Slide and Glide per-tick
+    /// application from `AutomationLane`s. Replaces the
+    /// cell-side `VolumeSlide` / `ChannelVolumeSlide` /
+    /// `PanningSlide` / `Portamento` / `TonePortamento` arms
+    /// (now no-ops). Reads the kind-matched lane via
+    /// `lanes_for(...).find_map(state_at)` so the right kind
+    /// is picked even when several lanes share the same target
+    /// (e.g. Tremolo + VolumeSlide on `TrackVolume(n)` ; Vibrato
+    /// + Portamento + TonePortamento on `TrackPitch(n)`).
+    ///
+    /// **TonePortamento goal**: kept cell-driven via
+    /// `self.note` (the channel's *played* pitch, which the
+    /// IT keyboard-table remap can transform into a different
+    /// output note than the cell's input pitch). The lane's
+    /// `target` field is the input pitch — pre-remap — so it's
+    /// intentionally ignored here. The lane only contributes
+    /// the `rate` and the `armed` flag; `self.note` already
+    /// went through `trigger_pitch` (which composes finetune
+    /// and drum-kit remap), so reading it gives the canonical
+    /// goal regardless of remap topology.
+    /// DAW migration Phase 3c.3 — advance the per-Track LFO
+    /// state machines (Vibrato / Tremolo / Panbrello) on every tick
+    /// where the corresponding lane is armed. Replaces the legacy
+    /// per-tick `.tick_q()` calls that used to fire from the
+    /// `TrackEffect::Vibrato/Tremolo/Panbrello` cell-side match
+    /// arms.
+    ///
+    /// Special cases honoured:
+    /// * **Vibrato @ tick 0** advances only under the IT 2.14
+    ///   `it_vibrato_ticks_at_row_zero` quirk (and only when
+    ///   `it_old_effects` is off).
+    /// * **FT2 vol-col-B** (`volcol_b_advances_vibrato`): a row
+    ///   that carries a standalone `VibratoDepth` (no main
+    ///   `Vibrato` Set) keeps the LFO advancing on `tick > 0`.
+    fn advance_lfos_from_lanes(&mut self, current_tick: usize) {
+        use xmrs::core::daw::automation::AutomationTarget;
+        let abs_tick = self.current_abs_tick;
+        let song = self.current_song_idx;
+        let Some(track_idx) = self.lookup_track_idx(abs_tick, song) else {
+            return;
+        };
+        // ---- Vibrato (TrackPitch) ---------------------------------------
+        let vib_state = self
+            .module
+            .lanes_for(AutomationTarget::TrackPitch(track_idx))
+            .find_map(|l| l.lfo_state_at(abs_tick));
+        if let Some(state) = vib_state {
+            if state.armed {
+                let row_has_main =
+                    self.lane_has_lfo_set_at(AutomationTarget::TrackPitch(track_idx), abs_tick);
+                let row_has_depth_only = self
+                    .lane_has_lfo_depthonly_at(AutomationTarget::TrackPitch(track_idx), abs_tick);
+                if current_tick == 0 {
+                    if row_has_main
+                        && self.module.quirks.it_vibrato_ticks_at_row_zero
+                        && !self.module.quirks.it_old_effects
+                    {
+                        self.effect_vibrato.tick_q();
+                    }
+                } else if row_has_main
+                    || (row_has_depth_only && self.module.quirks.volcol_b_advances_vibrato)
+                {
+                    self.effect_vibrato.tick_q();
+                }
+            }
+        }
+        // ---- Tremolo (TrackVolume) --------------------------------------
+        if current_tick > 0 {
+            let trem_state = self
+                .module
+                .lanes_for(AutomationTarget::TrackVolume(track_idx))
+                .find_map(|l| l.lfo_state_at(abs_tick));
+            if let Some(state) = trem_state {
+                if state.armed
+                    && self.lane_has_lfo_set_at(AutomationTarget::TrackVolume(track_idx), abs_tick)
+                {
+                    self.effect_tremolo.tick_q();
+                }
+            }
+            // ---- Panbrello (TrackPanning) ------------------------------
+            let pan_state = self
+                .module
+                .lanes_for(AutomationTarget::TrackPanning(track_idx))
+                .find_map(|l| l.lfo_state_at(abs_tick));
+            if let Some(state) = pan_state {
+                if state.armed
+                    && self.lane_has_lfo_set_at(AutomationTarget::TrackPanning(track_idx), abs_tick)
+                {
+                    self.effect_panbrello.tick_q();
+                }
+            }
+        }
+    }
+
+    fn apply_slides_from_lanes(&mut self, current_tick: usize) {
+        use xmrs::core::daw::automation::AutomationTarget;
+        let abs_tick = self.current_abs_tick;
+        let song = self.current_song_idx;
+        let Some(track_idx) = self.lookup_track_idx(abs_tick, song) else {
+            return;
+        };
+        let is_tick0 = current_tick == 0;
+
+        // VolumeSlide on TrackVolume Slide lane.
+        if let Some(state) = self
+            .module
+            .lanes_for(AutomationTarget::TrackVolume(track_idx))
+            .find_map(|l| l.slide_state_at(abs_tick))
+        {
+            if state.armed && state.fine == is_tick0 {
+                self.volume = self.volume.with_tremolo(state.rate);
+            }
+        }
+        // ChannelVolumeSlide on TrackChannelVolume Slide lane.
+        if let Some(state) = self
+            .module
+            .lanes_for(AutomationTarget::TrackChannelVolume(track_idx))
+            .find_map(|l| l.slide_state_at(abs_tick))
+        {
+            if state.armed && state.fine == is_tick0 {
+                self.channel_volume = self.channel_volume.shifted_by(state.rate);
+            }
+        }
+        // PanningSlide on TrackPanning Slide lane.
+        if let Some(state) = self
+            .module
+            .lanes_for(AutomationTarget::TrackPanning(track_idx))
+            .find_map(|l| l.slide_state_at(abs_tick))
+        {
+            if state.armed && state.fine == is_tick0 {
+                self.panning = self.panning.shifted_by(state.rate);
+            }
+        }
+        // TonePortamento on TrackPitch Glide lane. At tick 0,
+        // recompute the slide goal from `self.note` (which
+        // `tick0_load_pitch` already updated to the cell's
+        // played pitch via `played_pitch_for` + finetune
+        // composition — drum-kit remaps included). At tick > 0,
+        // approach the goal by `state.rate`.
+        if let Some(state) = self
+            .module
+            .lanes_for(AutomationTarget::TrackPitch(track_idx))
+            .find_map(|l| l.glide_state_at(abs_tick))
+        {
+            if state.armed {
+                if is_tick0 {
+                    self.effect_tone_portamento_goal = self.period_helper.note_to_period(self.note);
+                } else if self.period != self.effect_tone_portamento_goal {
+                    self.period = self
+                        .period
+                        .slide_towards(self.effect_tone_portamento_goal, state.rate);
+                }
+            }
+        }
+
+        // Portamento on TrackPitch Slide lane. Format-specific
+        // clamping (FT2 signed-overflow, ST3 `period_clamp`, IT
+        // `allow_zero_period`) is preserved verbatim from the
+        // pre-substitution cell-side arm.
+        if let Some(state) = self
+            .module
+            .lanes_for(AutomationTarget::TrackPitch(track_idx))
+            .find_map(|l| l.slide_state_at(abs_tick))
+        {
+            if state.armed && state.fine == is_tick0 {
+                let speed_i16 = state.rate.raw();
+                let new_period = self.period.saturating_add_signed(speed_i16);
+                if self.module.quirks.ft2_pitch_slide_overflow && speed_i16 > 0 {
+                    // FT2 `pitchSlideDown` signed-overflow quirk
+                    // (`ft2_replayer.c:1914`): periods in
+                    // `[32000, 32767]` snap to 31999; periods
+                    // ≥ 32768 wrap negative under the int16
+                    // cast, the clamp silently fails, and the
+                    // slide freewheels. Some XM modules rely
+                    // on this.
+                    let wrapped = new_period.raw() as i16;
+                    if (32000..=32767).contains(&(wrapped as i32)) {
+                        self.period = Period::from_raw(31999);
+                    } else {
+                        self.period = if new_period == Period::ZERO {
+                            Period::from_raw(1)
+                        } else {
+                            new_period
+                        };
+                    }
+                } else if let Some((clamp_min, clamp_max)) = self.module.quirks.period_clamp {
+                    // ST3 `amigalimits` clamp.
+                    self.period = new_period.clamp(clamp_min, clamp_max);
+                } else {
+                    // Conservative clamp; IT `allow_zero_period`
+                    // opens the low edge so a pitch slide can
+                    // reach "infinitely high note" — ST3
+                    // convention without amigalimits.
+                    let min_period = if self.module.quirks.allow_zero_period {
+                        Period::ZERO
+                    } else {
+                        Period::from_raw(1)
+                    };
+                    self.period = new_period.clamp(min_period, Period::from_raw(31999));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn tick0(
+        &mut self,
+        pattern_slot: &Cell,
+        track_instr: Option<usize>,
+        abs_tick: u32,
+        song: u16,
+        pool: &mut VoicePool<'a>,
+    ) {
         self.current = pattern_slot.clone();
+        self.current_track_instrument = track_instr;
+        // Phase 3c.1 — cache abs_tick / song for the row's
+        // tick run. `tickn_effects` and the per-tick lane
+        // queries read these without re-threading from
+        // sequencer state.
+        self.current_abs_tick = abs_tick;
+        self.current_song_idx = song;
 
         let delay = self.current.get_delay();
         // Always write `effect_note_delay` — whether 0 or the row's
@@ -2511,6 +2819,12 @@ impl<'a> Channel<'a> {
             if let Some(instr) = self.live_mut(pool) {
                 instr.tick();
             }
+            // DAW migration Phase 3c.1 — lane is the source of
+            // truth for LFO params (Vibrato/Tremolo/Panbrello).
+            // Runs before `tickn_effects` so the cell-side arms
+            // (which only drive per-tick advance + quirks now)
+            // see the correct `effect_*.data` state.
+            self.arm_lfos_from_lanes(abs_tick, song);
             self.tickn_effects(0, pool);
 
             if self.effect_arpeggio.in_progress() && !self.current.has_arpeggio() {
@@ -2520,7 +2834,7 @@ impl<'a> Channel<'a> {
                 self.effect_arpeggio.retrigger();
             }
 
-            if self.effect_vibrato.in_progress() && !self.current.has_vibrato() {
+            if self.effect_vibrato.in_progress() && !self.row_has_vibrato_lane() {
                 // When leaving a Vibrato (main-effect 4xx/6xx) row, clear
                 // the lingering period offset so the next row plays at
                 // `realPeriod`.
@@ -2531,8 +2845,8 @@ impl<'a> Channel<'a> {
                 // we must NOT clear the output — otherwise the vibrato
                 // would audibly cut in and out on every row that only
                 // carries vol-col B.
-                let xm_volcol_b_alone = self.module.profile.quirks.volcol_b_advances_vibrato
-                    && self.current.has_vibrato_depth();
+                let xm_volcol_b_alone = self.module.quirks.volcol_b_advances_vibrato
+                    && self.row_has_vibrato_depth_only_lane();
                 if !xm_volcol_b_alone {
                     // Only clear the output modulation.
                     self.effect_vibrato.clear_output();

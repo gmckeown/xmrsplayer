@@ -1,6 +1,6 @@
-use xmrs::fixed::fixed::{Q15, Q8_8};
-use xmrs::fixed::units::PitchDelta;
-use xmrs::{prelude::Waveform, waveform::WaveformState};
+use xmrs::core::fixed::fixed::{Q15, Q8_8};
+use xmrs::core::fixed::units::PitchDelta;
+use xmrs::{core::waveform::WaveformState, prelude::Waveform};
 
 /// LFO parameter pack. `speed` is the phase increment per tick
 /// (Q8.8 cycles/tick — fractional in practice, e.g. `4 raw =
@@ -55,9 +55,13 @@ impl EffectVibratoTremolo {
         // `self.pos` intentionally preserved.
     }
 
-    /// Type-clean tick0 for the typed call sites in `channel.rs`.
     /// Latches `(speed, depth)` and resets the LFO phase.
+    /// Public for downstream consumers; the in-tree
+    /// `Channel::arm_lfos_from_lanes` writes the params and
+    /// calls `retrigger_q` directly (DAW migration Phase 3c.1
+    /// substitution), so this helper is currently unused.
     #[inline]
+    #[allow(dead_code)]
     pub fn tick0_q(&mut self, speed: Q8_8, depth: i16) -> i16 {
         self.data.speed = speed;
         self.data.depth = depth;
@@ -85,7 +89,7 @@ impl EffectVibratoTremolo {
         let wave = self
             .data
             .waveform
-            .value_q15(xmrs::fixed::units::Phase::from_raw(self.pos));
+            .value_q15(xmrs::core::fixed::units::Phase::from_raw(self.pos));
         let product = ((self.data.depth as i32) * (wave.raw() as i32)) >> 15;
         self.value = product.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
 

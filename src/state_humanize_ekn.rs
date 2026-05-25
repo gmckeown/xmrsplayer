@@ -20,9 +20,9 @@
 //! no suppress". A channel that never sees an Euclidean carries
 //! this state at near-zero cost.
 
-use xmrs::fixed::fixed::Q15;
-use xmrs::prelude::TrackUnit;
-use xmrs::xorshift::XorShift32;
+use xmrs::core::fixed::fixed::Q15;
+use xmrs::core::xorshift::XorShift32;
+use xmrs::prelude::Cell;
 
 /// Per-channel Euclidean humanisation state.
 #[derive(Clone)]
@@ -38,10 +38,14 @@ pub(crate) struct StateHumanizeEkn {
     /// [`Deterministic`](crate::humanize::HumanizeMode::Deterministic)).
     rng: XorShift32,
 
-    /// Pending fire-early intent: `(tick_within_row, cell)`.
-    /// `Some` means: when the channel reaches this tick inside the
-    /// current row, trigger the cell early.
-    fire_intent: Option<(u8, TrackUnit)>,
+    /// Pending fire-early intent: `(tick_within_row, cell,
+    /// track_instr)`. `Some` means: when the channel reaches this
+    /// tick inside the current row, trigger the cell early. The
+    /// `track_instr` is the cached `Track.instrument` for the cell
+    /// that originated this intent — see DAW migration Phase 1+2
+    /// for why the per-cell instrument is no longer carried by
+    /// `Cell` itself.
+    fire_intent: Option<(u8, Cell, Option<usize>)>,
 
     /// `true` when the next row-start trigger should be skipped on
     /// this channel because the pulse was already fired early.
@@ -104,20 +108,21 @@ impl StateHumanizeEkn {
     }
 
     /// Schedule a fire-early at `tick_within_row` with the given
-    /// cell. Also marks `suppress_next_natural` so the natural
-    /// row-start trigger of the same pulse is skipped.
-    pub fn schedule_fire(&mut self, tick_within_row: u8, cell: TrackUnit) {
-        self.fire_intent = Some((tick_within_row, cell));
+    /// cell and the cell's track-level instrument. Also marks
+    /// `suppress_next_natural` so the natural row-start trigger of
+    /// the same pulse is skipped.
+    pub fn schedule_fire(&mut self, tick_within_row: u8, cell: Cell, track_instr: Option<usize>) {
+        self.fire_intent = Some((tick_within_row, cell, track_instr));
         self.suppress_next_natural = true;
     }
 
     /// If the fire-intent's scheduled tick matches `current_tick`,
-    /// consume it and return the cell to trigger now. Otherwise
-    /// `None`.
-    pub fn take_fire_intent_at(&mut self, current_tick: u8) -> Option<TrackUnit> {
+    /// consume it and return the `(cell, track_instr)` pair to
+    /// trigger now. Otherwise `None`.
+    pub fn take_fire_intent_at(&mut self, current_tick: u8) -> Option<(Cell, Option<usize>)> {
         match &self.fire_intent {
-            Some((scheduled_tick, _)) if *scheduled_tick == current_tick => {
-                self.fire_intent.take().map(|(_, cell)| cell)
+            Some((scheduled_tick, _, _)) if *scheduled_tick == current_tick => {
+                self.fire_intent.take().map(|(_, cell, ti)| (cell, ti))
             }
             _ => None,
         }

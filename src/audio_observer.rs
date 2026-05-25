@@ -57,11 +57,11 @@ pub struct MixContext {
     pub left: i16,
     pub right: i16,
     /// Current `global_volume` Q1.15 (song-driven, 0.0..=1.0).
-    /// Moves when a `GlobalEffect::Volume` / `VolumeSlide` fires.
-    pub global_volume: xmrs::fixed::units::Volume,
+    /// Moves when a `SongLevelEffect::Volume` / `VolumeSlide` fires.
+    pub global_volume: xmrs::core::fixed::units::Volume,
     /// Current `amplification` Q4.12 (user-driven, up to 8×).
     /// Changes only when `XmrsPlayer::set_amplification` is called.
-    pub amplification: xmrs::fixed::units::Amplification,
+    pub amplification: xmrs::core::fixed::units::Amplification,
 }
 
 /// Context passed to [`ChannelsObserver::on_channels`].
@@ -73,8 +73,8 @@ pub struct MixContext {
 /// to [`MixObserver`]. Sample values are signed 16-bit PCM.
 pub struct ChannelsContext<'a> {
     pub channels: &'a [(i16, i16)],
-    pub global_volume: xmrs::fixed::units::Volume,
-    pub amplification: xmrs::fixed::units::Amplification,
+    pub global_volume: xmrs::core::fixed::units::Volume,
+    pub amplification: xmrs::core::fixed::units::Amplification,
 }
 
 /// Subscriber to the final (summed, stereo) audio mix, pre-gain.

@@ -1,40 +1,30 @@
-//! Song cursor + tick clock.
+//! Song cursor + tick clock — TimelineMap-driven.
 //!
-//! The `Sequencer` owns everything that has to do with *where we are in the
-//! song* and *when the next row fires*:
+//! Since DAW migration Phase 3c.2 the sequencer is a thin
+//! state machine over [`xmrs::core::daw::timeline::TimelineMap`]:
+//! each `TimelineEntry` already carries `(order, pattern, row,
+//! loop_iter, tick, speed_at_row, bpm_at_row)`, with all navigation
+//! effects (`Bxx` / `Dxx` / `E6y` / `EEy`) absorbed at import time
+//! by the linearisation walker. The sequencer's only job at
+//! row-start is to:
 //!
-//! * song/pattern/row position and the pending-jump flags that the navigation
-//!   effects (`Bxx` position jump, `Dxx` pattern break, `E6y` pattern loop,
-//!   `EEy` pattern delay) manipulate,
-//! * `tempo` / `bpm` / `current_tick` — the song-side clock, expressed in
-//!   ticks per row and ticks per second (the sample clock itself lives on
-//!   the facade),
-//! * the per-channel pattern-loop state (`pattern_loop_origin`,
-//!   `pattern_loop_count`) — it reads as "per channel" but semantically
-//!   belongs to navigation, so it migrates here from `Channel`,
-//! * the loop-detection bookkeeping (`row_loop_count`, `loop_count`,
-//!   `max_loop_count`) used to stop playback after N loops.
+//! * advance `timeline_idx` (either linearly, to entry+1, or via
+//!   the end-of-song wrap dictated by [`xmrs::core::module::Module::song_loop_to`]),
+//! * publish the new `(playing_pattern, playing_row, tempo, bpm)`
+//!   to observers and voices,
+//! * latch `BpmSlide` from the row's cells so non-row-start ticks
+//!   can ramp the BPM.
 //!
-//! The sequencer does **not** touch audio. It reads `GlobalEffect`s from the
-//! module's pattern cells (directly, without going through `Channel`) and
-//! applies the ones that affect navigation/tempo. Volume-side global effects
-//! (`GlobalEffect::Volume`, `GlobalEffect::VolumeSlide`) are read separately
-//! by `Voices`.
+//! Everything else (`Bpm`/`Speed`/`Volume`/`VolumeSlide` cell-side
+//! globals, `MidiMacro`) is either pre-baked into the entry (`Bpm`,
+//! `Speed`) or read separately by [`crate::voices::Voices`]
+//! (`Volume`, `VolumeSlide`, `MidiMacro`).
 //!
-//! The facade drives the sequencer one tick at a time via `Sequencer::advance_tick`.
+//! The sequencer does **not** touch audio. The facade drives it
+//! one tick at a time via `Sequencer::advance_tick` (crate-private).
 
 use alloc::{vec, vec::Vec};
 use xmrs::prelude::*;
-
-/// Per-channel pattern-loop state (FT2 `E6y` / S3M `SBy` / IT `SBy`).
-///
-/// `origin` is the row the loop starts from (set by `E60` on that channel),
-/// `count` is how many times the loop body has run so far.
-#[derive(Clone, Default)]
-struct PatternLoopSlot {
-    origin: usize,
-    count: usize,
-}
 
 /// Outcome of a single tick advance.
 #[derive(Debug, Clone, Copy)]
@@ -43,11 +33,9 @@ pub enum TickOutcome {
     /// current row (>= 1 — row-start ticks use `RowStart` instead).
     /// Voices should run their per-tick effect logic using this value.
     Tick { tick: usize },
-    /// A row-start tick. The sequencer has already applied any pending
-    /// navigation jumps and consumed the new row's navigation global effects.
-    /// `pattern` is the pattern index, `row` is the row index within that
-    /// pattern. The caller is expected to forward `module.row_at(song,
-    /// pattern, row)` to voices and to observers.
+    /// A row-start tick. `pattern` is the pattern index, `row` is the row
+    /// index within that pattern. The caller is expected to forward
+    /// `module.row_at(song, pattern, row)` to voices and to observers.
     ///
     /// `pattern_changed` is `true` when this row-start tick also crossed a
     /// pattern-order boundary (either naturally or via a jump); observers
@@ -57,7 +45,8 @@ pub enum TickOutcome {
         row: usize,
         pattern_changed: bool,
     },
-    /// Playback has ended (max loop count reached). No more events will fire
+    /// Playback has ended (max loop count reached, or `TimelineMap`
+    /// exhausted with no wrap target). No more events will fire
     /// until the caller resets the sequencer (e.g. via `goto`).
     SongEnd,
 }
@@ -72,38 +61,28 @@ pub struct Sequencer<'a> {
     /// Current tick inside the current row (0 = row-start tick, 1..tempo-1 =
     /// sustained-effect ticks, wraps back to 0 to load the next row).
     current_tick: usize,
-    /// Extra ticks before advancing to the next row — used for `EEy`
-    /// pattern-delay. Consumed once per row.
-    extra_ticks: usize,
     /// IT `Txx` BPM slide: the signed delta latched on the last row
-    /// that carried a `GlobalEffect::BpmSlide`. Applied on every
+    /// that carried a `SongLevelEffect::BpmSlide`. Applied on every
     /// subsequent non-row-start tick until the next row either
     /// re-latches or clears it. Zero when inactive.
     bpm_slide_delta: isize,
 
-    // --- Cursor ---
+    // --- Cursor (kept in sync with `timeline_idx` for legacy accessors) ---
     current_table_index: usize,
-    /// Row cursor. Following FT2 historical behaviour this is incremented at
-    /// the END of the row-start tick, so between row-start ticks it points to
-    /// the *next* row to play rather than to the row currently sounding.
-    /// `Sequencer::playing_row()` gives the opposite view when needed.
+    /// Row cursor. Following FT2 historical behaviour this is the
+    /// row *after* the one currently sounding (+1 bias). When the
+    /// row currently sounding is the last visited row of its
+    /// pattern, this points one past the end of the pattern.
     current_row: usize,
-    /// Last row reported to the caller via [`TickOutcome::RowStart`] — kept
-    /// separate from `current_row` because `current_row` gets incremented
-    /// before the outcome is returned.
+    /// Last row reported to the caller via [`TickOutcome::RowStart`].
+    /// Stable throughout the row's tick cycle.
     playing_row: usize,
     /// Same, but for the pattern index.
     playing_pattern: usize,
-
-    // --- Pending jumps (set by navigation effects on a row, consumed at the
-    //     start of the next row-start tick). ---
-    position_jump: bool,
-    pattern_break: bool,
-    jump_dest: usize,
-    jump_row: usize,
-
-    // --- Per-channel pattern-loop state (E6y / SBy). ---
-    pattern_loop: Vec<PatternLoopSlot>,
+    /// Cached at construction so [`Self::num_channels`] stays cheap
+    /// even though the field-of-truth (`module.get_num_channels()`)
+    /// is also O(1).
+    num_channels: usize,
 
     // --- Loop-detection bookkeeping for `max_loop_count`. ---
     row_loop_count: Vec<Vec<usize>>,
@@ -111,26 +90,29 @@ pub struct Sequencer<'a> {
     max_loop_count: usize,
 
     /// One-shot terminator latched by an explicit end-of-song
-    /// signal — currently set by `GlobalEffect::Speed(0)` on
-    /// modules whose `PlaybackQuirks::speed_zero_ends_song` is
-    /// on (ProTracker `F00` convention). Once latched,
-    /// `is_exhausted` returns `true` for every subsequent
-    /// `advance_tick`, which guarantees `SongEnd` fires even
-    /// when `tempo` was zeroed and the row would otherwise
-    /// freeze. Cleared by `goto` so the caller can jump past
+    /// signal. Cleared by `goto` so the caller can jump past
     /// the terminator and keep playing.
     song_end_requested: bool,
+
+    /// Index in [`xmrs::core::daw::timeline::TimelineMap::entries`] of the
+    /// row currently sounding. Valid only when `started` is `true`.
+    timeline_idx: usize,
+    /// Whether the very first row has been played. While `false`,
+    /// [`Self::advance_to_next_entry`] seeds `timeline_idx` from the
+    /// first entry of `current_song` instead of advancing.
+    started: bool,
+    /// Set by [`Self::goto`] / [`Self::goto_tick`] to redirect the
+    /// next row-start to the entry already stored in `timeline_idx`,
+    /// bypassing the linear advance. Consumed once.
+    restart_row: bool,
 }
 
 impl<'a> Sequencer<'a> {
     /// Build a sequencer for the given module.
     ///
-    /// `song` is clamped to a valid index into `module.pattern_order` (0 is
-    /// used if out of range), matching the constructor's historical contract.
+    /// `song` is clamped to a valid sub-song defined by
+    /// `module.timeline_map`. Falls back to song 0 when out of range.
     pub(crate) fn new(module: &'a Module, song: usize) -> Self {
-        // Pick a valid sub-song index from the timeline_map. We accept
-        // any song that has at least one entry; fall back to 0
-        // otherwise.
         let num_songs = module
             .timeline_map
             .entries
@@ -142,7 +124,6 @@ impl<'a> Sequencer<'a> {
         let current_song = if song < num_songs.max(1) { song } else { 0 };
         let num_channels = module.get_num_channels();
         let song_len = module.song_length(current_song);
-        let first_pattern = module.order_pattern_idx(current_song, 0).unwrap_or(0);
 
         Self {
             module,
@@ -150,17 +131,12 @@ impl<'a> Sequencer<'a> {
             tempo: module.default_tempo,
             bpm: module.default_bpm,
             current_tick: 0,
-            extra_ticks: 0,
             bpm_slide_delta: 0,
             current_table_index: 0,
             current_row: 0,
             playing_row: 0,
-            playing_pattern: first_pattern,
-            position_jump: false,
-            pattern_break: false,
-            jump_dest: 0,
-            jump_row: 0,
-            pattern_loop: vec![PatternLoopSlot::default(); num_channels],
+            playing_pattern: module.order_pattern_idx(current_song, 0).unwrap_or(0),
+            num_channels,
             row_loop_count: (0..song_len.max(1))
                 .map(|order_idx| {
                     let rows = module
@@ -173,6 +149,9 @@ impl<'a> Sequencer<'a> {
             loop_count: 0,
             max_loop_count: 0,
             song_end_requested: false,
+            timeline_idx: 0,
+            started: false,
+            restart_row: false,
         }
     }
 
@@ -224,7 +203,26 @@ impl<'a> Sequencer<'a> {
         self.max_loop_count = v;
     }
     pub fn num_channels(&self) -> usize {
-        self.pattern_loop.len()
+        self.num_channels
+    }
+
+    /// Position in `module.timeline_map.entries` of the row
+    /// currently sounding. Stable across the row's tick cycle.
+    /// Returns `0` until the first row plays.
+    pub fn timeline_idx(&self) -> usize {
+        self.timeline_idx
+    }
+
+    /// Absolute song tick of the currently playing row, derived
+    /// from the timeline_map entry at [`Self::timeline_idx`]. `0`
+    /// when no row has played yet.
+    pub fn current_abs_tick(&self) -> u32 {
+        self.module
+            .timeline_map
+            .entries
+            .get(self.timeline_idx)
+            .map(|e| e.tick)
+            .unwrap_or(0)
     }
 
     // --- Cursor manipulation ---
@@ -233,25 +231,50 @@ impl<'a> Sequencer<'a> {
     /// the module's default tempo. Returns `false` if the target is
     /// out of range.
     ///
-    /// Semantically identical to the old `XmrsPlayer::goto`:
-    /// the cursor is scheduled to jump on the *next* tick boundary (as if a
-    /// `Bxx` had been applied), tempo and BPM are reset, and the row counter
-    /// is forced to fire `tick0` on the next step.
+    /// Semantically: the cursor is scheduled to fire on the *next*
+    /// tick boundary. Tempo and BPM are reset and the song-end latch
+    /// is cleared so the caller can jump past a `F00` terminator and
+    /// keep playing — matches ProTracker's "press space to restart"
+    /// behaviour after the song flag was cleared.
     pub(crate) fn goto(&mut self, table_position: usize, row: usize, speed: usize) -> bool {
         if table_position >= self.module.song_length(self.current_song) {
             return false;
         }
-        let num_row = self
+        let pat_idx = self
             .module
             .order_pattern_idx(self.current_song, table_position)
             .unwrap_or(0);
-        if row >= self.module.pattern_row_count(num_row) {
+        if row >= self.module.pattern_row_count(pat_idx) {
             return false;
         }
-
-        self.jump_dest = table_position;
-        self.jump_row = row;
-        self.position_jump = true;
+        // The walker may not have visited `(table_position, row)`
+        // directly (e.g. user picks a row never reached by playback).
+        // Fall back to the order's entry row when no exact match
+        // exists; otherwise return false.
+        let song_u16 = self.current_song as u16;
+        let entry_idx = self
+            .module
+            .timeline_map
+            .entries
+            .iter()
+            .position(|e| {
+                e.song == song_u16
+                    && e.order_idx as usize == table_position
+                    && e.row_idx as usize == row
+                    && e.loop_iter == 0
+            })
+            .or_else(|| {
+                self.module.timeline_map.entries.iter().position(|e| {
+                    e.song == song_u16 && e.order_idx as usize == table_position && e.loop_iter == 0
+                })
+            });
+        let entry_idx = match entry_idx {
+            Some(i) => i,
+            None => return false,
+        };
+        self.timeline_idx = entry_idx;
+        self.restart_row = true;
+        self.started = true;
 
         self.tempo = if speed == 0 {
             self.module.default_tempo
@@ -263,13 +286,44 @@ impl<'a> Sequencer<'a> {
 
         // Force the next advance_tick to be treated as a row-start tick.
         self.current_tick = 0;
-
-        // Clear any latched end-of-song so the caller can jump
-        // past an `F00` terminator and keep playing — matches
-        // ProTracker's "press space to restart" behaviour after
-        // the song flag was cleared.
         self.song_end_requested = false;
 
+        true
+    }
+
+    /// Seek to an absolute song tick. Resolves `abs_tick` against
+    /// `module.timeline_map.entries` to find the matching entry,
+    /// then schedules a jump on the next tick. Returns `false` when
+    /// no entry exists at exactly `abs_tick` for the current song
+    /// (only canonical row-start ticks are valid — seeking inside a
+    /// row is the caller's responsibility).
+    pub fn goto_tick(&mut self, abs_tick: u32) -> bool {
+        let song_u16 = self.current_song as u16;
+        let entry_idx = self
+            .module
+            .timeline_map
+            .entries
+            .iter()
+            .position(|e| e.song == song_u16 && e.tick == abs_tick && e.loop_iter == 0);
+        let entry_idx = match entry_idx {
+            Some(i) => i,
+            None => return false,
+        };
+        let entry = self.module.timeline_map.entries[entry_idx];
+
+        self.timeline_idx = entry_idx;
+        self.restart_row = true;
+        self.started = true;
+
+        // Tempo / BPM come from the timeline_map entry — the walker
+        // captured the effective row-start values, so the seek lands
+        // on the same clock the linear playback would see.
+        self.tempo = (entry.speed_at_row as usize).max(1);
+        self.bpm = (entry.bpm_at_row as usize).max(1);
+        self.bpm_slide_delta = 0;
+
+        self.current_tick = 0;
+        self.song_end_requested = false;
         true
     }
 
@@ -278,10 +332,6 @@ impl<'a> Sequencer<'a> {
     /// Advance the sequencer by one song tick. The facade is responsible for
     /// computing the sample-clock gap between ticks — here we just bump the
     /// song-side tick counter and, when appropriate, apply row-change logic.
-    ///
-    /// The returned outcome tells the caller whether this tick was a
-    /// row-start (meaning cells must be dispatched to voices + observers) or
-    /// a regular sustained tick.
     pub(crate) fn advance_tick(&mut self) -> TickOutcome {
         if self.is_exhausted() {
             return TickOutcome::SongEnd;
@@ -289,29 +339,23 @@ impl<'a> Sequencer<'a> {
 
         if self.current_tick == 0 {
             let outcome = self.row_start_tick();
-            // Re-check exhaustion — `row_start_tick` updates `loop_count`.
+            // Re-check exhaustion — `row_start_tick` updates `loop_count`
+            // and may set `song_end_requested` when no next entry exists.
             if self.is_exhausted() {
                 return TickOutcome::SongEnd;
             }
             self.advance_tick_counter();
             outcome
         } else {
-            // Capture the tick number BEFORE advancing the counter — voices
-            // and observers need the value of the tick they're currently
-            // processing, not the next one.
             let tick_processed = self.current_tick;
-
-            // Apply the per-tick BPM slide if one's latched. Each
-            // non-row-start tick bumps the BPM by the stored delta,
-            // clamped to the tracker-legal range. When the next row
-            // arrives with no BpmSlide the latch is cleared in
-            // `apply_row_navigation_effects` — until then, the slide
-            // keeps ramping.
+            // Per-tick BPM slide. Each non-row-start tick bumps the
+            // BPM by the stored delta, clamped to the tracker-legal
+            // range. When the next row arrives the latch is reset in
+            // `row_start_tick` (a fresh `BpmSlide` may re-arm it).
             if self.bpm_slide_delta != 0 {
                 let new_bpm = (self.bpm as isize + self.bpm_slide_delta).clamp(32, 255) as usize;
                 self.bpm = new_bpm;
             }
-
             self.advance_tick_counter();
             TickOutcome::Tick {
                 tick: tick_processed,
@@ -324,277 +368,136 @@ impl<'a> Sequencer<'a> {
             || (self.max_loop_count > 0 && self.loop_count >= self.max_loop_count)
     }
 
-    /// Core of the row-start tick: apply pending jumps, consume the row's
-    /// navigation global effects, snapshot `(playing_pattern, playing_row)`,
-    /// update the loop counter, then advance `current_row` for next time.
+    /// Core of the row-start tick: pick the next entry to play
+    /// from `module.timeline_map`, publish its `(pattern, row,
+    /// tempo, bpm)`, and latch any `BpmSlide` on the row.
     fn row_start_tick(&mut self) -> TickOutcome {
-        let mut pattern_changed = false;
+        let prev_table_index = if self.started {
+            Some(self.current_table_index)
+        } else {
+            None
+        };
 
-        // 1. Apply any pending jump/break from the previous row.
-        //
-        // For `position_jump`: SBx pattern loops set this with
-        // `jump_dest = current_table_index` (within-pattern jump).
-        // Real cross-pattern moves — `Bxx`, end-of-pattern natural
-        // advance funnelled through here (see step 6 below) — set
-        // `jump_dest` to a different table index. We only flag the
-        // observer-visible `pattern_changed` when the table index
-        // actually moves; otherwise SBx loops would print one
-        // spurious "pattern_order[X] = Y" header per iteration even
-        // though we're staying on the same pattern.
-        if self.position_jump {
-            let table_changed = self.jump_dest != self.current_table_index;
-            self.current_table_index = self.jump_dest;
-            self.current_row = self.jump_row;
-            self.position_jump = false;
-            self.pattern_break = false;
-            self.jump_row = 0;
-            self.post_pattern_change();
-            pattern_changed = table_changed;
-        } else if self.pattern_break {
-            self.current_table_index += 1;
-            self.current_row = self.jump_row;
-            self.pattern_break = false;
-            self.jump_row = 0;
-            self.post_pattern_change();
-            pattern_changed = true;
-        }
-
-        // 2. Resolve pattern_idx, guarding against an out-of-range order entry
-        //    (historical behaviour: fall back to table index 0).
-        let pat_idx = match self
-            .module
-            .order_pattern_idx(self.current_song, self.current_table_index)
-        {
-            Some(p) => p,
+        let entry_idx = match self.advance_to_next_entry() {
+            Some(i) => i,
             None => {
-                self.current_table_index = 0;
-                self.module
-                    .order_pattern_idx(self.current_song, 0)
-                    .unwrap_or(0)
+                // TimelineMap exhausted and no wrap target.
+                self.song_end_requested = true;
+                return TickOutcome::SongEnd;
             }
         };
 
-        let current_row = self.current_row;
+        let entry = self.module.timeline_map.entries[entry_idx];
+        let pat_idx = entry.pattern_idx as usize;
+        let row = entry.row_idx as usize;
+        let new_order = entry.order_idx as usize;
 
-        // 3. Consume the row's navigation global effects (across all channels).
-        let in_a_loop = self.apply_row_navigation_effects(pat_idx, current_row);
+        self.timeline_idx = entry_idx;
+        self.tempo = (entry.speed_at_row as usize).max(1);
+        self.bpm = (entry.bpm_at_row as usize).max(1);
+        self.bpm_slide_delta = 0;
 
-        // 4. Loop-detection counter. Skip the increment when an E6y loop is
-        //    currently active on at least one channel (FT2: `in_a_loop`
-        //    suppresses max_loop_count interference).
-        if !in_a_loop {
+        // Loop-detection counter. Suppress the bump when we're inside
+        // a pattern-loop body (entry.loop_iter > 0): only canonical
+        // first-iteration visits feed `max_loop_count`.
+        if entry.loop_iter == 0 {
             if let Some(slot) = self
                 .row_loop_count
-                .get_mut(self.current_table_index)
-                .and_then(|order_slot| order_slot.get_mut(current_row))
+                .get_mut(new_order)
+                .and_then(|order_slot| order_slot.get_mut(row))
             {
                 self.loop_count = *slot;
                 *slot += 1;
             }
         }
 
-        // 5. Snapshot "playing" position so observers/voices see a stable
-        //    (pattern, row) while `current_row` is about to be advanced.
-        self.playing_pattern = pat_idx;
-        self.playing_row = current_row;
+        // Read `BpmSlide` from the Bpm/Slide AutomationLane.
+        // DAW migration Phase 3c.3: BpmSlide no longer sources
+        // from `cell.global_effects` — the lane built by
+        // `extract_bpm_slide_events` is the authoritative form.
+        // Other song-level / navigation effects are either pre-baked
+        // into the entry (`Bpm`, `Speed`), consumed by `Voices`
+        // (`Volume`, `VolumeSlide`, `MidiMacro`) or absorbed by the
+        // walker (`PatternBreak`, `PositionJump`, `PatternLoop`,
+        // `PatternDelay`).
+        self.latch_bpm_slide_from_lane(entry.tick);
 
-        // 6. Advance `current_row`, handle natural end-of-pattern.
-        //
-        // `current_row` is a `usize`, so the wrap-to-0 branch below cannot
-        // fire in practice (pattern lengths are bounded well below usize::MAX).
-        // A previous comment speculated about shrinking this field to `u8`
-        // and wanted the wrap to push us into the next pattern; if that ever
-        // happens, reintroduce the `== 0` guard in the condition below.
-        //
-        // When the row pointer falls off the pattern's last row we
-        // *defer* the actual advance: instead of bumping
-        // `current_table_index` here and flipping `pattern_changed`
-        // on the OUTGOING row, we synthesize a position_jump
-        // targeting `current_table_index + 1`. The next
-        // `row_start_tick` consumes that jump in step 1, where
-        // `pattern_changed` correctly fires on the FIRST row of the
-        // new pattern with `pat_idx` already pointing at the new
-        // pattern. This matches how `Bxx` and SBx are wired and
-        // keeps observers (e.g. DebugObserver) honest:
-        // `on_pattern_change` fires once, immediately before the
-        // first row of the destination, with both `new_table_index`
-        // and `new_pattern` describing the same destination.
-        self.current_row += 1;
-        let pattern_len = self.module.pattern_row_count(pat_idx);
-        if !self.position_jump && !self.pattern_break && self.current_row >= pattern_len {
-            self.position_jump = true;
-            self.jump_dest = self.current_table_index + 1;
-            // `jump_row` is intentionally left as-is: it might carry
-            // a row index leaked by the FT2 E60 quirk
-            // (`e60_leaks_to_next_pattern`), and the position_jump
-            // consumption code in step 1 will pick that up and reset
-            // `jump_row` to 0 afterwards.
-        }
+        self.playing_pattern = pat_idx;
+        self.playing_row = row;
+        self.current_table_index = new_order;
+        // +1-biased to match historical `current_row()`.
+        self.current_row = row + 1;
+
+        let pattern_changed = prev_table_index != Some(new_order);
 
         TickOutcome::RowStart {
             pattern: pat_idx,
-            row: current_row,
+            row,
             pattern_changed,
         }
     }
 
-    /// Iterate the row's cells and apply every navigation-side global effect:
-    /// `Speed` (tempo), `Bpm` / `BpmSlide`, `PatternBreak`, `PositionJump`,
-    /// `PatternLoop`, `PatternDelay`, and the MIDI-macro stub.
+    /// Choose the next entry index to play. Honours, in order:
     ///
-    /// Volume-side effects (`GlobalEffect::Volume`, `GlobalEffect::VolumeSlide`)
-    /// are handled by [`crate::voices::Voices`] — we leave them alone here.
-    ///
-    /// Returns `true` if at least one channel is currently inside an E6y
-    /// pattern-loop body (used to gate the max-loop-count increment).
-    fn apply_row_navigation_effects(&mut self, pat_idx: usize, row: usize) -> bool {
-        let num_channels = self.pattern_loop.len();
-        let mut in_a_loop = false;
-
-        // Reset the BPM-slide latch before processing the new row.
-        // A slide is only active on the row that carries it; the
-        // next row either re-latches a new delta or stays silent.
-        self.bpm_slide_delta = 0;
-
-        // Materialise the row through the DAW timeline layer.
-        let row_cells = self.module.row_at(self.current_song, pat_idx, row);
-
-        for ch_index in 0..num_channels {
-            // Defensive indexing: some malformed modules have short rows
-            // relative to their declared channel count.
-            let cell = match row_cells.get(ch_index) {
-                Some(c) => c,
-                None => continue,
-            };
-
-            // `pattern_slot.global_effects` is a Vec on TrackUnit; we clone
-            // it as the current implementation does (the vector is short,
-            // typically 0..2 entries) so we can mutate `self` freely.
-            for gfx in cell.global_effects.clone() {
-                match gfx {
-                    GlobalEffect::Bpm(bpm) => {
-                        self.bpm = bpm;
-                    }
-                    GlobalEffect::BpmSlide(delta) => {
-                        // IT Txy with x=0 is "slide BPM down by y", x=1
-                        // is "slide BPM up by y". The xmrs importer
-                        // normalises both into a single signed delta
-                        // (positive = up). The slide fires on every
-                        // non-row-start tick of the row; here we latch
-                        // the delta, and `apply_per_tick_effects`
-                        // applies it each tick.
-                        //
-                        // Note the latch is also reset just above the
-                        // `for ch_index` loop (at row-start), so a
-                        // slide on row N doesn't bleed into row N+1.
-                        self.bpm_slide_delta = delta;
-                    }
-                    GlobalEffect::MidiMacro(_m) => {
-                        // MIDI macros are per-channel-scoped despite
-                        // the `GlobalEffect` typing. `Voices` picks
-                        // them up in `apply_row_global_effects` with
-                        // the channel index in hand — see
-                        // `Channel::apply_midi_macro`. The sequencer
-                        // ignores them here.
-                    }
-                    GlobalEffect::PatternBreak(position) => {
-                        self.pattern_break = true;
-                        self.jump_row = position;
-                    }
-                    GlobalEffect::PatternDelay {
-                        quantity: q,
-                        tempo: t,
-                    } => self.extra_ticks = if t { q * self.tempo } else { q },
-                    GlobalEffect::PatternLoop(value) => {
-                        let slot = &mut self.pattern_loop[ch_index];
-                        if value != 0 {
-                            if value == slot.count {
-                                // Loop is over.
-                                slot.count = 0;
-                                if self.module.profile.quirks.pattern_loop_resumes {
-                                    // ST3 `s_patloop` (digcmd.c:1003):
-                                    // when the loop finishes, the next
-                                    // row becomes the new loop start.
-                                    slot.origin = self.current_row + 1;
-                                }
-                            } else {
-                                // Jump to the beginning of the loop.
-                                slot.count += 1;
-                                self.position_jump = true;
-                                self.jump_row = slot.origin;
-                                self.jump_dest = self.current_table_index;
-                            }
-                        } else {
-                            // Set loop start point (E60 / SB0).
-                            slot.origin = self.current_row;
-                            if self.module.profile.quirks.e60_leaks_to_next_pattern {
-                                // Replicate FT2 E60 bug: in FT2, E60 not
-                                // only sets the per-channel loop origin,
-                                // it ALSO leaks that row number into the
-                                // song's pBreakPos. When the pattern then
-                                // ends naturally, the next pattern starts
-                                // at pBreakPos instead of row 0.
-                                self.jump_row = slot.origin;
-                            }
-                        }
-                    }
-                    GlobalEffect::PositionJump(position) => {
-                        if position < self.module.song_length(self.current_song) {
-                            self.position_jump = true;
-                            self.jump_dest = position;
-                            self.jump_row = 0;
-                        }
-                    }
-                    GlobalEffect::Speed(speed) => {
-                        if speed == 0 {
-                            if self.module.profile.quirks.speed_zero_ends_song {
-                                // ProTracker `F00` / XM `F00`:
-                                // latch end-of-song. Leave
-                                // `self.tempo` untouched so the
-                                // *current* row finishes its
-                                // tick run at its previous
-                                // speed — `SongEnd` fires
-                                // before the next row's
-                                // `row_start_tick` would run.
-                                self.song_end_requested = true;
-                            }
-                            // else: `Axx` with xx=0 in S3M/IT
-                            // is documented as "ignored" (ST3
-                            // source: `if (param) speed =
-                            // param`). Leaving `self.tempo`
-                            // untouched is the correct
-                            // no-op — assigning `tempo = 0`
-                            // would freeze the row scheduler
-                            // forever (the previous behaviour
-                            // here, which was a real bug for
-                            // any S3M/IT that ever emitted
-                            // `A00`).
-                        } else {
-                            self.tempo = speed;
-                        }
-                    }
-                    GlobalEffect::Volume(_) | GlobalEffect::VolumeSlide { .. } => {
-                        // Volume-side effects belong to `Voices`, not here.
-                    }
-                }
-            }
-
-            if self.pattern_loop[ch_index].count > 0 {
-                in_a_loop = true;
+    /// 1. First-ever firing: pick the first entry of `current_song`.
+    /// 2. A pending `restart_row` from `goto`/`goto_tick`: reuse
+    ///    `self.timeline_idx` as-is.
+    /// 3. Linear advance: `timeline_idx + 1` if still within `current_song`.
+    /// 4. End-of-song wrap: the entry matching `module.song_loop_to`
+    ///    if set, otherwise the first entry of `current_song`.
+    /// 5. Nothing left (e.g. empty `timeline_map`): `None`.
+    fn advance_to_next_entry(&mut self) -> Option<usize> {
+        if !self.started {
+            self.started = true;
+            return self.first_entry_of_current_song();
+        }
+        if self.restart_row {
+            self.restart_row = false;
+            return Some(self.timeline_idx);
+        }
+        let entries = &self.module.timeline_map.entries;
+        let song_u16 = self.current_song as u16;
+        let next = self.timeline_idx + 1;
+        if let Some(e) = entries.get(next) {
+            if e.song == song_u16 {
+                return Some(next);
             }
         }
-
-        in_a_loop
+        // End-of-song wrap.
+        if let Some(loop_tick) = self.module.song_loop_to {
+            if let Some(idx) = entries
+                .iter()
+                .position(|e| e.song == song_u16 && e.tick == loop_tick && e.loop_iter == 0)
+            {
+                return Some(idx);
+            }
+        }
+        self.first_entry_of_current_song()
     }
 
-    fn post_pattern_change(&mut self) {
-        if self.current_table_index >= self.module.song_length(self.current_song) {
-            // End-of-song wrap. The default is order 0; modules
-            // that want a different restart anchor (Soundtracker /
-            // older FastTracker restart byte) express it as a
-            // `GlobalEffect::PositionJump` on the last played row,
-            // which fires earlier and overrides this fallback.
-            self.current_table_index = 0;
+    fn first_entry_of_current_song(&self) -> Option<usize> {
+        let song_u16 = self.current_song as u16;
+        self.module
+            .timeline_map
+            .entries
+            .iter()
+            .position(|e| e.song == song_u16)
+    }
+
+    /// Latch the per-tick BPM-slide delta from the `Bpm` `Slide`
+    /// [`AutomationLane`] at `abs_tick`. When the lane is unarmed
+    /// (or absent), the latch is cleared to 0 — already done by the
+    /// caller right above, so this method only writes when armed.
+    fn latch_bpm_slide_from_lane(&mut self, abs_tick: u32) {
+        for lane in self
+            .module
+            .lanes_for(xmrs::core::daw::automation::AutomationTarget::Bpm)
+        {
+            if let Some(state) = lane.slide_state_at(abs_tick) {
+                if state.armed {
+                    self.bpm_slide_delta = state.rate.raw() as isize;
+                }
+            }
         }
     }
 
@@ -602,15 +505,213 @@ impl<'a> Sequencer<'a> {
         self.current_tick += 1;
         // `F00` (speed = 0) halts row advance: tick() keeps firing so
         // sustained effects continue, but tick0() never runs again
-        // until the tempo is set to a non-zero value.
-        if self.tempo != 0 && self.current_tick >= self.tempo + self.extra_ticks {
+        // until the tempo is set to a non-zero value. In practice
+        // the walker already truncated the timeline_map past the
+        // `F00` row (`speed_zero_ends_song` quirk), so this branch
+        // is mostly defensive for synthetic modules.
+        if self.tempo != 0 && self.current_tick >= self.tempo {
             self.current_tick = 0;
-            self.extra_ticks = 0;
         }
     }
 }
 
-// Tests for this module are intentionally omitted from this initial split —
-// the `Sequencer` is now fully decoupled from audio, so unit tests can drive
-// `advance_tick()` against synthetic `Module` instances without instantiating
-// any channel/voice machinery. See `OBSERVERS.md` for the testing story.
+#[cfg(all(test, any(feature = "import_xm", feature = "import")))]
+mod phase_3c2_tests {
+    use super::*;
+
+    /// DAW migration Phase 3c.2 invariant: after each
+    /// `RowStart`, `timeline_idx` points at the entry whose
+    /// `(song, pattern, row)` matches the row just emitted.
+    #[test]
+    fn timeline_idx_tracks_navigation_on_note_xm() {
+        let data = include_bytes!("../../xmrs/examples/note.xm");
+        let module = Module::load_xm(data).expect("load");
+        let mut seq = Sequencer::new(&module, 0);
+        for _ in 0..256 {
+            match seq.advance_tick() {
+                TickOutcome::RowStart { pattern, row, .. } => {
+                    let entry = module
+                        .timeline_map
+                        .entries
+                        .get(seq.timeline_idx())
+                        .expect("timeline_idx points past entries vec");
+                    assert_eq!(entry.song as usize, seq.current_song());
+                    assert_eq!(
+                        entry.pattern_idx as usize, pattern,
+                        "timeline_idx pattern mismatch"
+                    );
+                    assert_eq!(entry.row_idx as usize, row, "timeline_idx row mismatch");
+                }
+                TickOutcome::Tick { .. } => {}
+                TickOutcome::SongEnd => break,
+            }
+        }
+    }
+
+    /// `goto_tick` resolves an absolute song tick to the matching
+    /// TimelineMap entry and jumps. Round trips between
+    /// `(table_index, row)` and `abs_tick`.
+    #[test]
+    fn goto_tick_lands_on_matching_entry() {
+        let data = include_bytes!("../../xmrs/examples/note.xm");
+        let module = Module::load_xm(data).expect("load");
+        if module.timeline_map.entries.len() < 3 {
+            return;
+        }
+        let target = module.timeline_map.entries[2];
+        let mut seq = Sequencer::new(&module, 0);
+        assert!(seq.goto_tick(target.tick), "goto_tick should succeed");
+        assert_eq!(seq.timeline_idx(), 2);
+        match seq.advance_tick() {
+            TickOutcome::RowStart { pattern, row, .. } => {
+                assert_eq!(pattern as u32, target.pattern_idx);
+                assert_eq!(row as u32, target.row_idx);
+            }
+            _ => panic!("expected RowStart after goto_tick"),
+        }
+    }
+
+    #[test]
+    fn goto_tick_rejects_invalid_tick() {
+        let data = include_bytes!("../../xmrs/examples/note.xm");
+        let module = Module::load_xm(data).expect("load");
+        let mut seq = Sequencer::new(&module, 0);
+        assert!(!seq.goto_tick(u32::MAX));
+    }
+
+    /// End-of-song wrap honours `song_loop_to`: a synthetic
+    /// 2-pattern module wraps to the matching entry instead of
+    /// blindly resetting to order 0.
+    #[test]
+    fn song_loop_to_drives_end_of_song_wrap() {
+        use xmrs::core::cell::Cell;
+        use xmrs::core::daw::clip::Clip;
+        use xmrs::core::daw::sorted_clips::SortedClips;
+        use xmrs::core::daw::timeline::{TimelineEntry, TimelineMap};
+        use xmrs::core::daw::track::Track;
+
+        let mut m = Module::default();
+        m.tracks.push(Track {
+            name: "t".into(),
+            instrument: 0,
+            rows: alloc::vec![Cell::default(); 4],
+            muted: false,
+        });
+        let clips = alloc::vec![
+            Clip {
+                track: 0,
+                song: 0,
+                target_channel: 0,
+                position_tick: 0,
+                speed_at_start: 6,
+                track_row_offset: 0,
+                source_start_row: 0,
+                end_tick: 24,
+            },
+            Clip {
+                track: 0,
+                song: 0,
+                target_channel: 0,
+                position_tick: 24,
+                speed_at_start: 6,
+                track_row_offset: 0,
+                source_start_row: 0,
+                end_tick: 48,
+            },
+        ];
+        m.clips = SortedClips::from_unsorted(clips);
+        let mut entries = alloc::vec::Vec::new();
+        for (order_idx, base_tick) in [(0u32, 0u32), (1, 24)] {
+            for row in 0..4u32 {
+                entries.push(TimelineEntry {
+                    song: 0,
+                    order_idx,
+                    pattern_idx: order_idx,
+                    row_idx: row,
+                    loop_iter: 0,
+                    tick: base_tick + row * 6,
+                    speed_at_row: 6,
+                    bpm_at_row: 125,
+                });
+            }
+        }
+        m.timeline_map = TimelineMap { entries };
+        m.song_loop_to = Some(24);
+
+        let mut seq = Sequencer::new(&m, 0);
+        let mut rows_visited: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+        for _ in 0..200 {
+            match seq.advance_tick() {
+                TickOutcome::RowStart { pattern, row, .. } => {
+                    rows_visited.push((pattern, row));
+                    if rows_visited.len() >= 12 {
+                        break;
+                    }
+                }
+                TickOutcome::Tick { .. } => {}
+                TickOutcome::SongEnd => break,
+            }
+        }
+        assert_eq!(rows_visited[0..4], [(0, 0), (0, 1), (0, 2), (0, 3)]);
+        assert_eq!(rows_visited[4..8], [(1, 0), (1, 1), (1, 2), (1, 3)]);
+        assert_eq!(
+            rows_visited[8],
+            (1, 0),
+            "song_loop_to should re-enter order 1"
+        );
+    }
+
+    /// Without `song_loop_to`, the end-of-song wrap falls back to
+    /// the first entry of the song (legacy "wrap to order 0").
+    #[test]
+    fn end_of_song_wraps_to_order_zero_by_default() {
+        use xmrs::core::cell::Cell;
+        use xmrs::core::daw::sorted_clips::SortedClips;
+        use xmrs::core::daw::timeline::{TimelineEntry, TimelineMap};
+        use xmrs::core::daw::track::Track;
+
+        let mut m = Module::default();
+        m.tracks.push(Track {
+            name: "t".into(),
+            instrument: 0,
+            rows: alloc::vec![Cell::default(); 2],
+            muted: false,
+        });
+        m.clips = SortedClips::from_unsorted(alloc::vec::Vec::new());
+        let mut entries = alloc::vec::Vec::new();
+        for row in 0..2u32 {
+            entries.push(TimelineEntry {
+                song: 0,
+                order_idx: 0,
+                pattern_idx: 0,
+                row_idx: row,
+                loop_iter: 0,
+                tick: row * 6,
+                speed_at_row: 6,
+                bpm_at_row: 125,
+            });
+        }
+        m.timeline_map = TimelineMap { entries };
+        // song_loop_to deliberately left None.
+
+        let mut seq = Sequencer::new(&m, 0);
+        let mut rows_visited: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        for _ in 0..200 {
+            match seq.advance_tick() {
+                TickOutcome::RowStart { row, .. } => {
+                    rows_visited.push(row);
+                    if rows_visited.len() >= 5 {
+                        break;
+                    }
+                }
+                TickOutcome::Tick { .. } => {}
+                TickOutcome::SongEnd => break,
+            }
+        }
+        assert_eq!(
+            rows_visited,
+            alloc::vec![0, 1, 0, 1, 0],
+            "no song_loop_to → wrap to first entry of song"
+        );
+    }
+}

@@ -6,8 +6,8 @@
 
 #![cfg(all(feature = "std", any(feature = "import_xm", feature = "import")))]
 
-use xmrs::daw::build_timeline::{Pattern, Row};
 use xmrs::prelude::*;
+use xmrs::tracker::import::build::{Pattern, Row};
 use xmrsplayer::xmrsplayer::XmrsPlayer;
 
 fn render_pcm(player: &mut XmrsPlayer, samples: usize) -> Vec<i16> {
@@ -35,7 +35,7 @@ fn note_xm_produces_audio() {
 #[cfg(feature = "import_sid")]
 #[test]
 fn sid_commando_produces_audio() {
-    let sid = xmrs::import::sid::sid_module::SidModule::get_sid_commando();
+    let sid = xmrs::tracker::import::sid::sid_module::SidModule::get_sid_commando();
     let modules = sid.to_modules(false);
     let module = &modules[0];
     let mut player = XmrsPlayer::new(module, 48000, 0);
@@ -44,9 +44,9 @@ fn sid_commando_produces_audio() {
     assert!(nonzero > 0, "SID playback should produce audio");
 }
 
-fn make_euclidian_module(humanize_prob: xmrs::fixed::fixed::Q15, advance_max: u8) -> Module {
-    use xmrs::daw::build_timeline::build_timeline_layer;
-    use xmrs::instr_ekn::InstrEkn;
+fn make_euclidian_module(humanize_prob: xmrs::core::fixed::fixed::Q15, advance_max: u8) -> Module {
+    use xmrs::core::instr_ekn::InstrEkn;
+    use xmrs::tracker::import::build::build_timeline_layer;
 
     let data: Vec<i8> = (0..64)
         .map(|i| if i < 32 { 127i8 } else { -128i8 })
@@ -92,7 +92,9 @@ fn make_euclidian_module(humanize_prob: xmrs::fixed::fixed::Q15, advance_max: u8
     // A 1-pattern song with Play(C4) on channel 0 at row 0 and row
     // 4 — two pulses of the same wrapper Euclidean. The second
     // pulse is the one the humanisation can advance.
-    let mut play_row: Row = (0..1).map(|_| TrackUnit::default()).collect();
+    let mut play_row: Row = (0..1)
+        .map(|_| xmrs::tracker::import::unit::TrackImportUnit::default())
+        .collect();
     play_row[0].note = CellNote::Play(Pitch::C4);
     play_row[0].instrument = Some(1);
     let pattern: Pattern = (0..8)
@@ -100,7 +102,7 @@ fn make_euclidian_module(humanize_prob: xmrs::fixed::fixed::Q15, advance_max: u8
             if r == 0 || r == 4 {
                 play_row.clone()
             } else {
-                vec![TrackUnit::default()]
+                vec![xmrs::tracker::import::unit::TrackImportUnit::default()]
             }
         })
         .collect();
@@ -124,7 +126,7 @@ fn hash_pcm(pcm: &[i16]) -> u64 {
 /// triggers the wrapped sample. Smoke test: non-silent audio.
 #[test]
 fn euclidian_indirection_plays_wrapped_instrument() {
-    let module = make_euclidian_module(xmrs::fixed::fixed::Q15::ZERO, 0);
+    let module = make_euclidian_module(xmrs::core::fixed::fixed::Q15::ZERO, 0);
     let mut player = XmrsPlayer::new(&module, 48000, 0);
     let pcm = render_pcm(&mut player, 2048);
     let nonzero = pcm.iter().filter(|s| **s != 0).count();
@@ -133,10 +135,12 @@ fn euclidian_indirection_plays_wrapped_instrument() {
 
 /// Build a Module with two single-channel patterns, each carrying
 /// one trigger of `pitch_a` / `pitch_b` at row 0. Order = `[0, 1]`.
-/// If `restart_byte > 0` the helper injects a `PositionJump(restart_byte)`
-/// on the last played row via the import pipeline.
+/// If `restart_byte > 0` the helper sets `module.song_loop_to` to
+/// the tick of `(restart_byte, row 0)` so the TimelineMap-driven
+/// sequencer (DAW migration Phase 3c.2) wraps to that order on
+/// end-of-song instead of falling back to order 0.
 fn make_two_pattern_module(pitch_a: Pitch, pitch_b: Pitch, restart_byte: usize) -> Module {
-    use xmrs::daw::build_timeline::{build_timeline_layer, inject_restart_position_jump};
+    use xmrs::tracker::import::build::{build_timeline_layer, set_song_loop_to_restart_byte};
 
     let data: Vec<i8> = (0..64)
         .map(|i| if i < 32 { 127i8 } else { -128i8 })
@@ -167,10 +171,10 @@ fn make_two_pattern_module(pitch_a: Pitch, pitch_b: Pitch, restart_byte: usize) 
         muted: false,
     });
 
-    let mut row_a: Row = vec![TrackUnit::default()];
+    let mut row_a: Row = vec![xmrs::tracker::import::unit::TrackImportUnit::default()];
     row_a[0].note = CellNote::Play(pitch_a);
     row_a[0].instrument = Some(0);
-    let mut row_b: Row = vec![TrackUnit::default()];
+    let mut row_b: Row = vec![xmrs::tracker::import::unit::TrackImportUnit::default()];
     row_b[0].note = CellNote::Play(pitch_b);
     row_b[0].instrument = Some(0);
 
@@ -179,7 +183,7 @@ fn make_two_pattern_module(pitch_a: Pitch, pitch_b: Pitch, restart_byte: usize) 
             if r == 0 {
                 row_a.clone()
             } else {
-                vec![TrackUnit::default()]
+                vec![xmrs::tracker::import::unit::TrackImportUnit::default()]
             }
         })
         .collect();
@@ -188,23 +192,22 @@ fn make_two_pattern_module(pitch_a: Pitch, pitch_b: Pitch, restart_byte: usize) 
             if r == 0 {
                 row_b.clone()
             } else {
-                vec![TrackUnit::default()]
+                vec![xmrs::tracker::import::unit::TrackImportUnit::default()]
             }
         })
         .collect();
 
-    let mut pattern_order = vec![vec![0, 1]];
-    let mut patterns = vec![pat_a, pat_b];
-    inject_restart_position_jump(&mut pattern_order[0], &mut patterns, restart_byte);
-
+    let pattern_order = vec![vec![0, 1]];
+    let patterns = vec![pat_a, pat_b];
     build_timeline_layer(&mut module, &pattern_order, &patterns);
+    set_song_loop_to_restart_byte(&mut module, 0, restart_byte);
     module
 }
 
 /// Regression guard for the historical "restart byte" (Soundtracker
 /// MOD, FastTracker XM). Pre-3b the sequencer wrapped to
 /// `Module.restart_position` at end-of-song; post-3b the importer
-/// realises it as a `GlobalEffect::PositionJump` on the last played
+/// realises it as a `NavigationEffect::PositionJump` on the last played
 /// row. This test plays a synthetic two-pattern module past the
 /// natural end-of-song and verifies that:
 ///
@@ -280,11 +283,11 @@ fn euclidean_auto_conversion_is_cycle_exact() {
     sample_instr.keyboard.sample_for_pitch = [Some(0); 120];
 
     fn make_module(sample_instr: InstrDefault, convert: bool) -> Module {
-        use xmrs::daw::build_timeline::{
+        use xmrs::core::daw::euclidean::auto_convert_strict_euclidean_tracks;
+        use xmrs::core::daw::sorted_clips::SortedClips;
+        use xmrs::tracker::import::build::{
             build_timeline_map, dedupe_tracks_by_content, extract_tracks_and_clips,
         };
-        use xmrs::daw::euclidean::auto_convert_strict_euclidean_tracks;
-        use xmrs::daw::sorted_clips::SortedClips;
 
         let mut m = Module::default();
         m.instrument.push(Instrument {
@@ -294,7 +297,9 @@ fn euclidean_auto_conversion_is_cycle_exact() {
         });
         // Pattern of 8 rows, Play(C4) at rows 0, 3, 6 — canonical
         // Bjorklund(3, 8). Pattern length = 8 = K.
-        let mut play_row: Row = (0..1).map(|_| TrackUnit::default()).collect();
+        let mut play_row: Row = (0..1)
+            .map(|_| xmrs::tracker::import::unit::TrackImportUnit::default())
+            .collect();
         play_row[0].note = CellNote::Play(Pitch::C4);
         play_row[0].instrument = Some(0);
         let pattern: Pattern = (0..8)
@@ -302,7 +307,7 @@ fn euclidean_auto_conversion_is_cycle_exact() {
                 if r == 0 || r == 3 || r == 6 {
                     play_row.clone()
                 } else {
-                    vec![TrackUnit::default()]
+                    vec![xmrs::tracker::import::unit::TrackImportUnit::default()]
                 }
             })
             .collect();
@@ -363,7 +368,7 @@ fn euclidean_auto_conversion_is_cycle_exact() {
 /// `HumanizeMode::Disabled`. Proves humanisation actually fires.
 #[test]
 fn humanise_deterministic_changes_pcm() {
-    use xmrs::fixed::fixed::Q15;
+    use xmrs::core::fixed::fixed::Q15;
     use xmrsplayer::humanize::HumanizeMode;
     // Probability ONE so the roll always hits; advance_max_ticks = 3
     // (within speed=6 default → safe to fire at tick 3-5).
@@ -406,7 +411,7 @@ fn humanise_deterministic_changes_pcm() {
 /// player must obey its mode-side gate.
 #[test]
 fn humanise_disabled_is_cycle_exact() {
-    use xmrs::fixed::fixed::Q15;
+    use xmrs::core::fixed::fixed::Q15;
     let mod_zero = make_euclidian_module(Q15::ZERO, 0);
     let mod_loaded = make_euclidian_module(Q15::HALF, 4);
     let mut p_zero = XmrsPlayer::new(&mod_zero, 48000, 0);
@@ -428,3 +433,126 @@ fn humanise_disabled_is_cycle_exact() {
         "HumanizeMode::Disabled must ignore humanize_* params"
     );
 }
+
+// =====================================================================
+// PCM-byte-perfect reference tests
+// =====================================================================
+//
+// DAW migration Phase 3a establishes the "byte-perfect PCM"
+// safety net before any continuous-effect extraction work begins.
+// Each test renders a fixed number of samples from a bundled
+// fixture, then compares the result byte-for-byte against a stored
+// `.pcm` file in `tests/fixtures_pcm/`.
+//
+// **Regenerating fixtures.** When intentional renderer changes
+// shift the canonical output, the fixtures need to be re-baked.
+// Run the test suite with `XM_PCM_REGEN=1` to write the current
+// renderer output as the new reference:
+//
+// ```sh
+// XM_PCM_REGEN=1 cargo test --test cycle_exact_pcm -- pcm_byte_perfect
+// ```
+//
+// Without the env var, missing-fixture and mismatched-fixture
+// cases both fail loudly so an accidental regression is caught.
+
+const PCM_FIXTURE_DIR: &str = "tests/fixtures_pcm";
+
+/// Serialise a `Vec<i16>` of stereo-interleaved samples as raw
+/// little-endian bytes — the on-disk format we compare against.
+fn pcm_to_le_bytes(pcm: &[i16]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(pcm.len() * 2);
+    for s in pcm {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+/// Either compare the rendered PCM byte-for-byte against the stored
+/// fixture (default) or write a fresh fixture and exit early
+/// (`XM_PCM_REGEN=1`). Surfaces the cargo-relative fixture path in
+/// every error message so the developer can locate the file
+/// immediately.
+fn assert_pcm_byte_perfect(fixture_name: &str, pcm: &[i16]) {
+    use std::fs;
+    use std::path::PathBuf;
+
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push(PCM_FIXTURE_DIR);
+    path.push(format!("{}.pcm", fixture_name));
+
+    let actual = pcm_to_le_bytes(pcm);
+
+    if std::env::var("XM_PCM_REGEN").is_ok() {
+        fs::create_dir_all(path.parent().unwrap()).expect("create_dir_all fixtures_pcm");
+        fs::write(&path, &actual).expect("write fixture");
+        // Don't assert — the test passes after a regen by design.
+        return;
+    }
+
+    let expected = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) => panic!(
+            "missing PCM fixture {} ({}). Run with `XM_PCM_REGEN=1` to bake \
+             a fresh reference.",
+            path.display(),
+            e
+        ),
+    };
+
+    if expected != actual {
+        panic!(
+            "PCM byte-perfect mismatch for {}: stored {} bytes, rendered {} bytes. \
+             If the renderer change is intentional, regenerate with \
+             `XM_PCM_REGEN=1 cargo test --test cycle_exact_pcm`. Path: {}",
+            fixture_name,
+            expected.len(),
+            actual.len(),
+            path.display(),
+        );
+    }
+}
+
+/// `note.xm` is the smoke-test reference fixture bundled with
+/// `xmrs`. The first second of audio at 48 kHz makes a stable
+/// signature for the byte-perfect comparison (the song's intro is
+/// well under one second, so this captures both note triggers and
+/// some sustained tail).
+#[test]
+fn pcm_byte_perfect_note_xm() {
+    let data = include_bytes!("../../xmrs/examples/note.xm");
+    let module = Module::load_xm(data).expect("load note.xm");
+    let mut player = XmrsPlayer::new(&module, 48000, 0);
+    // 1 second of stereo PCM @ 48 kHz.
+    let pcm = render_pcm(&mut player, 48_000);
+    assert_pcm_byte_perfect("note_xm", &pcm);
+}
+
+/// The Euclidean module (3-events / 8-step Bjorklund on a
+/// square-wave sample) — pure-synthetic, deterministic. Render
+/// length matches the canonical pulse spacing so both the converted
+/// and the raw paths come through in the captured second.
+#[test]
+fn pcm_byte_perfect_euclidean() {
+    let module = make_euclidian_module(xmrs::core::fixed::fixed::Q15::ZERO, 0);
+    let mut player = XmrsPlayer::new(&module, 48000, 0);
+    let pcm = render_pcm(&mut player, 48_000);
+    assert_pcm_byte_perfect("euclidean_3_8", &pcm);
+}
+
+#[cfg(feature = "import_sid")]
+#[test]
+fn pcm_byte_perfect_sid_commando() {
+    let sid = xmrs::tracker::import::sid::sid_module::SidModule::get_sid_commando();
+    let modules = sid.to_modules(false);
+    let module = &modules[0];
+    let mut player = XmrsPlayer::new(module, 48000, 0);
+    let pcm = render_pcm(&mut player, 48_000);
+    assert_pcm_byte_perfect("sid_commando", &pcm);
+}
+
+// =====================================================================
+// Lane ↔ cell validators were removed alongside the migrated
+// `TrackEffect` variants in DAW migration Phase 3c.3 — there is
+// no cell-side source of truth left to dual-validate against.
+// =====================================================================

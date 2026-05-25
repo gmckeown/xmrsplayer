@@ -505,7 +505,7 @@ mod tests {
     use crate::state_instr_default::StateInstrDefault;
     use alloc::boxed::Box;
     use alloc::vec::Vec;
-    use xmrs::fixed::units::{ChannelVolume, EnvValue, Panning, Volume};
+    use xmrs::core::fixed::units::{ChannelVolume, EnvValue, Panning, Volume};
     use xmrs::prelude::*;
 
     /// Minimal helper to build a fake `Voice`. The internals don't

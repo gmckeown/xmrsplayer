@@ -12,7 +12,7 @@
 //! architectural — there is no `dyn` dispatch involved on the audio path.
 //!
 //! `Voices` also handles the two volume-side global effects
-//! (`GlobalEffect::Volume`, `GlobalEffect::VolumeSlide`) — the sequencer
+//! (`SongLevelEffect::Volume`, `SongLevelEffect::VolumeSlide`) — the sequencer
 //! leaves those alone because they belong to the mixer, not to navigation.
 
 use crate::channel::Channel;
@@ -20,8 +20,8 @@ use crate::midi_observer::MidiEvent;
 use crate::triggerkeep::TRIGGER_KEEP_PERIOD;
 use crate::voice_pool::VoicePool;
 use alloc::{vec, vec::Vec};
-use xmrs::fixed::fixed::Q15;
-use xmrs::fixed::units::{Amplification, SampleRate, Volume};
+use xmrs::core::fixed::fixed::Q15;
+use xmrs::core::fixed::units::{Amplification, SampleRate, Volume};
 use xmrs::prelude::*;
 
 /// Default voice pool capacity. Mirrors schismtracker's
@@ -41,6 +41,12 @@ pub const DEFAULT_VOICE_POOL_CAPACITY: usize = 256;
 pub struct Voices<'a> {
     sample_rate: SampleRate,
 
+    /// Module reference, kept so the global-volume / global-volume-
+    /// slide lane lookups in [`Self::process_row`] can introspect
+    /// `module.automation` without the facade having to thread it
+    /// through every call. DAW migration Phase 3c.3.
+    module: &'a Module,
+
     channel: Vec<Channel<'a>>,
 
     /// Pool of voices, both live and NNA-detached. Channels
@@ -52,8 +58,8 @@ pub struct Voices<'a> {
     pool: VoicePool<'a>,
 
     /// Global volume (0.0 ..= 1.0) Q1.15. Mutated by
-    /// `GlobalEffect::Volume` and by accumulating
-    /// `GlobalEffect::VolumeSlide`. Applied as a final gain in
+    /// `SongLevelEffect::Volume` and by accumulating
+    /// `SongLevelEffect::VolumeSlide`. Applied as a final gain in
     /// [`Voices::mix`].
     global_volume: Volume,
     /// Extra amplification applied after `global_volume` —
@@ -63,7 +69,7 @@ pub struct Voices<'a> {
     amplification: Amplification,
 
     /// Non-fine volume-slide speed latched on the last row that carried a
-    /// `GlobalEffect::VolumeSlide { fine: false }`. Applied once per tick as
+    /// `SongLevelEffect::VolumeSlide { fine: false }`. Applied once per tick as
     /// long as `row_has_global_volume_slide` stays true.
     volume_slide_speed: Q15,
     /// Whether the last latched slide was a fine one (fires once at tick 0
@@ -76,10 +82,11 @@ pub struct Voices<'a> {
     /// fine/non-fine distinction is handled through `volume_slide_fine`.
     row_has_global_volume_slide: bool,
 
-    /// MIDI events emitted by macros on the current row. Filled during
-    /// `apply_row_global_effects` and drained by the facade, which
-    /// dispatches to any registered [`crate::midi_observer::MidiObserver`]. The buffer is
-    /// re-used across rows — cleared on entry to each `process_row`.
+    /// MIDI events emitted by macros on the current row. Filled by
+    /// `apply_row_per_channel_effects` and drained by the facade,
+    /// which dispatches to any registered
+    /// [`crate::midi_observer::MidiObserver`]. The buffer is re-used
+    /// across rows — cleared on entry to each `process_row`.
     pending_midi_events: Vec<(usize, MidiEvent)>,
 
     /// Humanisation mode for `InstrumentType::Euclidean` pulses.
@@ -132,6 +139,7 @@ impl<'a> Voices<'a> {
         }
         Self {
             sample_rate: sr,
+            module,
             channel: channels,
             pool: VoicePool::new(voice_pool_capacity),
             global_volume: Volume::FULL,
@@ -169,10 +177,14 @@ impl<'a> Voices<'a> {
     /// Trigger any fire-intent on each channel whose scheduled
     /// tick matches `current_tick`. Called per-tick by the player
     /// (Euclidean humanisation early-fire path).
-    pub(crate) fn fire_humanize_intents_at(&mut self, current_tick: u8) {
+    ///
+    /// `abs_tick` / `song` are threaded so the channel can resolve
+    /// its current Clip → Track and run the Phase 3c.1 dual-read
+    /// lane validation alongside the legacy cell-driven path.
+    pub(crate) fn fire_humanize_intents_at(&mut self, current_tick: u8, abs_tick: u32, song: u16) {
         for ch in &mut self.channel {
-            if let Some(cell) = ch.humanize_ekn.take_fire_intent_at(current_tick) {
-                ch.tick0(&cell, &mut self.pool);
+            if let Some((cell, track_instr)) = ch.humanize_ekn.take_fire_intent_at(current_tick) {
+                ch.tick0(&cell, track_instr, abs_tick, song, &mut self.pool);
             }
         }
     }
@@ -272,14 +284,22 @@ impl<'a> Voices<'a> {
     /// Forward the cells of a newly loaded row to each channel, applying the
     /// volume-side global effects as we go.
     ///
-    /// Cell count is expected to match `self.channel.len()` — any extra
-    /// cells are ignored, any missing cells are skipped (defensive against
-    /// malformed modules).
-    pub(crate) fn process_row(&mut self, cells: &[TrackUnit]) {
-        // First, cache whether this row carries any global volume slide
-        // (fine or not). Used by `process_tick` to decide whether to keep
-        // sliding on subsequent ticks.
-        self.row_has_global_volume_slide = cells.iter().any(|cell| cell.has_global_volume_slide());
+    /// `abs_tick` is the playback's absolute song tick at row-start; `song`
+    /// is the current sub-song index. Channels use them to resolve their
+    /// active Clip + Track (and thence the extracted AutomationLanes) for
+    /// DAW migration Phase 3c.1's dual-read validation. The audio path
+    /// remains cell-driven in this phase — lanes are queried only for
+    /// validation under `cfg(debug_assertions)`.
+    pub(crate) fn process_row(
+        &mut self,
+        cells: &[(Cell, Option<usize>)],
+        abs_tick: u32,
+        song: u16,
+    ) {
+        // Song-level global volume / volume slide come from the
+        // `GlobalVolume` AutomationLanes (DAW migration Phase 3c.3).
+        self.apply_global_volume_from_lane(abs_tick);
+        self.apply_global_volume_slide_from_lane(abs_tick);
 
         // MIDI event buffer is per-row — the facade drains it after
         // processing. Clearing here so leftovers from a previous row
@@ -287,64 +307,81 @@ impl<'a> Voices<'a> {
         self.pending_midi_events.clear();
 
         let n = self.channel.len().min(cells.len());
-        for (i, cell) in cells.iter().enumerate().take(n) {
+        for (i, (cell, track_instr)) in cells.iter().enumerate().take(n) {
             // Euclidean humanisation: if a fire-early already
             // triggered this pulse, suppress the natural row-start
             // trigger. Global effects on the row still apply.
             if !self.channel[i].humanize_ekn.take_suppress() {
-                self.channel[i].tick0(cell, &mut self.pool);
+                self.channel[i].tick0(cell, *track_instr, abs_tick, song, &mut self.pool);
             }
-            self.apply_row_global_effects(i, cell);
+            self.apply_row_per_channel_effects(i, cell);
         }
     }
 
-    /// Consume the channel-routed entries of `cell.global_effects` for
-    /// a single channel. Covers:
-    /// * `Volume` / `VolumeSlide` — mix-level gain control
-    /// * `MidiMacro` — filter automation (per-channel, despite the
-    ///   `GlobalEffect` typing — see `Channel::apply_midi_macro`)
-    ///
-    /// The navigation-side arms (`Bpm`, `BpmSlide`, `PatternBreak`,
-    /// `PatternLoop`, `PatternDelay`) are owned by the sequencer and
-    /// skipped here.
-    fn apply_row_global_effects(&mut self, ch_index: usize, cell: &TrackUnit) {
-        // Iterate by reference. Pre-fix this was `for gfx in
-        // cell.global_effects.clone()` — a wholesale `Vec<GlobalEffect>`
-        // clone on every channel of every row, even though the only
-        // arm that genuinely needs an owned value is `MidiMacro` (it
-        // moves `macro_type` into `apply_midi_macro`). The other arms
-        // (`Volume`, `VolumeSlide`, navigation arms) only read scalar
-        // fields. Cloning is now confined to the MidiMacro path,
-        // which is rare in practice — most cells have no global
-        // effects at all.
-        for gfx in &cell.global_effects {
-            match gfx {
-                GlobalEffect::Volume(volume) => {
-                    // Pure Q-format: `Voices.global_volume` is `Volume`.
-                    self.global_volume = *volume;
+    /// Per-channel cell effects that need to fire at row-start.
+    /// Currently only `TrackEffect::MidiMacro` — the macro byte stream
+    /// substitutes the channel's note / volume / pan / instrument
+    /// fields and may write through to the filter envelope or MIDI
+    /// output. Relocated from `TrackImportUnit::midi_macros` by Phase 3b's
+    /// mirror pass and consumed cell-side since Phase 3c.3.
+    fn apply_row_per_channel_effects(&mut self, ch_index: usize, cell: &Cell) {
+        for fx in &cell.effects {
+            if let TrackEffect::MidiMacro(macro_type) = fx {
+                if let Some(ch) = self.channel.get_mut(ch_index) {
+                    ch.apply_midi_macro(
+                        macro_type.clone(),
+                        ch_index,
+                        &mut self.pending_midi_events,
+                        &mut self.pool,
+                    );
                 }
-                GlobalEffect::VolumeSlide { speed: s, fine: f } => {
-                    if *f {
-                        // Fine slide: apply once at tick 0.
-                        self.global_volume = self.global_volume.with_tremolo(*s);
-                    }
-                    // Latch the speed so non-fine slides apply on subsequent ticks.
-                    self.volume_slide_speed = *s;
-                    self.volume_slide_fine = *f;
-                }
-                GlobalEffect::MidiMacro(macro_type) => {
-                    if let Some(ch) = self.channel.get_mut(ch_index) {
-                        ch.apply_midi_macro(
-                            macro_type.clone(),
-                            ch_index,
-                            &mut self.pending_midi_events,
-                            &mut self.pool,
-                        );
-                    }
-                }
-                // Everything else is owned by the sequencer.
-                _ => {}
             }
+        }
+    }
+
+    /// Look up the song-level `GlobalVolume` `Points` lane and apply
+    /// the latest set whose tick falls *exactly* on `abs_tick`. A
+    /// `value_at` query would re-apply the latest stored point every
+    /// row, which would clobber any in-flight volume slide; the
+    /// strict-equality check matches the legacy "set only on the row
+    /// that carries the Volume effect" semantic.
+    fn apply_global_volume_from_lane(&mut self, abs_tick: u32) {
+        use xmrs::core::daw::automation::{AutomationTarget, AutomationValue, LaneEvent};
+        for lane in self.module.lanes_for(AutomationTarget::GlobalVolume) {
+            for ev in lane.events_in(abs_tick, abs_tick.saturating_add(1)) {
+                if let LaneEvent::Point(p) = ev {
+                    if let AutomationValue::Normalized(q) = p.value {
+                        self.global_volume = Volume::from_q15(q);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Look up the song-level `GlobalVolume` `Slide` lane and latch
+    /// the per-tick slide rate. Mirrors the sequencer's
+    /// `latch_bpm_slide_from_lane`: when armed, write `speed` / `fine`
+    /// and, for fine slides, apply once at tick 0; when unarmed,
+    /// clear the latch so `process_tick` stops sliding.
+    fn apply_global_volume_slide_from_lane(&mut self, abs_tick: u32) {
+        use xmrs::core::daw::automation::AutomationTarget;
+        let mut armed = false;
+        for lane in self.module.lanes_for(AutomationTarget::GlobalVolume) {
+            if let Some(state) = lane.slide_state_at(abs_tick) {
+                if state.armed {
+                    if state.fine {
+                        // Fine slide fires once at tick 0.
+                        self.global_volume = self.global_volume.with_tremolo(state.rate);
+                    }
+                    self.volume_slide_speed = state.rate;
+                    self.volume_slide_fine = state.fine;
+                    armed = true;
+                }
+            }
+        }
+        self.row_has_global_volume_slide = armed;
+        if !armed {
+            self.volume_slide_speed = Q15::ZERO;
         }
     }
 

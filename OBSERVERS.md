@@ -46,23 +46,30 @@ pub trait PlayerObserver {
 pub struct RowContext<'a> {
     pub module: &'a Module,
     pub song: usize,
-    pub pattern: usize,      // index into module.pattern
+    pub pattern: usize,      // pattern index as resolved by Module::row_at
     pub row: usize,
-    pub cells: &'a [TrackUnit],   // one per channel, zero-copy borrow
+    pub cells: &'a [Cell],   // one per channel, zero-copy borrow
     pub tempo: usize,
     pub bpm: usize,
 }
 ```
 
-`cells` is borrowed directly from the module — no allocation, no clone — so
-you can pick out the note/instrument/volume/effects of any channel at zero
-cost:
+`cells` is materialised through `Module::row_at` (which walks the DAW
+timeline layer) and borrowed for the duration of the callback. Each
+[`Cell`] exposes a typed `event: CellEvent`
+(`NoteOn { pitch, velocity }`, `NoteOnGhost { pitch, velocity }`,
+`InstrReset`, `NoteOff { retrig }`, `NoteCut`, `NoteFade`, `None`)
+plus a `Vec<TrackEffect>` of discrete per-trigger effects. The
+**instrument** that a row plays comes from the active `Track`
+(`Track::instrument`) — it is no longer a per-cell field. The
+audio-side dispatch threads the track-level instrument separately
+(see `Module::row_at`, which returns `Vec<(Cell, Option<usize>)>`
+on the audio path).
 
 ```rust
 for (ch, cell) in ctx.cells.iter().enumerate() {
-    if cell.note.is_valid() {
-        let instr = cell.instrument;
-        println!("ch{ch}: note={:?} instr={:?}", cell.note, instr);
+    if let Some(pitch) = cell.event.pitch() {
+        println!("ch{ch}: pitch={:?} velocity={:?}", pitch, cell.event.velocity());
     }
 }
 ```
@@ -154,7 +161,7 @@ callback thread (cpal / rodio). That has three consequences:
            let snap = RowSnapshot {
                pattern: ctx.pattern,
                row: ctx.row,
-               notes: ctx.cells.iter().map(|c| c.note).collect(),
+               events: ctx.cells.iter().map(|c| c.event).collect(),
            };
            let _ = self.tx.send(snap);  // non-blocking send
        }
@@ -219,10 +226,10 @@ struct NoteHighlighter;
 impl PlayerObserver for NoteHighlighter {
     fn on_row(&mut self, ctx: &RowContext<'_>) {
         for (ch, cell) in ctx.cells.iter().enumerate() {
-            if cell.note.is_valid() {
-                // Send `(ch, cell.note, cell.instrument)` to your UI somehow.
+            if let Some(pitch) = cell.event.pitch() {
+                // Send `(ch, pitch)` to your UI somehow.
                 // For the sake of the example we just print.
-                println!("row {}: ch{ch} -> {:?}", ctx.row, cell.note);
+                println!("row {}: ch{ch} -> {:?}", ctx.row, pitch);
             }
         }
     }
@@ -262,10 +269,12 @@ invariant to guard.
 The `Sequencer` is now independently driveable: you can feed it a
 hand-built `Module` and check that `advance_tick()` emits the expected
 `TickOutcome`s, without instantiating `Voices` and without producing any
-audio. This makes the historically tricky navigation logic (FT2 `E60` leak,
-ST3 pattern-loop resume, `Bxx` + `Dxx` interaction, `EEy` combined with
-`Fxx`) unit-testable with pure data. A test module is a good place to
-start growing the regression suite.
+audio. Since DAW migration Phase 3c.2 the sequencer is fully
+TimelineMap-driven — navigation effects (`Bxx` / `Dxx` / `E6y` / `EEy`)
+are absorbed at import time and the runtime just walks
+`module.timeline_map.entries` linearly, honouring `module.song_loop_to`
+for the end-of-song wrap. A test module is a good place to start
+growing the regression suite.
 
 ## Audio observers
 

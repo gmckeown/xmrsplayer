@@ -14,8 +14,8 @@
 //! cargo run --release --features=demo --example inspect_mod -- path/to/module.s3m
 //! ```
 
-use xmrs::instrument::InstrumentType;
-use xmrs::module::Module;
+use xmrs::core::instrument::InstrumentType;
+use xmrs::core::module::Module;
 
 fn main() {
     let path = std::env::args()

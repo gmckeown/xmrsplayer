@@ -25,11 +25,11 @@
 //! `i64`, narrowed back to Q15.16 with `>> 28`.
 //!
 //! Cutoff and resonance use compile-time-evaluated 128-entry
-//! LUTs computed via `xmrs::fixed::tables::pow2_frac_q16_16` —
+//! LUTs computed via `xmrs::core::fixed::tables::pow2_frac_q16_16` —
 //! no `pow` / `log` / `exp` runs at audio rate (or anywhere).
 
-use xmrs::fixed::tables::pow2_frac_q16_16;
-use xmrs::fixed::units::Amp;
+use xmrs::core::fixed::tables::pow2_frac_q16_16;
+use xmrs::core::fixed::units::Amp;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FilterMode {
@@ -205,7 +205,7 @@ impl StateFilter {
     /// Recompute biquad coefficients from `cutoff_reg` /
     /// `resonance_reg`. Pure integer arithmetic — uses the
     /// compile-time `CUTOFF_FACTOR_Q16_16` / `TWO_Q_Q16_16`
-    /// LUTs and the runtime `xmrs::fixed::tables::sine` LUT for
+    /// LUTs and the runtime `xmrs::core::fixed::tables::sine` LUT for
     /// trig. No `pow` / `log` / `exp` ever invoked.
     fn recompute_coefficients(&mut self) {
         // Cutoff in Q16.16 Hz: `110 × cutoff_factor`.
@@ -227,13 +227,15 @@ impl StateFilter {
         // The result fits in u16 by construction (fc < rate/2 →
         // phase < 32768 < 65536).
         let phase_u32: u64 = fc_q16_16 / self.rate_hz as u64;
-        let phase = xmrs::fixed::units::Phase::from_raw(phase_u32 as u16);
+        let phase = xmrs::core::fixed::units::Phase::from_raw(phase_u32 as u16);
 
         // sin(omega) and cos(omega) as Q1.15. `cos = sin(· + π/2)`
         // is a quarter-cycle phase shift.
-        let sin_q15 = xmrs::fixed::tables::sine(phase).raw() as i32;
-        let cos_q15 = xmrs::fixed::tables::sine(phase.shifted(xmrs::fixed::units::Phase::QUARTER))
-            .raw() as i32;
+        let sin_q15 = xmrs::core::fixed::tables::sine(phase).raw() as i32;
+        let cos_q15 = xmrs::core::fixed::tables::sine(
+            phase.shifted(xmrs::core::fixed::units::Phase::QUARTER),
+        )
+        .raw() as i32;
 
         // alpha = sin / (2Q). Q-format:
         //   alpha_q15 = (sin_q15 × 65536) / two_q_q16_16

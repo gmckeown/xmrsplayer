@@ -6,7 +6,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use xmrs::duration::ModuleDuration;
+use xmrs::core::duration::ModuleDuration;
 use xmrs::prelude::*;
 use xmrsplayer::prelude::*;
 
@@ -101,7 +101,7 @@ impl PlayerObserver for ExitOnSongEnd {
 }
 
 #[cfg(feature = "import_sid")]
-use xmrs::import::sid::sid_module::SidModule;
+use xmrs::tracker::import::sid::sid_module::SidModule;
 
 #[derive(Parser)]
 struct Cli {
@@ -313,7 +313,7 @@ fn play_music(
         ));
         if debug {
             tprintln!("Debug on");
-            tprintln!("Module format: {:?}", module.profile.format);
+            tprintln!("Module format: {:?}", module.origin);
             // In 0.10+ the inline `debug(bool)` toggle has been replaced by a
             // standalone observer — register it explicitly.
             player_lock.add_observer(Box::new(DebugObserver::new()));

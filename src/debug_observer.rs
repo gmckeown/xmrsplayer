@@ -41,7 +41,7 @@ impl PlayerObserver for DebugObserver {
     fn on_row(&mut self, ctx: &RowContext<'_>) {
         print!("{:03X} ", ctx.row);
         for cell in ctx.cells {
-            print!("{:?} ", cell.note);
+            print!("{:?} ", cell.event);
         }
         println!();
     }

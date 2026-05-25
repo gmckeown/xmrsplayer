@@ -11,7 +11,7 @@ It does not aim for bit-exact compatibility with every tracker ever written — 
 | Amiga Module (MOD)| Works                                                                  |
 | FastTracker XM    | Works                                                                  |
 | ScreamTracker S3M | Works                                                                  |
-| Impulse Tracker IT| WIP — loader done, playback in progress                         |
+| Impulse Tracker IT| WIP — loader mostly done, playback in progress                         |
 | SID (C64)         | Experimental — reverse-engineered from Rob Hubbard's 6510 player       |
 
 A word on **SID**: tracks and effects can already be extracted from several of Hubbard's hits and played back through the generic module engine. One thing is still needed to go further — working *per-track* to reconstruct patterns (some tracks change length, which defeats a naive pattern builder), The module engine is already generic enough; the rest is a matter of time (and motivated contributors — Rust speakers welcome!).
@@ -72,30 +72,41 @@ above it only when you have evidence the song needs it.
 
 The player also exposes a subscription API — hook into row/tick changes with `PlayerObserver`, into the produced audio stream with `MixObserver` / `ChannelsObserver` (VU-meters, WAV recorders, visualisers), or into MIDI events emitted by IT `Zxx` macros with `MidiObserver` (bridge to external synths or hardware). See [OBSERVERS.md](OBSERVERS.md).
 
-### The DAW timeline layer (transparent to the player)
+### The DAW timeline layer
 
-Since the DAW migration, every imported `Module` carries a second
-representation of the song alongside the legacy `Pattern → Row →
-TrackUnit` matrix:
+Every imported `Module` stores songs natively in a DAW-style layout —
+the legacy `Pattern → Row → TrackUnit` matrix is gone:
 
 - `module.tracks: Vec<Track>` — one track per (song, instrument) pair,
-  carrying the actual `Vec<TrackUnit>` content.
+  carrying `Vec<Cell>` content. Cells carry a typed
+  `CellEvent` (`NoteOn { pitch, velocity }`, `InstrReset`,
+  `NoteOff { retrig }`, …) plus a vector of **discrete**
+  `TrackEffect`s (Arpeggio, NoteDelay/Cut/Off/Retrig/FadeOut,
+  Tremor, Volume/Panning/ChannelVolume set, instrument switches,
+  MidiMacro).
 - `module.clips: SortedClips` — placements of those tracks on the
   timeline (`song`, `target_channel`, `position_tick`, `end_tick`).
+- `module.automation: Vec<AutomationLane>` — every **continuous**
+  modulation (Vibrato/Tremolo/Panbrello/Portamento/TonePortamento/
+  VolumeSlide/ChannelVolumeSlide/PanningSlide per-Track + Bpm/Speed/
+  GlobalVolume + their slides song-level) extracted upstream from
+  `TrackImportUnit` at import time. The player consumes the lanes
+  exclusively for those classes — there is no cell-side fallback.
 - `module.timeline_map: TimelineMap` — the linearised `pattern_order`
-  used to compute absolute ticks.
+  used to compute absolute ticks. Absorbs every navigation effect
+  (`Bxx` / `Dxx` / `E6y` / `EEy` + restart byte) at import time so
+  the sequencer just walks `entries` linearly.
 
 The player calls `Module::row_at(song, pattern, row)`, which routes
-through the DAW layer when populated (and through `Module.pattern[…]`
-otherwise) — so existing code keeps working without any opt-in. For an
-authored module you can build the DAW layer with
+through the DAW layer (the only path — `Module.pattern[…]` no longer
+exists). For an authored module you can build the DAW layer with
 `xmrs::daw::build_timeline::build_timeline_layer`; importers do it
 automatically.
 
 The same indirection also enables **Euclidean rhythm wrappers**: when
-a Track repeats a single (note, instrument, no-effect) cell on a
-strict Bjorklund pattern, `auto_convert_strict_euclidean_tracks`
-collapses the Track to a single prototype row and stashes the
+a Track repeats a single (note, no-effect) cell on a strict
+Bjorklund pattern, `auto_convert_strict_euclidean_tracks` collapses
+the Track to a single prototype `Cell` and stashes the
 `(events, steps, rotation)` triplet in an empty `Instrument` slot
 typed as `InstrumentType::Euclidean(InstrEkn)`. The cells are
 regenerated on-the-fly by `Module::row_at`, so playback is

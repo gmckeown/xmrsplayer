@@ -1,9 +1,9 @@
 /// A Sample State
-use xmrs::fixed::fixed::Q15;
-use xmrs::fixed::units::{
+use xmrs::core::fixed::fixed::Q15;
+use xmrs::core::fixed::units::{
     Amp, ChannelVolume, Finetune, Frequency, Panning, PitchDelta, SampleRate,
 };
-use xmrs::sample::{LoopType, Sample};
+use xmrs::core::sample::{LoopType, Sample};
 
 const M: u32 = 25; // 25 bits for fract part seems the better i can have
 const M_MASK: u32 = (1 << M) - 1;

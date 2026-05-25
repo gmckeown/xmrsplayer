@@ -1,5 +1,5 @@
 /// An Instrument Envelope State
-use xmrs::fixed::units::EnvValue;
+use xmrs::core::fixed::units::EnvValue;
 use xmrs::prelude::*;
 
 #[derive(Clone)]
@@ -134,7 +134,7 @@ mod tests {
     use super::*;
     use alloc::vec;
     use alloc::vec::Vec;
-    use xmrs::fixed::fixed::Q15;
+    use xmrs::core::fixed::fixed::Q15;
 
     /// Helper: build an `EnvValue` from an integer ratio so tests
     /// stay readable. `ev(0, 1)` = 0.0, `ev(1, 1)` = 1.0,

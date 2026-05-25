@@ -2,7 +2,7 @@
 //! `InstrumentType::Euclidean` pulses.
 //!
 //! The instrument owns the *shape* (probability + max-advance) via
-//! [`xmrs::instr_ekn::InstrEkn`]; the player owns the *execution* —
+//! [`xmrs::core::instr_ekn::InstrEkn`]; the player owns the *execution* —
 //! whether and how to draw randomness for each pulse.
 //!
 //! Default is [`HumanizeMode::Disabled`](crate::humanize::HumanizeMode::Disabled):
