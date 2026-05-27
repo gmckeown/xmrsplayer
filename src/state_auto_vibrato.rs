@@ -8,9 +8,7 @@ use xmrs::tracker::period::{FrequencyType, PeriodHelper};
 /// Auto-vibrato runtime state. Q-format throughout: `phase` is a
 /// free-running `u32` Q.16 cycle accumulator (full cycle =
 /// `0x10000`), `current_modulation` is a [`PitchDelta`] (Q8.8
-/// semitones). Replaces the previous f32 implementation that
-/// silently masked the precision difference between linear and
-/// Amiga frequency modes.
+/// semitones).
 #[derive(Clone)]
 pub struct StateAutoVibrato<'a> {
     vibrato: &'a Vibrato,
@@ -34,13 +32,9 @@ impl<'a> StateAutoVibrato<'a> {
             current_modulation: PitchDelta::ZERO,
         };
 
-        sv.reset();
+        sv.retrig();
 
         sv
-    }
-
-    pub fn reset(&mut self) {
-        self.retrig();
     }
 
     pub fn retrig(&mut self) {
@@ -59,7 +53,7 @@ impl<'a> StateAutoVibrato<'a> {
         q.raw().max(0) as u32 * 256
     }
 
-    pub fn tick(&mut self, _sustain: bool) {
+    pub fn tick(&mut self) {
         let speed_q16 = Self::q8_8_to_q16(self.vibrato.speed);
         let sweep_q16 = Self::q8_8_to_q16(self.vibrato.sweep);
         let depth_raw = self.vibrato.depth.as_q8_8_i32(); // Q8.8 i16 widened.
@@ -162,8 +156,7 @@ mod tests {
             "vibrato.sweep Q8_8 raw is zero — Q8_8::from_ratio(65, 255) gave 0?",
         );
 
-        // Q-format raw range checks (replace the OLD f32 ≈ 0.0586 /
-        // 0.164 / 0.254 expectations). At Q8.8 (0.0586 → 15, 0.254 →
+        // Q-format raw range checks. At Q8.8 (0.0586 → 15, 0.254 →
         // 65) and PitchDelta Q8.8 (0.164 → 42 raw):
         let speed_raw = vibrato.speed.raw();
         let depth_raw = vibrato.depth.as_q8_8_i16();
@@ -196,7 +189,7 @@ mod tests {
 
         // Tick 1: should produce non-zero modulation (sweep is
         // ramping in, but the waveform value is large).
-        sv.tick(true);
+        sv.tick();
         eprintln!(
             "[auto-vibrato test] tick 1 modulation raw = {}",
             sv.current_modulation.as_q8_8_i16()
@@ -214,7 +207,7 @@ mod tests {
         let depth_raw = vibrato.depth.as_q8_8_i16().abs() as i32;
         let mut peak_raw: i32 = sv.current_modulation.as_q8_8_i16().abs() as i32;
         for _ in 0..30 {
-            sv.tick(true);
+            sv.tick();
             peak_raw = peak_raw.max(sv.current_modulation.as_q8_8_i16().abs() as i32);
         }
         eprintln!(

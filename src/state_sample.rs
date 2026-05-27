@@ -8,15 +8,35 @@ use xmrs::core::sample::{LoopType, Sample};
 const M: u32 = 25; // 25 bits for fract part seems the better i can have
 const M_MASK: u32 = (1 << M) - 1;
 
+/// Cached loop region (forward or sustain). Materialises `end =
+/// start + length` so the per-frame seek doesn't recompute it.
+#[derive(Clone, Copy)]
+struct LoopRegion {
+    start: usize,
+    length: usize,
+    end: usize,
+    flag: LoopType,
+}
+
+impl LoopRegion {
+    fn new(start: usize, length: usize, flag: LoopType) -> Self {
+        Self {
+            start,
+            length,
+            end: start + length,
+            flag,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct StateSample<'a> {
     sample: &'a Sample,
-    /// Voice finetune contribution in semitones (was `f32`).
-    /// Stored as `Finetune` Q1.15 — represents fractional
-    /// semitones in `[-1, +1)`. The tracker formats put a
-    /// signed byte here `(byte/127)` semitones; Q1.15 has
-    /// 1/32768 ≈ 0.003 semitone resolution, well below the
-    /// XM byte's 1/127 step.
+    /// Voice finetune contribution in semitones. Stored as
+    /// `Finetune` Q1.15 — represents fractional semitones in
+    /// `[-1, +1)`. The tracker formats put a signed byte here
+    /// `(byte/127)` semitones; Q1.15 has 1/32768 ≈ 0.003 semitone
+    /// resolution, well below the XM byte's 1/127 step.
     finetune: Finetune,
     /// current sustain state
     sustained: bool,
@@ -24,19 +44,17 @@ pub struct StateSample<'a> {
     position: (u32, u32), // ( Position, Fract part M shifted )
     /// step is freq / rate
     step: Option<u32>, // step, M shifted
-    /// Output sample-rate (was `f32`). Q-typed `u32` Hz
-    /// throughout — `set_step` multiplies as `u64` to keep
-    /// the precision of the previous f32 path with no rounding
-    /// surprises.
+    /// Output sample-rate. Q-typed `u32` Hz throughout —
+    /// `set_step` multiplies as `u64` to keep full precision
+    /// with no rounding surprises.
     rate: SampleRate,
 
-    // Cached loop / length parameters from the underlying `Sample`.
+    // Cached length / loop parameters from the underlying `Sample`.
     //
-    // These mirror `Sample::len`, `Sample::loop_*` and
-    // `Sample::sustain_loop_*` and are populated once at construction.
-    // The `Sample` itself is borrowed immutably for the lifetime of
-    // this `StateSample`, so caching is safe — these values cannot
-    // change underneath us.
+    // These mirror `Sample::len` and the two `loop_*` blocks and are
+    // populated once at construction. The `Sample` itself is borrowed
+    // immutably for the lifetime of this `StateSample`, so caching is
+    // safe — these values cannot change underneath us.
     //
     // The point is to keep the per-sample hot path (`tick` →
     // `seek_cached`) free of the
@@ -53,44 +71,32 @@ pub struct StateSample<'a> {
     /// last-valid-index clamp; precomputing eliminates the
     /// subtraction (and the underflow check) inside `seek_cached`.
     cached_len_minus_1: usize,
-    cached_loop_start: usize,
-    cached_loop_length: usize,
-    /// `cached_loop_start + cached_loop_length`. Materialising the
-    /// end of the loop region avoids recomputing it inside the
-    /// per-frame seek.
-    cached_loop_end: usize,
-    cached_loop_flag: LoopType,
-    cached_sustain_loop_start: usize,
-    cached_sustain_loop_length: usize,
-    cached_sustain_loop_end: usize,
-    cached_sustain_loop_flag: LoopType,
+    cached_loop: LoopRegion,
+    cached_sustain_loop: LoopRegion,
 }
 
 impl<'a> StateSample<'a> {
     pub fn new(sample: &'a Sample, rate: SampleRate) -> Self {
-        let finetune = sample.finetune;
         let cached_len = sample.len();
-        let cached_loop_start = sample.loop_start as usize;
-        let cached_loop_length = sample.loop_length as usize;
-        let cached_sustain_loop_start = sample.sustain_loop_start as usize;
-        let cached_sustain_loop_length = sample.sustain_loop_length as usize;
         Self {
             sample,
-            finetune,
+            finetune: sample.finetune,
             sustained: true,
             position: (0, 0),
             step: None,
             rate,
             cached_len,
             cached_len_minus_1: cached_len.saturating_sub(1),
-            cached_loop_start,
-            cached_loop_length,
-            cached_loop_end: cached_loop_start + cached_loop_length,
-            cached_loop_flag: sample.loop_flag,
-            cached_sustain_loop_start,
-            cached_sustain_loop_length,
-            cached_sustain_loop_end: cached_sustain_loop_start + cached_sustain_loop_length,
-            cached_sustain_loop_flag: sample.sustain_loop_flag,
+            cached_loop: LoopRegion::new(
+                sample.loop_start as usize,
+                sample.loop_length as usize,
+                sample.loop_flag,
+            ),
+            cached_sustain_loop: LoopRegion::new(
+                sample.sustain_loop_start as usize,
+                sample.sustain_loop_length as usize,
+                sample.sustain_loop_flag,
+            ),
         }
     }
 
@@ -138,7 +144,7 @@ impl<'a> StateSample<'a> {
     /// heuristic — looping voices can ring indefinitely so they're
     /// cheaper to drop than one-shot tails.
     pub fn is_looping(&self) -> bool {
-        self.cached_loop_flag != LoopType::No || self.cached_sustain_loop_flag != LoopType::No
+        self.cached_loop.flag != LoopType::No || self.cached_sustain_loop.flag != LoopType::No
     }
 
     pub fn disable(&mut self) {
@@ -203,24 +209,13 @@ impl<'a> StateSample<'a> {
         if self.cached_len == 0 {
             return None;
         }
-        let (start, end, length, loop_type) =
-            if self.sustained && self.cached_sustain_loop_flag != LoopType::No {
-                (
-                    self.cached_sustain_loop_start,
-                    self.cached_sustain_loop_end,
-                    self.cached_sustain_loop_length,
-                    self.cached_sustain_loop_flag,
-                )
-            } else {
-                (
-                    self.cached_loop_start,
-                    self.cached_loop_end,
-                    self.cached_loop_length,
-                    self.cached_loop_flag,
-                )
-            };
+        let region = if self.sustained && self.cached_sustain_loop.flag != LoopType::No {
+            &self.cached_sustain_loop
+        } else {
+            &self.cached_loop
+        };
 
-        match loop_type {
+        match region.flag {
             LoopType::No => {
                 if pos < self.cached_len {
                     Some(pos)
@@ -229,22 +224,22 @@ impl<'a> StateSample<'a> {
                 }
             }
             LoopType::Forward => {
-                if length == 0 || pos < end {
+                if region.length == 0 || pos < region.end {
                     Some(pos.min(self.cached_len_minus_1))
                 } else {
-                    Some(start + (pos - start) % length)
+                    Some(region.start + (pos - region.start) % region.length)
                 }
             }
             LoopType::PingPong => {
-                if length == 0 || pos < end {
+                if region.length == 0 || pos < region.end {
                     Some(pos.min(self.cached_len_minus_1))
                 } else {
-                    let total_length = 2 * length;
-                    let mod_pos = (pos - start) % total_length;
-                    if mod_pos < length {
-                        Some(start + mod_pos)
+                    let total_length = 2 * region.length;
+                    let mod_pos = (pos - region.start) % total_length;
+                    if mod_pos < region.length {
+                        Some(region.start + mod_pos)
                     } else {
-                        Some(end - (mod_pos - length) - 1)
+                        Some(region.end - (mod_pos - region.length) - 1)
                     }
                 }
             }
@@ -286,7 +281,7 @@ impl<'a> StateSample<'a> {
         self.increment_position();
 
         // `Amp::lerp` is a saturating Q1.15 lerp — `u + (v - u) * t`
-        // computed in widened i32. Replaces the f32 lerp helper.
+        // computed in widened i32.
         (u.0.lerp(v.0, t), u.1.lerp(v.1, t))
     }
 

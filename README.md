@@ -55,7 +55,7 @@ A complete CLI player built on `cpal` is shipped as the `xmrsplayer` binary
 two focused demos: `arp_bug.rs` (a regression check for FT2 arpeggio) and
 `inspect_mod.rs` (a diagnostic dumper that prints the parsed module's
 instruments, pattern-order, DAW tracks/clips/timeline map, detected
-Euclidean wrappers, and the result of `verify_layers_consistent`).
+Euclidean tracks, and the result of `verify_layers_consistent`).
 
 For modules with very heavy NNA polyphony (the `Another Life`-class
 files that stack hundreds of `NNA = Continue` voices), you can raise
@@ -77,9 +77,13 @@ The player also exposes a subscription API — hook into row/tick changes with `
 Every imported `Module` stores songs natively in a DAW-style layout —
 the legacy `Pattern → Row → TrackUnit` matrix is gone:
 
-- `module.tracks: Vec<Track>` — one track per (song, instrument) pair,
-  carrying `Vec<Cell>` content. Cells carry a typed
-  `CellEvent` (`NoteOn { pitch, velocity }`, `InstrReset`,
+- `module.tracks: Vec<Track>` — an enum with two variants.
+  `Track::Notes` carries the classic per-row `Vec<Cell>` (one cell
+  per row); `Track::Euclidean` is a Bjorklund generator that
+  synthesises one cell per row at playback time (see
+  *Euclidean rhythm tracks* below). Both variants bind to a fixed
+  `instrument` index. Cells carry a typed `CellEvent`
+  (`NoteOn { pitch, velocity }`, `InstrReset`,
   `NoteOff { retrig }`, …) plus a vector of **discrete**
   `TrackEffect`s (Arpeggio, NoteDelay/Cut/Off/Retrig/FadeOut,
   Tremor, Volume/Panning/ChannelVolume set, instrument switches,
@@ -103,14 +107,14 @@ exists). For an authored module you can build the DAW layer with
 `xmrs::daw::build_timeline::build_timeline_layer`; importers do it
 automatically.
 
-The same indirection also enables **Euclidean rhythm wrappers**: when
-a Track repeats a single (note, no-effect) cell on a strict
-Bjorklund pattern, `auto_convert_strict_euclidean_tracks` collapses
-the Track to a single prototype `Cell` and stashes the
-`(events, steps, rotation)` triplet in an empty `Instrument` slot
-typed as `InstrumentType::Euclidean(InstrEkn)`. The cells are
-regenerated on-the-fly by `Module::row_at`, so playback is
-bit-identical while the on-disk Track is tiny.
+The same indirection also enables **Euclidean rhythm tracks**: when
+a `Track::Notes` repeats a single (note, no-effect) cell on a strict
+Bjorklund pattern, `auto_convert_strict_euclidean_tracks` rewrites
+it in place as a `Track::Euclidean` variant carrying the
+`(events, steps, rotation)` parameters and the single prototype
+`Cell` directly on the Track. The cells are regenerated on-the-fly
+by `Module::row_at`, so playback is bit-identical while the on-disk
+Track is tiny.
 
 ### Talking to the player in `f32`
 

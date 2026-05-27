@@ -1,6 +1,3 @@
-// Float-backend imports kept removed (Tour 6): no f32 methods
-// remain in this file after the period→pitch fold.
-
 use core::ops::Deref;
 
 use crate::{
@@ -199,7 +196,7 @@ impl<'a> StateInstrDefault<'a> {
     }
 
     pub fn vibrato_reset(&mut self) {
-        self.state_vibrato.reset();
+        self.state_vibrato.retrig();
     }
 
     pub fn cut_pitch(&mut self) {
@@ -549,78 +546,34 @@ impl<'a> StateInstrDefault<'a> {
         vibrato: PitchDelta,
         semitone: bool,
     ) {
-        let pitch_env_offset = self.get_pitch_envelope_offset();
-        let vibrato_mod = self.state_vibrato.current_modulation;
         if self.state_sample.is_none() {
             return;
         }
+        let pitch_env_offset = self.get_pitch_envelope_offset();
+        let vibrato_mod = self.state_vibrato.current_modulation;
 
         // Sum the four pitch deltas. Each `PitchDelta` is Q8.8
         // bounded to `±i16::MAX/256 ≈ ±128 semitones`; their
         // saturating `+` keeps the result inside that range
         // (and in practice each term is `± 32 semitones max`,
         // so we never get near saturation).
-        let delta = arp_pitch + pitch_env_offset + vibrato + vibrato_mod;
-        let delta_q88: i32 = delta.as_q8_8_i32();
+        let delta_q88 = (arp_pitch + pitch_env_offset + vibrato + vibrato_mod).as_q8_8_i32();
+        let arp_active = (arp_pitch + pitch_env_offset) != PitchDelta::ZERO;
 
         // Period → base pitch (Q8.8 semitones). Both branches
-        // are now integer-only:
-        //   - Linear: exact `(7680 - period) << 2` Q8.8 raw.
+        // are integer-only:
+        //   - Linear: exact `(7680 - period) << 2` raw — `(1/64)`
+        //     in Q8.8 raw is `256/64 = 4`.
         //   - Amiga: binary-search through the Amiga period
-        //     table (1/8-semitone grid, Q8.8 raw step 32).
-        let pitch_q = match self.period_helper.freq_type {
-            FrequencyType::LinearFrequencies => {
-                // EXACT: pitch_semitones = (7680 - period) / 64.
-                // In Q8.8 raw: `(7680 - period) << 2` because
-                // (1/64) in Q8.8 raw = 256/64 = 4.
-                let mut pitch_q88 = (7680_i32 - period.raw() as i32) * 4;
-
-                // FT2 glissando snap: round to nearest integer
-                // semitone (Q8.8 raw multiple of 256).
-                if semitone {
-                    pitch_q88 = round_to_nearest_semitone_q88(pitch_q88);
-                }
-
-                // FT2 arpeggio quirk: clamp base note to ≤ 95
-                // (Q8.8 raw `95 * 256 = 24320`) if arpeggio or
-                // pitch envelope is active.
-                if self.period_helper.legacy_arpeggio_clamp_enabled()
-                    && (arp_pitch + pitch_env_offset) != PitchDelta::ZERO
-                {
-                    pitch_q88 = pitch_q88.min(95 * 256);
-                }
-
-                // Saturating sum + Q-format encode (negative
-                // pitch is meaningless, hence `.max(0)`; the i16
-                // ceiling is handled by `from_q8_8_i32_sat`).
-                let final_q88 = pitch_q88.saturating_add(delta_q88).max(0);
-                xmrs::core::fixed::units::Pitch::from_q8_8_i32_sat(final_q88)
-            }
+        //     table (1/8-semitone grid, Q8.8 raw step 32) — 12.5
+        //     cent precision, same as FT2-era trackers.
+        let base_pitch_q88 = match self.period_helper.freq_type {
+            FrequencyType::LinearFrequencies => (7680_i32 - period.raw() as i32) * 4,
             FrequencyType::AmigaFrequencies => {
-                // Q-format Amiga period→pitch lookup. Uses the
-                // 1/8-semitone (Q8.8 raw step = 32) grid that
-                // matches the Amiga period table itself; pitch
-                // slides between table entries map to the
-                // nearest unit (12.5 cent precision) — same
-                // resolution any FT2-era tracker offers on its
-                // pitch sliders. No log2 / no f32.
-                let mut pitch_q88 =
-                    xmrs::core::fixed::tables::amiga_period_to_pitch(period).as_q8_8_i32();
-
-                if semitone {
-                    pitch_q88 = round_to_nearest_semitone_q88(pitch_q88);
-                }
-
-                if self.period_helper.legacy_arpeggio_clamp_enabled()
-                    && (arp_pitch + pitch_env_offset) != PitchDelta::ZERO
-                {
-                    pitch_q88 = pitch_q88.min(95 * 256);
-                }
-
-                let final_q88 = pitch_q88.saturating_add(delta_q88).max(0);
-                xmrs::core::fixed::units::Pitch::from_q8_8_i32_sat(final_q88)
+                xmrs::core::fixed::tables::amiga_period_to_pitch(period).as_q8_8_i32()
             }
         };
+        let pitch_q = self.finalize_pitch(base_pitch_q88, delta_q88, arp_active, semitone);
 
         // Q-format end-to-end: Pitch → Period → Frequency → step.
         let period_q = self.period_helper.note_to_period(pitch_q);
@@ -630,12 +583,33 @@ impl<'a> StateInstrDefault<'a> {
             s.set_step(f);
         }
     }
-}
 
-// log2 / pitch_from_semitones_f32_clamped helpers removed
-// (Tour 6): both period→pitch branches in `update_frequency`
-// now use Q-format LUTs from `xmrs::core::fixed::tables`. The
-// `update_frequency` body is integer-only end-to-end.
+    /// Snap + clamp + sum + encode shared between the two
+    /// frequency branches of [`Self::update_frequency`].
+    ///
+    /// * `semitone` (FT2 glissando) snaps to the nearest integer
+    ///   semitone (Q8.8 raw multiple of 256).
+    /// * The FT2 arpeggio quirk clamps the base note to ≤ 95
+    ///   when arpeggio or pitch-envelope contributes anything.
+    /// * Sum then `.max(0)` (negative pitch is meaningless);
+    ///   `from_q8_8_i32_sat` handles the i16 ceiling.
+    fn finalize_pitch(
+        &self,
+        mut base_pitch_q88: i32,
+        delta_q88: i32,
+        arp_active: bool,
+        semitone: bool,
+    ) -> xmrs::core::fixed::units::Pitch {
+        if semitone {
+            base_pitch_q88 = round_to_nearest_semitone_q88(base_pitch_q88);
+        }
+        if self.period_helper.legacy_arpeggio_clamp_enabled() && arp_active {
+            base_pitch_q88 = base_pitch_q88.min(95 * 256);
+        }
+        let final_q88 = base_pitch_q88.saturating_add(delta_q88).max(0);
+        xmrs::core::fixed::units::Pitch::from_q8_8_i32_sat(final_q88)
+    }
+}
 
 impl<'a> StateInstrDefault<'a> {
     /// Resolve the *output* pitch for a given input note, applying
@@ -716,7 +690,7 @@ impl<'a> StateInstrDefault<'a> {
 
     pub fn tick(&mut self) {
         self.envelopes();
-        self.state_vibrato.tick(self.sustained);
+        self.state_vibrato.tick();
     }
 }
 

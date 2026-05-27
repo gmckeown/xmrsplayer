@@ -15,6 +15,7 @@
 use crate::state_instr_default::StateInstrDefault;
 use xmrs::core::fixed::fixed::Q15;
 use xmrs::core::fixed::units::{Amp, ChannelVolume, Panning, Period, PitchDelta, Volume};
+use xmrs::core::instrument_behavior::NewNoteAction;
 use xmrs::prelude::Pitch;
 
 // (1.5) The former `MAX_GHOST_VOICES_PER_CHANNEL` cap has been
@@ -65,13 +66,6 @@ pub(crate) struct Voice<'a> {
     /// envelope-driven pitch drift stops at the moment the voice
     /// becomes a ghost.
     pub period_at_fork: Period,
-
-    /// The track that engendered this voice. Used by past-note
-    /// effects (S7x) and DCT matching to find voices belonging to
-    /// a given track, and by ghost-list maintenance routines.
-    /// `Some(track_index)` for both live and ghost voices.
-    #[allow(dead_code)]
-    pub master_track: Option<usize>,
 }
 
 impl<'a> Voice<'a> {
@@ -82,7 +76,7 @@ impl<'a> Voice<'a> {
     /// in the mixer, so these are unread for live voices but kept
     /// at sensible values in case the voice is later promoted to a
     /// ghost without an explicit re-snapshot.
-    pub fn new_live(instr: StateInstrDefault<'a>, master_track: usize) -> Self {
+    pub fn new_live(instr: StateInstrDefault<'a>) -> Self {
         Self {
             instr,
             vol_frozen: Volume::FULL,
@@ -91,35 +85,18 @@ impl<'a> Voice<'a> {
             note: None,
             sample_num: None,
             period_at_fork: Period::ZERO,
-            master_track: Some(master_track),
         }
     }
 
     /// Build a detached (ghost) voice from a live instrument state.
     /// Callers must then dispatch the NNA-specific action on the
-    /// returned voice — see [`Voice::apply_nna_continue`] (no-op),
-    /// [`Voice::apply_nna_note_off`], [`Voice::apply_nna_note_fade_out`].
-    /// Apply-functions live on this type so the NNA dispatch table
-    /// is co-located with the voice it affects.
-    ///
-    /// `master_track` records which pattern track engendered the
-    /// voice. For ghosts spawned by NNA != Cut, that's the track
-    /// whose live note was just displaced.
+    /// returned voice via [`Voice::apply_nna`].
     ///
     /// `note` / `sample_num` carry the identity tags used by DCT
     /// matching on subsequent triggers.
-    //
-    // Eight construction parameters: every one is a distinct piece
-    // of frozen state captured at fork time (the volume / channel-
-    // volume / panning trio, the identity tags, the period, plus
-    // the master-track index and the borrowed instrument state).
-    // Folding them into a builder struct just relocates the count
-    // without removing any complexity, so we keep the flat
-    // signature and silence the lint locally.
     #[allow(clippy::too_many_arguments)]
     pub fn new_ghost(
         instr: StateInstrDefault<'a>,
-        master_track: usize,
         vol_frozen: Volume,
         channel_volume_frozen: ChannelVolume,
         panning_frozen: Panning,
@@ -135,39 +112,30 @@ impl<'a> Voice<'a> {
             note,
             sample_num,
             period_at_fork,
-            master_track: Some(master_track),
         }
     }
 
-    /// NNA = Continue. Explicit no-op kept for symmetry with the
-    /// other NNA arms so the dispatch site reads straightforwardly.
-    #[inline]
-    pub fn apply_nna_continue(&mut self) {}
-
-    /// NNA = NoteOff (enters release segment of the volume envelope;
-    /// if the instrument has no envelope, the internal `key_off`
-    /// cuts the voice).
-    #[inline]
-    pub fn apply_nna_note_off(&mut self) {
-        self.instr.key_off();
-    }
-
-    /// NNA = NoteFadeOut: engage the fadeout register without
-    /// releasing sustain. Mirrors schism's `NNA_NOTEFADE` branch
-    /// in `csf_check_nna` (`effects.c:1791-1792`), which sets
-    /// `CHN_NOTEFADE` but NOT `CHN_KEYOFF`. The envelope keeps
-    /// wrapping in its sustain loop while the fadeout register
-    /// decays the voice to silence — that's how IT's NNA Fade
-    /// differs from NNA NoteOff, which DOES release sustain so
-    /// the envelope walks through its release section before the
-    /// fade engages.
+    /// Dispatch on an NNA variant. Callers must early-return on
+    /// `NoteCut` (which short-circuits ghost spawning entirely),
+    /// so reaching the `NoteCut` arm here is a programmer error.
     ///
-    /// The previous implementation called `instr.key_off()` here,
-    /// conflating the two NNAs and making every NNA Fade ghost
-    /// behave like an NNA NoteOff ghost.
+    /// * `Continue` — no-op.
+    /// * `NoteOff` — release sustain (`instr.key_off()`); the
+    ///   envelope walks its release segment, then the fade engages.
+    /// * `NoteFadeOut` — engage the fadeout register without
+    ///   releasing sustain. Mirrors schism's `NNA_NOTEFADE` branch
+    ///   in `csf_check_nna` (`effects.c:1791-1792`), which sets
+    ///   `CHN_NOTEFADE` but NOT `CHN_KEYOFF` — the envelope keeps
+    ///   wrapping in its sustain loop while the fadeout decays the
+    ///   voice to silence.
     #[inline]
-    pub fn apply_nna_note_fade_out(&mut self) {
-        self.instr.start_fadeout();
+    pub fn apply_nna(&mut self, nna: NewNoteAction) {
+        match nna {
+            NewNoteAction::Continue => {}
+            NewNoteAction::NoteOff => self.instr.key_off(),
+            NewNoteAction::NoteFadeOut => self.instr.start_fadeout(),
+            NewNoteAction::NoteCut => unreachable!("NoteCut is handled by the caller"),
+        }
     }
 
     /// S7x past-note: immediate cut.
@@ -265,7 +233,7 @@ impl<'a> Voice<'a> {
     /// `volume_fading_out` is the xmrsplayer equivalent of
     /// `CHN_NOTEFADE`; it's set independently from `sustained`,
     /// which lets a voice be "still sustained, but already fading"
-    /// (the NNA = NoteFade case — `apply_nna_note_fade_out` calls
+    /// (the NNA = NoteFade case — `apply_nna` calls
     /// `start_fadeout` without releasing sustain). A predicate
     /// based on `sustained || volume_fadeout > 0.0` would have
     /// missed that case and held the voice alive forever after
@@ -348,7 +316,6 @@ mod tests {
         let state = StateInstrDefault::new(instr, 0, ph, SampleRate::from_hz(44100), true);
         Voice::new_ghost(
             state,
-            0,
             Volume::FULL,
             ChannelVolume::FULL,
             Panning::CENTER,

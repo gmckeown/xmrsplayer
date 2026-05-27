@@ -1,7 +1,7 @@
 //! Song cursor + tick clock — TimelineMap-driven.
 //!
-//! Since DAW migration Phase 3c.2 the sequencer is a thin
-//! state machine over [`xmrs::core::daw::timeline::TimelineMap`]:
+//! The sequencer is a thin state machine over
+//! [`xmrs::core::daw::timeline::TimelineMap`]:
 //! each `TimelineEntry` already carries `(order, pattern, row,
 //! loop_iter, tick, speed_at_row, bpm_at_row)`, with all navigation
 //! effects (`Bxx` / `Dxx` / `E6y` / `EEy`) absorbed at import time
@@ -165,6 +165,16 @@ impl<'a> Sequencer<'a> {
     }
     pub fn bpm(&self) -> usize {
         self.bpm
+    }
+
+    /// Samples per tick at the current BPM, in Q.16 fixed-point.
+    /// `BPM × 0.4 ticks/s` → `samples_per_tick = sample_rate ×
+    /// 5 / (BPM × 2)`. BPM is clamped to ≥ 1 to avoid divide-by-
+    /// zero on pathological modules. Worst case 192 kHz / 1 BPM
+    /// is ~3 × 10^10, fits u64.
+    pub fn samples_per_tick_q16(&self, sample_rate_hz: u32) -> u64 {
+        let bpm = self.bpm.max(1) as u64;
+        ((sample_rate_hz as u64) << 15) * 5 / bpm
     }
     pub fn current_tick(&self) -> usize {
         self.current_tick
@@ -411,10 +421,8 @@ impl<'a> Sequencer<'a> {
             }
         }
 
-        // Read `BpmSlide` from the Bpm/Slide AutomationLane.
-        // DAW migration Phase 3c.3: BpmSlide no longer sources
-        // from `cell.global_effects` — the lane built by
-        // `extract_bpm_slide_events` is the authoritative form.
+        // Read `BpmSlide` from the Bpm/Slide AutomationLane (the
+        // authoritative form, built by `extract_bpm_slide_events`).
         // Other song-level / navigation effects are either pre-baked
         // into the entry (`Bpm`, `Speed`), consumed by `Voices`
         // (`Volume`, `VolumeSlide`, `MidiMacro`) or absorbed by the
@@ -516,12 +524,12 @@ impl<'a> Sequencer<'a> {
 }
 
 #[cfg(all(test, any(feature = "import_xm", feature = "import")))]
-mod phase_3c2_tests {
+mod timeline_idx_tests {
     use super::*;
 
-    /// DAW migration Phase 3c.2 invariant: after each
-    /// `RowStart`, `timeline_idx` points at the entry whose
-    /// `(song, pattern, row)` matches the row just emitted.
+    /// Invariant: after each `RowStart`, `timeline_idx` points at
+    /// the entry whose `(song, pattern, row)` matches the row just
+    /// emitted.
     #[test]
     fn timeline_idx_tracks_navigation_on_note_xm() {
         let data = include_bytes!("../../xmrs/examples/note.xm");
@@ -591,7 +599,7 @@ mod phase_3c2_tests {
         use xmrs::core::daw::track::Track;
 
         let mut m = Module::default();
-        m.tracks.push(Track {
+        m.tracks.push(Track::Notes {
             name: "t".into(),
             instrument: 0,
             rows: alloc::vec![Cell::default(); 4],
@@ -671,7 +679,7 @@ mod phase_3c2_tests {
         use xmrs::core::daw::track::Track;
 
         let mut m = Module::default();
-        m.tracks.push(Track {
+        m.tracks.push(Track::Notes {
             name: "t".into(),
             instrument: 0,
             rows: alloc::vec![Cell::default(); 2],

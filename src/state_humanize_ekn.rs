@@ -3,7 +3,7 @@
 //! Lives on each [`crate::channel::Channel`]; coordinated by the
 //! player's `step()` loop:
 //!
-//! 1. When a channel triggers an `InstrumentType::Euclidean`, the
+//! 1. When a channel triggers a `Track::Euclidean`, the
 //!    state arms (`note_euclidian_triggered`).
 //! 2. At every row-start AFTER the first armed trigger, the player
 //!    rolls the RNG (`roll`) and — if humanisation hits — schedules
@@ -42,9 +42,8 @@ pub(crate) struct StateHumanizeEkn {
     /// track_instr)`. `Some` means: when the channel reaches this
     /// tick inside the current row, trigger the cell early. The
     /// `track_instr` is the cached `Track.instrument` for the cell
-    /// that originated this intent — see DAW migration Phase 1+2
-    /// for why the per-cell instrument is no longer carried by
-    /// `Cell` itself.
+    /// that originated this intent (instruments live per-track,
+    /// not per-cell).
     fire_intent: Option<(u8, Cell, Option<usize>)>,
 
     /// `true` when the next row-start trigger should be skipped on

@@ -15,7 +15,49 @@
 //!
 //! [`PlayerObserver`]: crate::observer::PlayerObserver
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::ops::{Deref, DerefMut};
 use xmrs::prelude::*;
+
+/// Internal wrapper around `Vec<Box<T>>` for boxed-trait-object
+/// observer lists. Centralises the four facade quadruplets
+/// (`add_X / clear_X / X_count / Vec<Box<dyn _ + Send>>`).
+/// Deref/DerefMut expose slice methods (`iter`, `iter_mut`,
+/// `is_empty`, `len`) without re-exporting `push` / `clear` —
+/// callers go through [`Self::add`] / [`Self::clear`].
+pub(crate) struct ObserverList<T: ?Sized>(Vec<Box<T>>);
+
+impl<T: ?Sized> ObserverList<T> {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn add(&mut self, observer: Box<T>) {
+        self.0.push(observer);
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    pub fn count(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<T: ?Sized> Deref for ObserverList<T> {
+    type Target = [Box<T>];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T: ?Sized> DerefMut for ObserverList<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 /// Context passed to [`PlayerObserver::on_row`] when a new row is loaded.
 ///

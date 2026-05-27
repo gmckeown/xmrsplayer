@@ -156,22 +156,19 @@ impl<'a> VoicePool<'a> {
     }
 
     /// Total number of slots in the pool (live + free). Test-only:
-    /// no production consumer reads the capacity today, but several
-    /// tests assert on it. Will lose the `cfg(test)` gate when 1.6
-    /// exposes a constructor parameter for the capacity.
+    /// no production consumer reads the capacity today.
     #[cfg(test)]
     pub fn capacity(&self) -> usize {
         self.slots.len()
     }
 
-    /// Number of slots currently occupied. Test-only — see comment
-    /// on `capacity`.
+    /// Number of slots currently occupied. Test-only.
     #[cfg(test)]
     pub fn allocated_count(&self) -> usize {
         self.allocated
     }
 
-    /// `true` when every slot is occupied. Test-only — `allocate`
+    /// `true` when every slot is occupied. Test-only: `allocate`
     /// no longer fails on full so production code never needs to
     /// check.
     #[cfg(test)]
@@ -368,15 +365,14 @@ impl<'a> VoicePool<'a> {
         // magnitude, just a consistent ordering — so the score
         // stays in `i32` and callers compare with `<`.
         //
-        // Scale-equivalent of the OLD f32 formula:
+        // Formula:
         //   sustained:    vol × 1024       → `vol_q15 << 10`
         //   unsustained:  vol × fadeout    → `(vol_q15 × fadeout_q15) >> 15`
         //   looping:      score × 0.5      → `>> 1`
         //
         // Sustained range: `[0, 32767 × 1024 ≈ 3.4 × 10⁷]`
         // Unsustained range: `[0, 32767]`
-        // Sustained always outranks unsustained at equal `vol` —
-        // matches the OLD f32 ordering.
+        // Sustained always outranks unsustained at equal `vol`.
         let v_q15 = v.instr.volume.as_q15_i32();
         let mut score: i32 = if v.instr.sustained {
             v_q15 << 10
@@ -520,7 +516,6 @@ mod tests {
         let state = StateInstrDefault::new(instr, 0, ph, SampleRate::from_hz(44100), true);
         Voice::new_ghost(
             state,
-            0,
             Volume::FULL,
             ChannelVolume::FULL,
             Panning::CENTER,
@@ -581,7 +576,6 @@ mod tests {
             state.volume = vol;
             Voice::new_ghost(
                 state,
-                0,
                 Volume::FULL,
                 ChannelVolume::FULL,
                 Panning::CENTER,
@@ -704,7 +698,6 @@ mod tests {
         // sustained=true is the default. Don't call key_off.
         Voice::new_ghost(
             state,
-            0,
             Volume::FULL,
             ChannelVolume::FULL,
             Panning::CENTER,

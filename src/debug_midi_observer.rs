@@ -51,81 +51,76 @@ impl DebugMidiObserver {
 
 impl MidiObserver for DebugMidiObserver {
     fn on_midi_event(&mut self, event: &MidiEvent, source_channel: usize) {
-        match event {
+        let body = match event {
             MidiEvent::NoteOff {
                 channel,
                 note,
                 velocity,
-            } => println!(
-                "ch{:02} NoteOff       midi_ch={} note={} vel={}",
-                source_channel, channel, note, velocity
+            } => format!(
+                "NoteOff       midi_ch={} note={} vel={}",
+                channel, note, velocity
             ),
             MidiEvent::NoteOn {
                 channel,
                 note,
                 velocity,
-            } => println!(
-                "ch{:02} NoteOn        midi_ch={} note={} vel={}",
-                source_channel, channel, note, velocity
+            } => format!(
+                "NoteOn        midi_ch={} note={} vel={}",
+                channel, note, velocity
             ),
             MidiEvent::PolyAftertouch {
                 channel,
                 note,
                 pressure,
-            } => println!(
-                "ch{:02} PolyAfterTouch midi_ch={} note={} pressure={}",
-                source_channel, channel, note, pressure
+            } => format!(
+                "PolyAfterTouch midi_ch={} note={} pressure={}",
+                channel, note, pressure
             ),
             MidiEvent::ControlChange {
                 channel,
                 controller,
                 value,
-            } => println!(
-                "ch{:02} ControlChange midi_ch={} cc={} val={}",
-                source_channel, channel, controller, value
+            } => format!(
+                "ControlChange midi_ch={} cc={} val={}",
+                channel, controller, value
             ),
-            MidiEvent::ProgramChange { channel, program } => println!(
-                "ch{:02} ProgramChange midi_ch={} program={}",
-                source_channel, channel, program
-            ),
-            MidiEvent::ChannelAftertouch { channel, pressure } => println!(
-                "ch{:02} ChAfterTouch   midi_ch={} pressure={}",
-                source_channel, channel, pressure
-            ),
-            MidiEvent::PitchBend { channel, value } => println!(
-                "ch{:02} PitchBend     midi_ch={} value={} (centre=8192)",
-                source_channel, channel, value
-            ),
-            MidiEvent::SysEx(data) => {
-                if self.truncate_sysex && data.len() > 8 {
-                    let head: alloc::vec::Vec<_> =
-                        data.iter().take(8).map(|b| format!("{:02X}", b)).collect();
-                    println!(
-                        "ch{:02} SysEx         len={} data=[{}, ...]",
-                        source_channel,
-                        data.len(),
-                        head.join(", ")
-                    );
-                } else {
-                    let hex: alloc::vec::Vec<_> =
-                        data.iter().map(|b| format!("{:02X}", b)).collect();
-                    println!(
-                        "ch{:02} SysEx         len={} data=[{}]",
-                        source_channel,
-                        data.len(),
-                        hex.join(", ")
-                    );
-                }
+            MidiEvent::ProgramChange { channel, program } => {
+                format!("ProgramChange midi_ch={} program={}", channel, program)
             }
-            MidiEvent::Raw(bytes) => {
-                let hex: alloc::vec::Vec<_> = bytes.iter().map(|b| format!("{:02X}", b)).collect();
-                println!(
-                    "ch{:02} Raw           len={} data=[{}]",
-                    source_channel,
-                    bytes.len(),
-                    hex.join(", ")
-                );
+            MidiEvent::ChannelAftertouch { channel, pressure } => {
+                format!("ChAfterTouch   midi_ch={} pressure={}", channel, pressure)
             }
-        }
+            MidiEvent::PitchBend { channel, value } => {
+                format!(
+                    "PitchBend     midi_ch={} value={} (centre=8192)",
+                    channel, value
+                )
+            }
+            MidiEvent::SysEx(data) => self.format_bytes("SysEx        ", data, self.truncate_sysex),
+            MidiEvent::Raw(data) => self.format_bytes("Raw          ", data, false),
+        };
+        println!("ch{:02} {}", source_channel, body);
+    }
+}
+
+impl DebugMidiObserver {
+    /// Format the `SysEx` / `Raw` payload as `label len=N data=[..]`,
+    /// optionally truncating to 8 bytes with a trailing `...`.
+    fn format_bytes(&self, label: &str, data: &[u8], truncate: bool) -> alloc::string::String {
+        let truncated = truncate && data.len() > 8;
+        let take = if truncated { 8 } else { data.len() };
+        let hex: alloc::vec::Vec<_> = data
+            .iter()
+            .take(take)
+            .map(|b| format!("{:02X}", b))
+            .collect();
+        let tail = if truncated { ", ..." } else { "" };
+        format!(
+            "{} len={} data=[{}{}]",
+            label,
+            data.len(),
+            hex.join(", "),
+            tail
+        )
     }
 }

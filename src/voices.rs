@@ -44,7 +44,7 @@ pub struct Voices<'a> {
     /// Module reference, kept so the global-volume / global-volume-
     /// slide lane lookups in [`Self::process_row`] can introspect
     /// `module.automation` without the facade having to thread it
-    /// through every call. DAW migration Phase 3c.3.
+    /// through every call.
     module: &'a Module,
 
     channel: Vec<Channel<'a>>,
@@ -89,7 +89,7 @@ pub struct Voices<'a> {
     /// across rows — cleared on entry to each `process_row`.
     pending_midi_events: Vec<(usize, MidiEvent)>,
 
-    /// Humanisation mode for `InstrumentType::Euclidean` pulses.
+    /// Humanisation mode for `Track::Euclidean` pulses.
     /// Default [`crate::humanize::HumanizeMode::Disabled`] keeps
     /// playback strictly cycle-exact.
     humanize_mode: crate::humanize::HumanizeMode,
@@ -164,27 +164,91 @@ impl<'a> Voices<'a> {
         }
     }
 
-    /// Per-channel access for the humanisation scheduler. The
-    /// facade reads/writes `humanize_ekn` here to schedule fire-
-    /// early intents and apply the suppress flag.
-    pub(crate) fn channel_humanize_mut(
-        &mut self,
-        idx: usize,
-    ) -> Option<&mut crate::state_humanize_ekn::StateHumanizeEkn> {
-        self.channel.get_mut(idx).map(|c| &mut c.humanize_ekn)
-    }
-
     /// Trigger any fire-intent on each channel whose scheduled
     /// tick matches `current_tick`. Called per-tick by the player
     /// (Euclidean humanisation early-fire path).
     ///
     /// `abs_tick` / `song` are threaded so the channel can resolve
-    /// its current Clip → Track and run the Phase 3c.1 dual-read
-    /// lane validation alongside the legacy cell-driven path.
+    /// its current Clip → Track and read the per-tick lanes.
     pub(crate) fn fire_humanize_intents_at(&mut self, current_tick: u8, abs_tick: u32, song: u16) {
         for ch in &mut self.channel {
             if let Some((cell, track_instr)) = ch.humanize_ekn.take_fire_intent_at(current_tick) {
                 ch.tick0(&cell, track_instr, abs_tick, song, &mut self.pool);
+            }
+        }
+    }
+
+    /// Peek at the next row and, for every channel armed by a prior
+    /// Euclidean trigger, roll humanise + schedule a fire-early
+    /// intent inside the current row's tick run.
+    ///
+    /// `song` / `next_pat` / `next_row` / `speed` are read from the
+    /// sequencer by the facade and threaded in. Pulses that would
+    /// jump patterns can't humanise (out of scope for the simple
+    /// lookahead).
+    pub(crate) fn schedule_humanize_intents(
+        &mut self,
+        song: usize,
+        next_pat: usize,
+        next_row: usize,
+        speed: usize,
+    ) {
+        if speed < 2 {
+            // Need at least one non-row-start tick to fire early.
+            return;
+        }
+        let Some(entry) = self
+            .module
+            .timeline_map
+            .find_entry(song, next_pat, next_row)
+        else {
+            return;
+        };
+        let next_abs_tick = entry.tick;
+        let next_cells = self.module.row_at(song, next_pat, next_row);
+        let n_channels = self.channel.len();
+        for ch_idx in 0..n_channels {
+            let Some(ch) = self.channel.get_mut(ch_idx) else {
+                continue;
+            };
+            // `front` is now a Track index — see
+            // `state_humanize_ekn::StateHumanizeEkn::note_euclidian_triggered`.
+            let Some(front_track) = ch.humanize_ekn.armed_front() else {
+                continue;
+            };
+            // The next pulse's track on this channel: look up the
+            // active clip at `next_abs_tick`.
+            let next_track = self
+                .module
+                .clips
+                .active_at(song as u16, ch_idx as u8, next_abs_tick)
+                .map(|(_, c)| c.track as usize);
+            if next_track != Some(front_track) {
+                continue;
+            }
+            // Resolve humanise params on the front Track::Euclidean.
+            let (prob, max_adv) = match self.module.tracks.get(front_track) {
+                Some(xmrs::core::daw::track::Track::Euclidean {
+                    humanize_probability,
+                    humanize_advance_max_ticks,
+                    ..
+                }) => (*humanize_probability, *humanize_advance_max_ticks),
+                _ => continue,
+            };
+            // Only humanise a real NoteOn trigger.
+            let Some((cell, track_instr)) = next_cells.get(ch_idx) else {
+                continue;
+            };
+            if !matches!(cell.event, xmrs::core::cell::CellEvent::NoteOn { .. }) {
+                continue;
+            }
+            // Roll humanise. On hit, fire at tick (speed - advance)
+            // inside the current row, clamped to [1, speed-1].
+            if let Some(advance) = ch.humanize_ekn.roll(prob, max_adv) {
+                let s = speed as u8;
+                let fire_tick = s.saturating_sub(advance).max(1).min(s.saturating_sub(1));
+                ch.humanize_ekn
+                    .schedule_fire(fire_tick, cell.clone(), *track_instr);
             }
         }
     }
@@ -199,17 +263,6 @@ impl<'a> Voices<'a> {
     pub fn set_global_volume(&mut self, v: Volume) {
         self.global_volume = v;
     }
-    /// Alias kept for the older `_q` naming convention.
-    #[doc(hidden)]
-    pub fn global_volume_q(&self) -> Volume {
-        self.global_volume
-    }
-    /// Alias kept for the older `_q` naming convention.
-    #[doc(hidden)]
-    #[allow(dead_code)]
-    pub fn set_global_volume_q(&mut self, v: Volume) {
-        self.global_volume = v;
-    }
 
     /// Q4.12 user-driven amplification (up to 8×).
     pub fn amplification(&self) -> Amplification {
@@ -219,26 +272,9 @@ impl<'a> Voices<'a> {
     pub fn set_amplification(&mut self, a: Amplification) {
         self.amplification = a;
     }
-    /// Alias kept for the older `_q` naming convention.
-    #[doc(hidden)]
-    pub fn amplification_q(&self) -> Amplification {
-        self.amplification
-    }
-    /// Alias kept for the older `_q` naming convention.
-    #[doc(hidden)]
-    #[allow(dead_code)]
-    pub fn set_amplification_q(&mut self, a: Amplification) {
-        self.amplification = a;
-    }
 
     /// Output sample-rate in Hz.
     pub fn sample_rate(&self) -> SampleRate {
-        self.sample_rate
-    }
-    /// Alias kept for the older `_q` naming convention.
-    #[doc(hidden)]
-    #[allow(dead_code)]
-    pub fn sample_rate_q(&self) -> SampleRate {
         self.sample_rate
     }
     pub fn num_channels(&self) -> usize {
@@ -286,10 +322,7 @@ impl<'a> Voices<'a> {
     ///
     /// `abs_tick` is the playback's absolute song tick at row-start; `song`
     /// is the current sub-song index. Channels use them to resolve their
-    /// active Clip + Track (and thence the extracted AutomationLanes) for
-    /// DAW migration Phase 3c.1's dual-read validation. The audio path
-    /// remains cell-driven in this phase — lanes are queried only for
-    /// validation under `cfg(debug_assertions)`.
+    /// active Clip + Track and read the per-tick lanes.
     pub(crate) fn process_row(
         &mut self,
         cells: &[(Cell, Option<usize>)],
@@ -297,7 +330,7 @@ impl<'a> Voices<'a> {
         song: u16,
     ) {
         // Song-level global volume / volume slide come from the
-        // `GlobalVolume` AutomationLanes (DAW migration Phase 3c.3).
+        // `GlobalVolume` AutomationLanes.
         self.apply_global_volume_from_lane(abs_tick);
         self.apply_global_volume_slide_from_lane(abs_tick);
 
@@ -322,8 +355,7 @@ impl<'a> Voices<'a> {
     /// Currently only `TrackEffect::MidiMacro` — the macro byte stream
     /// substitutes the channel's note / volume / pan / instrument
     /// fields and may write through to the filter envelope or MIDI
-    /// output. Relocated from `TrackImportUnit::midi_macros` by Phase 3b's
-    /// mirror pass and consumed cell-side since Phase 3c.3.
+    /// output.
     fn apply_row_per_channel_effects(&mut self, ch_index: usize, cell: &Cell) {
         for fx in &cell.effects {
             if let TrackEffect::MidiMacro(macro_type) = fx {

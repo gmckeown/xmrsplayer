@@ -3,7 +3,7 @@
 //! Loads a `.xm` / `.mod` / `.s3m` / `.it` file via the standard
 //! `Module::load` autodetection and prints a structural summary:
 //! per-song length, instrument count, track and clip counts,
-//! Euclidean wrappers detected by `auto_convert_strict_euclidean_tracks`,
+//! Euclidean tracks detected by `auto_convert_strict_euclidean_tracks`,
 //! and the result of `verify_layers_consistent`.
 //!
 //! Useful when chasing import-time regressions ("which channel does
@@ -14,7 +14,7 @@
 //! cargo run --release --features=demo --example inspect_mod -- path/to/module.s3m
 //! ```
 
-use xmrs::core::instrument::InstrumentType;
+use xmrs::core::daw::track::Track;
 use xmrs::core::module::Module;
 
 fn main() {
@@ -32,17 +32,20 @@ fn main() {
     println!("  tracks        = {}", m.tracks.len());
     println!(
         "  Σ track rows  = {}",
-        m.tracks.iter().map(|t| t.rows.len()).sum::<usize>()
+        m.tracks
+            .iter()
+            .map(|t| t.rows().map(|r| r.len()).unwrap_or(0))
+            .sum::<usize>()
     );
     println!("  clips         = {}", m.clips.len());
     println!("  timeline      = {} entries", m.timeline_map.entries.len());
 
     let euclidean = m
-        .instrument
+        .tracks
         .iter()
-        .filter(|i| matches!(i.instr_type, InstrumentType::Euclidean(_)))
+        .filter(|t| matches!(t, Track::Euclidean { .. }))
         .count();
-    println!("  Euclidean wrappers = {}", euclidean);
+    println!("  Euclidean tracks = {}", euclidean);
 
     let n_songs = m
         .timeline_map

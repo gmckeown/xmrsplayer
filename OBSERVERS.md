@@ -61,7 +61,7 @@ timeline layer) and borrowed for the duration of the callback. Each
 `InstrReset`, `NoteOff { retrig }`, `NoteCut`, `NoteFade`, `None`)
 plus a `Vec<TrackEffect>` of discrete per-trigger effects. The
 **instrument** that a row plays comes from the active `Track`
-(`Track::instrument`) — it is no longer a per-cell field. The
+(`Track::instrument()`) — it is no longer a per-cell field. The
 audio-side dispatch threads the track-level instrument separately
 (see `Module::row_at`, which returns `Vec<(Cell, Option<usize>)>`
 on the audio path).

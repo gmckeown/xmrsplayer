@@ -62,7 +62,7 @@ pub mod debug_midi_observer;
 pub mod xmrsplayer;
 
 /// Toggle and policy for humanisation of
-/// `InstrumentType::Euclidean` pulses at playback.
+/// `Track::Euclidean` pulses at playback.
 pub mod humanize;
 
 /// Per-channel state for Euclidean humanisation, coordinated by

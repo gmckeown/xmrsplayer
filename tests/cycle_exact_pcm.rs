@@ -45,8 +45,12 @@ fn sid_commando_produces_audio() {
 }
 
 fn make_euclidian_module(humanize_prob: xmrs::core::fixed::fixed::Q15, advance_max: u8) -> Module {
-    use xmrs::core::instr_ekn::InstrEkn;
-    use xmrs::tracker::import::build::build_timeline_layer;
+    use xmrs::core::cell::CellEvent;
+    use xmrs::core::daw::clip::Clip;
+    use xmrs::core::daw::sorted_clips::SortedClips;
+    use xmrs::core::daw::timeline::{TimelineEntry, TimelineMap};
+    use xmrs::core::daw::track::Track;
+    use xmrs::core::fixed::fixed::Q15;
 
     let data: Vec<i8> = (0..64)
         .map(|i| if i < 32 { 127i8 } else { -128i8 })
@@ -76,37 +80,54 @@ fn make_euclidian_module(humanize_prob: xmrs::core::fixed::fixed::Q15, advance_m
         instr_type: InstrumentType::Default(sample_instr),
         muted: false,
     });
-    module.instrument.push(Instrument {
+
+    // Bjorklund(3, 8) — fixed-events Euclidean track. The track
+    // owns the rhythm parameters directly; no wrapper instrument.
+    module.tracks.push(Track::Euclidean {
         name: "ekn".into(),
-        instr_type: InstrumentType::Euclidean(InstrEkn {
-            events: 3,
-            steps: 8,
-            rotation: 0,
-            instr: Some(0),
-            humanize_advance_max_ticks: advance_max,
-            humanize_probability: humanize_prob,
-        }),
+        instrument: 0,
         muted: false,
+        events: 3,
+        steps: 8,
+        rotation: 0,
+        prototype: Cell {
+            event: CellEvent::NoteOn {
+                pitch: Pitch::C4,
+                velocity: Volume::FULL,
+            },
+            effects: Vec::new(),
+        },
+        humanize_advance_max_ticks: advance_max,
+        humanize_probability: humanize_prob,
     });
 
-    // A 1-pattern song with Play(C4) on channel 0 at row 0 and row
-    // 4 — two pulses of the same wrapper Euclidean. The second
-    // pulse is the one the humanisation can advance.
-    let mut play_row: Row = (0..1)
-        .map(|_| xmrs::tracker::import::unit::TrackImportUnit::default())
-        .collect();
-    play_row[0].note = CellNote::Play(Pitch::C4);
-    play_row[0].instrument = Some(1);
-    let pattern: Pattern = (0..8)
-        .map(|r| {
-            if r == 0 || r == 4 {
-                play_row.clone()
-            } else {
-                vec![xmrs::tracker::import::unit::TrackImportUnit::default()]
-            }
-        })
-        .collect();
-    build_timeline_layer(&mut module, &[vec![0]], &[pattern]);
+    let speed = module.default_tempo as u32;
+    // One pattern, 8 rows wide, played once on channel 0.
+    module.clips = SortedClips::from_unsorted(vec![Clip {
+        track: 0,
+        song: 0,
+        target_channel: 0,
+        position_tick: 0,
+        speed_at_start: module.default_tempo as u8,
+        track_row_offset: 0,
+        source_start_row: 0,
+        end_tick: 8 * speed,
+    }]);
+    let _ = Q15::ONE;
+    let mut entries = Vec::new();
+    for row in 0..8u32 {
+        entries.push(TimelineEntry {
+            song: 0,
+            order_idx: 0,
+            pattern_idx: 0,
+            row_idx: row,
+            loop_iter: 0,
+            tick: row * speed,
+            speed_at_row: speed as u8,
+            bpm_at_row: module.default_bpm as u16,
+        });
+    }
+    module.timeline_map = TimelineMap { entries };
     module
 }
 
@@ -121,9 +142,9 @@ fn hash_pcm(pcm: &[i16]) -> u64 {
     h
 }
 
-/// `InstrumentType::Euclidean` wraps a Default sample-based
-/// instrument via `ekn.instr`. The player follows the pointer and
-/// triggers the wrapped sample. Smoke test: non-silent audio.
+/// `Track::Euclidean` binds to a Default sample-based instrument
+/// via its `instrument` index. The player triggers the referenced
+/// sample on each Bjorklund pulse. Smoke test: non-silent audio.
 #[test]
 fn euclidian_indirection_plays_wrapped_instrument() {
     let module = make_euclidian_module(xmrs::core::fixed::fixed::Q15::ZERO, 0);
@@ -319,7 +340,11 @@ fn euclidean_auto_conversion_is_cycle_exact() {
         // conversion now performs.
         let pattern_order = vec![vec![0usize]];
         let patterns = vec![pattern];
-        m.timeline_map = build_timeline_map(&m, &pattern_order, &patterns);
+        let (timeline_map, walker_wrap) = build_timeline_map(&m, &pattern_order, &patterns);
+        m.timeline_map = timeline_map;
+        if let Some(t) = walker_wrap {
+            m.song_loop_to = Some(t);
+        }
         let (tracks, clips) = extract_tracks_and_clips(&patterns, &m.timeline_map);
         m.tracks = tracks;
         m.clips = SortedClips::from_unsorted(clips);
@@ -333,20 +358,14 @@ fn euclidean_auto_conversion_is_cycle_exact() {
     let module_raw = make_module(sample_instr.clone(), /*convert=*/ false);
     let module_ekn = make_module(sample_instr, /*convert=*/ true);
 
-    // Sanity: the converted module has an Euclidean wrapper.
+    // Sanity: the converted module has a Track::Euclidean.
     assert!(
-        module_ekn
-            .instrument
-            .iter()
-            .any(|i| matches!(i.instr_type, InstrumentType::Euclidean(_))),
-        "expected an InstrumentType::Euclidean after auto-conversion"
+        module_ekn.tracks.iter().any(|t| t.is_euclidean()),
+        "expected a Track::Euclidean after auto-conversion"
     );
     assert!(
-        !module_raw
-            .instrument
-            .iter()
-            .any(|i| matches!(i.instr_type, InstrumentType::Euclidean(_))),
-        "raw module should not carry a wrapper"
+        !module_raw.tracks.iter().any(|t| t.is_euclidean()),
+        "raw module should carry only Track::Notes"
     );
 
     // Render both at default `HumanizeMode::Disabled`.
@@ -406,9 +425,9 @@ fn humanise_deterministic_changes_pcm() {
 }
 
 /// With `HumanizeMode::Disabled` (the default), the PCM must be
-/// identical regardless of the `InstrEkn`'s `humanize_*` parameter
-/// values. The instrument-side params describe the *shape*; the
-/// player must obey its mode-side gate.
+/// identical regardless of the `Track::Euclidean`'s `humanize_*`
+/// parameter values. The track-side params describe the *shape*;
+/// the player must obey its mode-side gate.
 #[test]
 fn humanise_disabled_is_cycle_exact() {
     use xmrs::core::fixed::fixed::Q15;

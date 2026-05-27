@@ -21,7 +21,9 @@ use xmrs::prelude::*;
 use crate::audio_observer::{ChannelsContext, ChannelsObserver, MixContext, MixObserver};
 use crate::humanize::HumanizeMode;
 use crate::midi_observer::MidiObserver;
-use crate::observer::{PatternChangeContext, PlayerObserver, RowContext, TickContext};
+use crate::observer::{
+    ObserverList, PatternChangeContext, PlayerObserver, RowContext, TickContext,
+};
 use crate::sequencer::{Sequencer, TickOutcome};
 use crate::voices::{Voices, DEFAULT_VOICE_POOL_CAPACITY};
 
@@ -34,23 +36,23 @@ pub struct XmrsPlayer<'a> {
     sequencer: Sequencer<'a>,
     voices: Voices<'a>,
 
-    observers: Vec<Box<dyn PlayerObserver + Send>>,
+    observers: ObserverList<dyn PlayerObserver + Send>,
 
     /// Audio observers subscribed to the final (post-sum, pre-gain) stereo
     /// mix. Called once per produced sample.
-    audio_mix_observers: Vec<Box<dyn MixObserver + Send>>,
+    audio_mix_observers: ObserverList<dyn MixObserver + Send>,
 
     /// Audio observers subscribed to the per-channel pre-sum slice. Called
     /// once per produced sample, but only if at least one is registered —
     /// the capture path in `Voices::mix` is gated on this list being
     /// non-empty to avoid paying the per-channel write cost otherwise.
-    audio_channels_observers: Vec<Box<dyn ChannelsObserver + Send>>,
+    audio_channels_observers: ObserverList<dyn ChannelsObserver + Send>,
 
     /// MIDI observers subscribed to MIDI events emitted by the macro
     /// interpreter. Called per-event during `process_row` dispatch.
     /// Per-row frequency is very low (at most a handful of macros
     /// per row); no hot-path gating needed.
-    midi_observers: Vec<Box<dyn MidiObserver + Send>>,
+    midi_observers: ObserverList<dyn MidiObserver + Send>,
 
     /// Scratch buffer that `Voices::mix` fills when the channels-observer
     /// list is non-empty. Pre-allocated to `num_channels` at construction
@@ -92,7 +94,7 @@ pub struct XmrsPlayer<'a> {
     /// `on_song_end` must fire at most once per song-termination event.
     song_end_notified: bool,
 
-    /// Humanisation mode for `InstrumentType::Euclidean` pulses.
+    /// Humanisation mode for `Track::Euclidean` pulses.
     /// Default [`crate::humanize::HumanizeMode::Disabled`] preserves cycle-exact
     /// strict playback.
     humanize_mode: HumanizeMode,
@@ -111,15 +113,13 @@ impl<'a> XmrsPlayer<'a> {
     /// `Bx` advancing the vibrato; IT's persistent tremor state,
     /// pan-reset policy, and tick-zero vibrato; the per-format
     /// `Sample.volume` semantics; and so on — is driven by
-    /// individual flags on `module.profile.quirks`
-    /// ([`xmrs::core::module::PlaybackQuirks`]). The
-    /// `module.profile.format` field is metadata only (display,
-    /// export, editor UI). Importers populate the quirks via
-    /// `CompatibilityProfile::ft2()` / `it214()` / `pt()` /
-    /// `st3()` / `modern()`, which preset coherent quirk
-    /// bundles per format; an editor or modern authored module
-    /// can compose the quirks freely without lying about the
-    /// format tag.
+    /// individual flags on `module.quirks`
+    /// ([`xmrs::core::compatibility::PlaybackQuirks`]). The
+    /// `module.origin` field is metadata only (display, export,
+    /// editor UI). Importers populate the quirks via the presets
+    /// in `xmrs::tracker::profiles` (`ft2`, `it214`, `it215`,
+    /// `st3`, `pt`); an editor-authored module can compose the
+    /// quirks freely without lying about the source format.
     pub fn new(module: &'a Module, sample_rate: u32, song: usize) -> Self {
         Self::new_with_voice_pool_capacity(module, sample_rate, song, DEFAULT_VOICE_POOL_CAPACITY)
     }
@@ -160,10 +160,10 @@ impl<'a> XmrsPlayer<'a> {
             last_propagated_tempo: sequencer.tempo(),
             sequencer,
             voices,
-            observers: Vec::new(),
-            audio_mix_observers: Vec::new(),
-            audio_channels_observers: Vec::new(),
-            midi_observers: Vec::new(),
+            observers: ObserverList::new(),
+            audio_mix_observers: ObserverList::new(),
+            audio_channels_observers: ObserverList::new(),
+            midi_observers: ObserverList::new(),
             per_channel_buffer: vec![(0, 0); num_channels],
             remaining_samples_in_tick: 0,
             sample_rate_hz: sample_rate,
@@ -186,7 +186,7 @@ impl<'a> XmrsPlayer<'a> {
     /// callback thread — which requires every owned field to cross thread
     /// boundaries. See the `PlayerObserver` trait docs for details.
     pub fn add_observer(&mut self, observer: Box<dyn PlayerObserver + Send>) {
-        self.observers.push(observer);
+        self.observers.add(observer);
     }
 
     /// Remove every registered observer. Does not affect the built-in voices
@@ -199,7 +199,7 @@ impl<'a> XmrsPlayer<'a> {
     /// Number of currently registered observers (excluding the built-in
     /// voices engine).
     pub fn observer_count(&self) -> usize {
-        self.observers.len()
+        self.observers.count()
     }
 
     // --- Audio observer registration ---
@@ -207,7 +207,7 @@ impl<'a> XmrsPlayer<'a> {
     /// Register an observer on the final stereo mix (pre-gain). Called once
     /// per produced sample. See [`MixObserver`] for the contract.
     pub fn add_audio_mix_observer(&mut self, observer: Box<dyn MixObserver + Send>) {
-        self.audio_mix_observers.push(observer);
+        self.audio_mix_observers.add(observer);
     }
 
     /// Remove every registered mix observer.
@@ -217,7 +217,7 @@ impl<'a> XmrsPlayer<'a> {
 
     /// Number of currently registered mix observers.
     pub fn audio_mix_observer_count(&self) -> usize {
-        self.audio_mix_observers.len()
+        self.audio_mix_observers.count()
     }
 
     /// Register an observer on the per-channel pre-sum slice. Called once
@@ -226,7 +226,7 @@ impl<'a> XmrsPlayer<'a> {
     /// [`MixObserver`](Self::add_audio_mix_observer) if you only need the
     /// summed mix. See [`ChannelsObserver`] for the contract.
     pub fn add_audio_channels_observer(&mut self, observer: Box<dyn ChannelsObserver + Send>) {
-        self.audio_channels_observers.push(observer);
+        self.audio_channels_observers.add(observer);
     }
 
     /// Remove every registered channels observer.
@@ -236,7 +236,7 @@ impl<'a> XmrsPlayer<'a> {
 
     /// Number of currently registered channels observers.
     pub fn audio_channels_observer_count(&self) -> usize {
-        self.audio_channels_observers.len()
+        self.audio_channels_observers.count()
     }
 
     // --- MIDI observer registration ---
@@ -250,7 +250,7 @@ impl<'a> XmrsPlayer<'a> {
     /// observer on a non-IT module or an IT module without macros
     /// costs nothing at runtime — the buffer stays empty.
     pub fn add_midi_observer(&mut self, observer: Box<dyn MidiObserver + Send>) {
-        self.midi_observers.push(observer);
+        self.midi_observers.add(observer);
     }
 
     /// Remove every registered MIDI observer.
@@ -260,7 +260,7 @@ impl<'a> XmrsPlayer<'a> {
 
     /// Number of currently registered MIDI observers.
     pub fn midi_observer_count(&self) -> usize {
-        self.midi_observers.len()
+        self.midi_observers.count()
     }
 
     // --- Mute helpers (delegated to voices) ---
@@ -279,7 +279,7 @@ impl<'a> XmrsPlayer<'a> {
         self.sequencer.set_max_loop_count(max_loop_count);
     }
 
-    /// Configure how `InstrumentType::Euclidean` pulses are
+    /// Configure how `Track::Euclidean` pulses are
     /// humanized at playback. Default is [`crate::humanize::HumanizeMode::Disabled`]
     /// — cycle-exact strict.
     pub fn set_humanize_mode(&mut self, mode: HumanizeMode) {
@@ -307,14 +307,6 @@ impl<'a> XmrsPlayer<'a> {
     /// Output sample-rate in Hz.
     pub fn get_sample_rate(&self) -> u32 {
         self.sample_rate_hz
-    }
-
-    /// Alias of [`Self::get_sample_rate`] returning the typed
-    /// `SampleRate` newtype. Kept for the older `_q` naming
-    /// convention.
-    #[doc(hidden)]
-    pub fn get_sample_rate_q(&self) -> xmrs::core::fixed::units::SampleRate {
-        xmrs::core::fixed::units::SampleRate::from_hz(self.sample_rate_hz)
     }
 
     pub fn get_tempo(&self) -> usize {
@@ -373,11 +365,6 @@ impl<'a> XmrsPlayer<'a> {
     pub fn set_global_volume(&mut self, v: xmrs::core::fixed::units::Volume) {
         self.voices.set_global_volume(v);
     }
-    /// Alias kept for the older `_q` naming convention.
-    #[doc(hidden)]
-    pub fn set_global_volume_q(&mut self, v: xmrs::core::fixed::units::Volume) {
-        self.voices.set_global_volume(v);
-    }
 
     /// Q4.12 user-driven amplification (up to 8×).
     pub fn amplification(&self) -> xmrs::core::fixed::units::Amplification {
@@ -385,11 +372,6 @@ impl<'a> XmrsPlayer<'a> {
     }
     /// Set user-driven amplification.
     pub fn set_amplification(&mut self, a: xmrs::core::fixed::units::Amplification) {
-        self.voices.set_amplification(a);
-    }
-    /// Alias kept for the older `_q` naming convention.
-    #[doc(hidden)]
-    pub fn set_amplification_q(&mut self, a: xmrs::core::fixed::units::Amplification) {
         self.voices.set_amplification(a);
     }
 
@@ -417,9 +399,8 @@ impl<'a> XmrsPlayer<'a> {
     /// entry sits at exactly `abs_tick` for the current sub-song.
     ///
     /// Mirrors [`Self::goto`] for voices reset / tick reload /
-    /// song-end clear. DAW migration Phase 3c.2 step — useful
-    /// for editor UIs whose cursor lives in the clip-tick space
-    /// (`Clip.position_tick`).
+    /// song-end clear. Useful for editor UIs whose cursor lives
+    /// in the clip-tick space (`Clip.position_tick`).
     pub fn goto_tick(&mut self, abs_tick: u32) -> bool {
         if !self.sequencer.goto_tick(abs_tick) {
             return false;
@@ -430,66 +411,23 @@ impl<'a> XmrsPlayer<'a> {
         true
     }
 
-    /// Euclidean humanisation scheduler: after the current row's
-    /// triggers have fired, peek at the NEXT row's cells; for each
-    /// channel armed by a prior Euclidean trigger, if the next-row
-    /// cell is a `Play(_)` of the same wrapper, roll humanize and
-    /// schedule a fire-early intent inside the current row's tick
-    /// run.
+    /// Euclidean humanisation scheduler — peek at the NEXT row
+    /// and, for each armed channel, schedule a fire-early intent
+    /// inside the current row's tick run.
+    ///
+    /// After `row_start_tick()`, `playing_pattern`/`playing_row`
+    /// hold the row we just processed; `current_row` points to
+    /// the next row to play *within the same pattern* (the
+    /// sequencer's pending jumps for cross-pattern moves are
+    /// out of scope for this lookahead — pulses that would
+    /// jump patterns just don't humanise).
     fn schedule_humanize_intents(&mut self) {
-        // After row_start_tick(), `playing_pattern`/`playing_row`
-        // hold the row we just processed; `current_row` points to
-        // the next row to play *within the same pattern* (the
-        // sequencer's pending jumps for cross-pattern moves are
-        // out of scope for this lookahead — pulses that would
-        // jump patterns just don't humanize).
-        let song = self.sequencer.current_song();
-        let next_pat = self.sequencer.playing_pattern();
-        let next_row = self.sequencer.current_row();
-        let speed = self.sequencer.tempo();
-        if speed < 2 {
-            // Need at least one non-row-start tick to fire early.
-            return;
-        }
-        let next_cells = self.module.row_at(song, next_pat, next_row);
-        let n_channels = self.voices.num_channels();
-        for ch_idx in 0..n_channels {
-            let humanize = match self.voices.channel_humanize_mut(ch_idx) {
-                Some(h) => h,
-                None => continue,
-            };
-            let front = match humanize.armed_front() {
-                Some(f) => f,
-                None => continue,
-            };
-            // Resolve InstrEkn params on the front wrapper.
-            let (prob, max_adv) = match &self.module.instrument[front].instr_type {
-                InstrumentType::Euclidean(ekn) => {
-                    (ekn.humanize_probability, ekn.humanize_advance_max_ticks)
-                }
-                _ => continue,
-            };
-            // Only humanize a real NoteOn trigger of the same
-            // wrapper. The track-level instrument index travels
-            // alongside the cell since DAW migration Phase 1+2.
-            let (cell, track_instr) = match next_cells.get(ch_idx) {
-                Some(c) => c,
-                None => continue,
-            };
-            if !matches!(cell.event, xmrs::core::cell::CellEvent::NoteOn { .. }) {
-                continue;
-            }
-            if *track_instr != Some(front) {
-                continue;
-            }
-            // Roll humanize. On hit, fire at tick (speed - advance)
-            // inside the current row, clamped to [1, speed-1].
-            if let Some(advance) = humanize.roll(prob, max_adv) {
-                let s = speed as u8;
-                let fire_tick = s.saturating_sub(advance).max(1).min(s.saturating_sub(1));
-                humanize.schedule_fire(fire_tick, cell.clone(), *track_instr);
-            }
-        }
+        self.voices.schedule_humanize_intents(
+            self.sequencer.current_song(),
+            self.sequencer.playing_pattern(),
+            self.sequencer.current_row(),
+            self.sequencer.tempo(),
+        );
     }
 
     // --- Sample generation hot path ---
@@ -504,7 +442,7 @@ impl<'a> XmrsPlayer<'a> {
             match self.sequencer.advance_tick() {
                 TickOutcome::SongEnd => {
                     if !self.song_end_notified {
-                        for obs in &mut self.observers {
+                        for obs in self.observers.iter_mut() {
                             obs.on_song_end();
                         }
                         self.song_end_notified = true;
@@ -515,129 +453,8 @@ impl<'a> XmrsPlayer<'a> {
                     pattern,
                     row,
                     pattern_changed,
-                } => {
-                    // Fetch cells ONCE — voices and every observer share the
-                    // same buffer. Resolved through the DAW timeline.
-                    // Each entry is `(Cell, Option<usize>)` since
-                    // DAW migration Phase 1+2: the cell + the
-                    // cached Track-level instrument.
-                    let song = self.sequencer.current_song();
-                    let abs_tick = self.sequencer.current_abs_tick();
-                    let cells_vec: Vec<(xmrs::core::cell::Cell, Option<usize>)> =
-                        self.module.row_at(song, pattern, row);
-
-                    // 1. Voices (the built-in row consumer) processes the row.
-                    //    `abs_tick` + `song` are threaded so the Channel layer
-                    //    can resolve its active Clip → Track and query the
-                    //    extracted AutomationLanes for the dual-read
-                    //    validation pass (DAW migration Phase 3c.1 pilot).
-                    self.voices.process_row(&cells_vec, abs_tick, song as u16);
-
-                    // 1b. Drain MIDI events the macro interpreter
-                    //     produced during the row and dispatch to
-                    //     any registered MIDI observers. Done here
-                    //     (not per-tick) because macros only fire
-                    //     at row-start.
-                    if !self.midi_observers.is_empty() {
-                        for (src_ch, event) in self.voices.drain_midi_events() {
-                            for obs in &mut self.midi_observers {
-                                obs.on_midi_event(&event, src_ch);
-                            }
-                        }
-                    } else {
-                        // Still drain so the buffer doesn't grow —
-                        // `process_row` clears at entry too, but an
-                        // unsubscribed drain here keeps the two
-                        // paths consistent.
-                        self.voices.drain_midi_events().for_each(drop);
-                    }
-
-                    // 2. User observers: on_pattern_change first (if
-                    //    applicable), then on_row.
-                    if pattern_changed && !self.observers.is_empty() {
-                        let pc_ctx = PatternChangeContext {
-                            module: self.module,
-                            song: self.sequencer.current_song(),
-                            new_table_index: self.sequencer.current_table_index(),
-                            new_pattern: pattern,
-                        };
-                        for obs in &mut self.observers {
-                            obs.on_pattern_change(&pc_ctx);
-                        }
-                    }
-
-                    if !self.observers.is_empty() {
-                        // Observers consume `&[Cell]` directly —
-                        // they don't need the per-channel track
-                        // instrument that the audio path threads
-                        // through. Materialise a contiguous slice
-                        // by stripping the tuple's second field.
-                        let cells_obs: Vec<xmrs::core::cell::Cell> =
-                            cells_vec.iter().map(|(c, _)| c.clone()).collect();
-                        let ctx = RowContext {
-                            module: self.module,
-                            song: self.sequencer.current_song(),
-                            pattern,
-                            row,
-                            cells: &cells_obs,
-                            tempo: self.sequencer.tempo(),
-                            bpm: self.sequencer.bpm(),
-                        };
-                        for obs in &mut self.observers {
-                            obs.on_row(&ctx);
-                        }
-                    }
-
-                    // Euclidean humanisation lookahead: after
-                    // processing the current row, peek at the next
-                    // row to see whether any armed channel can fire
-                    // its next pulse early.
-                    if self.humanize_mode != HumanizeMode::Disabled {
-                        self.schedule_humanize_intents();
-                    }
-                }
-                TickOutcome::Tick { tick } => {
-                    // Euclidean humanisation early-fire: consume
-                    // any scheduled fire-intents whose tick matches.
-                    if self.humanize_mode != HumanizeMode::Disabled {
-                        let abs_tick = self
-                            .sequencer
-                            .current_abs_tick()
-                            .saturating_add(tick as u32);
-                        let song = self.sequencer.current_song() as u16;
-                        self.voices
-                            .fire_humanize_intents_at(tick as u8, abs_tick, song);
-                    }
-                    // 1. Voices run per-tick effects.
-                    self.voices.process_tick(tick);
-
-                    // 2. Observers that opt in get an on_tick callback.
-                    //    Walk the list twice only when at least one subscribes —
-                    //    a cheap short-circuit when the common case (UI
-                    //    observers on rows only) dominates.
-                    if self.observers.iter().any(|obs| obs.subscribes_to_ticks()) {
-                        let pat = self.sequencer.playing_pattern();
-                        let row = self.sequencer.playing_row();
-                        let song = self.sequencer.current_song();
-                        let cells_vec: Vec<(xmrs::core::cell::Cell, Option<usize>)> =
-                            self.module.row_at(song, pat, row);
-                        let cells_obs: Vec<xmrs::core::cell::Cell> =
-                            cells_vec.iter().map(|(c, _)| c.clone()).collect();
-                        let ctx = TickContext {
-                            module: self.module,
-                            song: self.sequencer.current_song(),
-                            pattern: pat,
-                            row,
-                            tick,
-                            cells: &cells_obs,
-                        };
-                        for obs in &mut self.observers {
-                            if obs.subscribes_to_ticks() {
-                                obs.on_tick(&ctx);
-                            }
-                        }
-                    }
-                }
+                } => self.dispatch_row_start(pattern, row, pattern_changed),
+                TickOutcome::Tick { tick } => self.dispatch_tick(tick),
             }
 
             // Propagate tempo change to voices if any global effect (or the
@@ -648,21 +465,7 @@ impl<'a> XmrsPlayer<'a> {
                 self.last_propagated_tempo = cur_tempo;
             }
 
-            // FT2 manual: number of ticks / second = BPM × 0.4 =
-            //   BPM × 2 / 5. So samples_per_tick = sample_rate ×
-            //   5 / (BPM × 2). In Q.16 raw:
-            //     samples_per_tick_q16 =
-            //         (sample_rate × 5 << 16) / (bpm × 2)
-            //       = (sample_rate << 15) × 5 / bpm
-            // Worst case at 192 kHz / 1 BPM: ~3 × 10^10, fits u64.
-            //
-            // BPM is clamped to ≥ 1 to avoid divide-by-zero on
-            // pathological modules. The OLD f32 path silently
-            // returned `inf` and stalled the clock; the integer
-            // path keeps stepping by holding the previous tick
-            // duration.
-            let bpm = self.sequencer.bpm().max(1) as u64;
-            let samples_per_tick_q16: u64 = ((self.sample_rate_hz as u64) << 15) * 5 / bpm;
+            let samples_per_tick_q16 = self.sequencer.samples_per_tick_q16(self.sample_rate_hz);
             self.remaining_samples_in_tick = self
                 .remaining_samples_in_tick
                 .saturating_add(samples_per_tick_q16 as i64);
@@ -670,6 +473,127 @@ impl<'a> XmrsPlayer<'a> {
         // Decrement by one whole sample (= 1.0 in Q.16).
         self.remaining_samples_in_tick -= 1 << 16;
         true
+    }
+
+    /// Dispatch the row-start work: voices process the row, MIDI
+    /// events drain to observers, then `on_pattern_change` / `on_row`
+    /// fire and Euclidean lookahead schedules early fires.
+    fn dispatch_row_start(&mut self, pattern: usize, row: usize, pattern_changed: bool) {
+        // Fetch cells ONCE — voices and every observer share the
+        // same buffer. Resolved through the DAW timeline.
+        // Each entry is `(Cell, Option<usize>)` — the cell plus
+        // the cached Track-level instrument.
+        let song = self.sequencer.current_song();
+        let abs_tick = self.sequencer.current_abs_tick();
+        let cells_vec: Vec<(xmrs::core::cell::Cell, Option<usize>)> =
+            self.module.row_at(song, pattern, row);
+
+        // 1. Voices (the built-in row consumer) processes the row.
+        //    `abs_tick` + `song` are threaded so the Channel layer
+        //    can resolve its active Clip → Track and read the
+        //    extracted AutomationLanes.
+        self.voices.process_row(&cells_vec, abs_tick, song as u16);
+
+        // 1b. Dispatch any MIDI events the macro interpreter
+        //     produced during the row. Done here (not per-tick)
+        //     because macros only fire at row-start. The buffer
+        //     is cleared at the next `process_row`, so we skip
+        //     the drain entirely when no one is listening.
+        if !self.midi_observers.is_empty() {
+            for (src_ch, event) in self.voices.drain_midi_events() {
+                for obs in self.midi_observers.iter_mut() {
+                    obs.on_midi_event(&event, src_ch);
+                }
+            }
+        }
+
+        // 2. User observers: on_pattern_change first (if
+        //    applicable), then on_row.
+        if pattern_changed && !self.observers.is_empty() {
+            let pc_ctx = PatternChangeContext {
+                module: self.module,
+                song,
+                new_table_index: self.sequencer.current_table_index(),
+                new_pattern: pattern,
+            };
+            for obs in self.observers.iter_mut() {
+                obs.on_pattern_change(&pc_ctx);
+            }
+        }
+
+        if !self.observers.is_empty() {
+            // Observers consume `&[Cell]` directly — they don't
+            // need the per-channel track instrument that the
+            // audio path threads through. Materialise a
+            // contiguous slice by stripping the tuple's second
+            // field.
+            let cells_obs: Vec<xmrs::core::cell::Cell> =
+                cells_vec.iter().map(|(c, _)| c.clone()).collect();
+            let ctx = RowContext {
+                module: self.module,
+                song,
+                pattern,
+                row,
+                cells: &cells_obs,
+                tempo: self.sequencer.tempo(),
+                bpm: self.sequencer.bpm(),
+            };
+            for obs in self.observers.iter_mut() {
+                obs.on_row(&ctx);
+            }
+        }
+
+        // Euclidean humanisation lookahead: after processing the
+        // current row, peek at the next row to see whether any
+        // armed channel can fire its next pulse early.
+        if self.humanize_mode != HumanizeMode::Disabled {
+            self.schedule_humanize_intents();
+        }
+    }
+
+    /// Dispatch the per-tick work: Euclidean early-fire, voices
+    /// per-tick effects, then `on_tick` for subscribing observers.
+    fn dispatch_tick(&mut self, tick: usize) {
+        // Euclidean humanisation early-fire: consume any
+        // scheduled fire-intents whose tick matches.
+        if self.humanize_mode != HumanizeMode::Disabled {
+            let abs_tick = self
+                .sequencer
+                .current_abs_tick()
+                .saturating_add(tick as u32);
+            let song = self.sequencer.current_song() as u16;
+            self.voices
+                .fire_humanize_intents_at(tick as u8, abs_tick, song);
+        }
+        // 1. Voices run per-tick effects.
+        self.voices.process_tick(tick);
+
+        // 2. Observers that opt in get an on_tick callback. Walk
+        //    the list twice only when at least one subscribes —
+        //    a cheap short-circuit when the common case (UI
+        //    observers on rows only) dominates.
+        if self.observers.iter().any(|obs| obs.subscribes_to_ticks()) {
+            let pat = self.sequencer.playing_pattern();
+            let row = self.sequencer.playing_row();
+            let song = self.sequencer.current_song();
+            let cells_vec: Vec<(xmrs::core::cell::Cell, Option<usize>)> =
+                self.module.row_at(song, pat, row);
+            let cells_obs: Vec<xmrs::core::cell::Cell> =
+                cells_vec.iter().map(|(c, _)| c.clone()).collect();
+            let ctx = TickContext {
+                module: self.module,
+                song,
+                pattern: pat,
+                row,
+                tick,
+                cells: &cells_obs,
+            };
+            for obs in self.observers.iter_mut() {
+                if obs.subscribes_to_ticks() {
+                    obs.on_tick(&ctx);
+                }
+            }
+        }
     }
 
     /// Returns samples from each channel before applying global volume and
@@ -716,32 +640,9 @@ impl<'a> XmrsPlayer<'a> {
     /// Apply `global_volume * amplification` to a per-channel
     /// sample set and fold to a single stereo pair. Intended to
     /// be paired with [`samples_from_channels`](Self::samples_from_channels).
-    /// Pure integer Q-format — `Volume` (Q1.15) and `Amplification`
-    /// (Q4.12) compose to Q5.27 then narrow back to `i16`.
     pub fn samples_apply_volume(&self, samples: &[(i16, i16)]) -> (i16, i16) {
-        let gv = self.voices.global_volume().as_q15_i32(); // Q1.15
-        let amp = self.voices.amplification().as_q4_12_i32(); // Q4.12
         let (l, r) = self.samples_to_sample(samples);
-        // sample × gv × amp: Q1.15 × Q4.12 → Q5.27, narrow with
-        // round-half bias before clamp to i16.
-        let scale_q27 = gv as i64 * amp as i64;
-        let l64 = (l as i64).wrapping_mul(scale_q27);
-        let r64 = (r as i64).wrapping_mul(scale_q27);
-        let bias = 1i64 << 26;
-        let li = if l64 >= 0 {
-            (l64 + bias) >> 27
-        } else {
-            -(((-l64) + bias) >> 27)
-        };
-        let ri = if r64 >= 0 {
-            (r64 + bias) >> 27
-        } else {
-            -(((-r64) + bias) >> 27)
-        };
-        (
-            li.clamp(i16::MIN as i64, i16::MAX as i64) as i16,
-            ri.clamp(i16::MIN as i64, i16::MAX as i64) as i16,
-        )
+        self.voices.apply_final_gain((l as i32, r as i32))
     }
 
     /// Return the sum of the samples from all channels,
@@ -794,8 +695,8 @@ impl<'a> XmrsPlayer<'a> {
     /// Dispatch audio observers for a real (non-paused) sample.
     /// Channels observers first, then mix observers.
     fn notify_audio_observers(&mut self, mix: (i16, i16)) {
-        let global_volume = self.voices.global_volume_q();
-        let amplification = self.voices.amplification_q();
+        let global_volume = self.voices.global_volume();
+        let amplification = self.voices.amplification();
 
         if !self.audio_channels_observers.is_empty() {
             let channels: &[(i16, i16)] = self.per_channel_buffer.as_slice();
@@ -804,7 +705,7 @@ impl<'a> XmrsPlayer<'a> {
                 global_volume,
                 amplification,
             };
-            for obs in &mut self.audio_channels_observers {
+            for obs in self.audio_channels_observers.iter_mut() {
                 obs.on_channels(&ctx);
             }
         }
@@ -816,7 +717,7 @@ impl<'a> XmrsPlayer<'a> {
                 global_volume,
                 amplification,
             };
-            for obs in &mut self.audio_mix_observers {
+            for obs in self.audio_mix_observers.iter_mut() {
                 obs.on_mix(&ctx);
             }
         }
@@ -825,35 +726,12 @@ impl<'a> XmrsPlayer<'a> {
     /// Same as `notify_audio_observers` but for the paused path:
     /// every per-channel entry is zero, and the mix is zero.
     fn notify_audio_observers_paused(&mut self) {
-        let global_volume = self.voices.global_volume_q();
-        let amplification = self.voices.amplification_q();
-
         if !self.audio_channels_observers.is_empty() {
             for entry in self.per_channel_buffer.iter_mut() {
                 *entry = (0, 0);
             }
-            let channels: &[(i16, i16)] = self.per_channel_buffer.as_slice();
-            let ctx = ChannelsContext {
-                channels,
-                global_volume,
-                amplification,
-            };
-            for obs in &mut self.audio_channels_observers {
-                obs.on_channels(&ctx);
-            }
         }
-
-        if !self.audio_mix_observers.is_empty() {
-            let ctx = MixContext {
-                left: 0,
-                right: 0,
-                global_volume,
-                amplification,
-            };
-            for obs in &mut self.audio_mix_observers {
-                obs.on_mix(&ctx);
-            }
-        }
+        self.notify_audio_observers((0, 0));
     }
 
     /// Returns samples one after the other, starting with the

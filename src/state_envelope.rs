@@ -28,8 +28,12 @@ impl<'a> StateEnvelope<'a> {
         }
     }
 
+    /// `true` when the volume envelope is currently active. Tracks
+    /// the runtime [`Self::enabled`] flag, which the
+    /// `InstrumentVolumeEnvelope` effect can toggle independently
+    /// from the imported `env.enabled`.
     pub fn has_volume_envelope(&self) -> bool {
-        self.env.enabled || self.enabled
+        self.enabled
     }
 
     /// `true` when the envelope's counter has walked past the last

@@ -55,19 +55,6 @@ impl EffectVibratoTremolo {
         // `self.pos` intentionally preserved.
     }
 
-    /// Latches `(speed, depth)` and resets the LFO phase.
-    /// Public for downstream consumers; the in-tree
-    /// `Channel::arm_lfos_from_lanes` writes the params and
-    /// calls `retrigger_q` directly (DAW migration Phase 3c.1
-    /// substitution), so this helper is currently unused.
-    #[inline]
-    #[allow(dead_code)]
-    pub fn tick0_q(&mut self, speed: Q8_8, depth: i16) -> i16 {
-        self.data.speed = speed;
-        self.data.depth = depth;
-        self.retrigger_q()
-    }
-
     /// Reset phase + output. Returns the new raw output (always 0).
     #[inline]
     pub fn retrigger_q(&mut self) -> i16 {
