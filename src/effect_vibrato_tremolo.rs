@@ -1,5 +1,4 @@
 use xmrs::core::fixed::fixed::{Q15, Q8_8};
-use xmrs::core::fixed::units::PitchDelta;
 use xmrs::{core::waveform::WaveformState, prelude::Waveform};
 
 /// LFO parameter pack. `speed` is the phase increment per tick
@@ -100,11 +99,18 @@ impl EffectVibratoTremolo {
         Q15::from_raw(self.value)
     }
 
-    /// Current LFO output as [`PitchDelta`] (semitones, Q8.8).
-    /// Used by Vibrato.
+    /// Current raw LFO output (same Q-format as `data.depth`).
+    ///
+    /// Vibrato consumes this two ways depending on the module's
+    /// frequency mode (see `StateInstrDefault::update_frequency`):
+    /// * **Linear** — reinterpreted as Q8.8 semitones (identical to
+    ///   [`Self::value_pitch_delta`]), folded into the pitch delta.
+    /// * **Amiga** — a direct Paula-period delta added to the period
+    ///   (FT2/Protracker `outPeriod = realPeriod ± tmpVib`); the lane
+    ///   depth is then stored in period units, not semitones.
     #[inline]
-    pub fn value_pitch_delta(&self) -> PitchDelta {
-        PitchDelta::from_q8_8_i16(self.value)
+    pub fn value_raw(&self) -> i16 {
+        self.value
     }
 
     /// Whether the LFO has been triggered and not yet stopped

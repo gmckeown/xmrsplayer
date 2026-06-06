@@ -201,9 +201,14 @@ impl<'a> Voice<'a> {
         // voice, not to detached ghosts — those stop at detachment.
         // Pitch envelope is folded in by `update_frequency` itself
         // via `get_pitch_envelope_offset_semitones`.
-        self.instr.update_frequency(
+        //
+        // The returned effective period is only consumed by a live
+        // `Channel`'s snapshot; a detached ghost has no snapshot of its
+        // own, so discard it here.
+        let _ = self.instr.update_frequency(
             self.period_at_fork,
             PitchDelta::ZERO,
+            0i16,
             PitchDelta::ZERO,
             false,
         );

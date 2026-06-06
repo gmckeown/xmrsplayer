@@ -105,6 +105,20 @@ pub struct Sequencer<'a> {
     /// next row-start to the entry already stored in `timeline_idx`,
     /// bypassing the linear advance. Consumed once.
     restart_row: bool,
+
+    /// How many times the current song's timeline has wrapped under
+    /// **per-lane free-run** (see [`Self::current_abs_tick_monotonic`]).
+    /// Only ever non-zero when the current song carries
+    /// [`xmrs::core::module::Module::channel_loops`]: those songs never
+    /// wrap as a whole — each voice loops its own region — so the
+    /// timeline is replayed and this counts the replays, giving a
+    /// monotonic playhead tick that lets each lane keep drifting. `0`
+    /// for every tracker song.
+    loop_generation: u32,
+    /// Tick span of one full pass of the current song's timeline
+    /// (last row's tick + its duration). The stride added per
+    /// `loop_generation`. Cached at construction.
+    song_tick_span: u32,
 }
 
 impl<'a> Sequencer<'a> {
@@ -124,6 +138,18 @@ impl<'a> Sequencer<'a> {
         let current_song = if song < num_songs.max(1) { song } else { 0 };
         let num_channels = module.get_num_channels();
         let song_len = module.song_length(current_song);
+        // Tick span of one full timeline pass for this song: the last
+        // row's tick plus its own duration (so the next pass's row 0
+        // sits exactly `span` ticks ahead). Used only by per-lane
+        // free-run; `0` is harmless for songs that never free-run.
+        let song_tick_span = module
+            .timeline_map
+            .entries
+            .iter()
+            .filter(|e| e.song as usize == current_song)
+            .map(|e| e.tick + e.speed_at_row as u32)
+            .max()
+            .unwrap_or(0);
 
         Self {
             module,
@@ -152,6 +178,8 @@ impl<'a> Sequencer<'a> {
             timeline_idx: 0,
             started: false,
             restart_row: false,
+            loop_generation: 0,
+            song_tick_span,
         }
     }
 
@@ -235,6 +263,20 @@ impl<'a> Sequencer<'a> {
             .unwrap_or(0)
     }
 
+    /// Like [`Self::current_abs_tick`] but **monotonic across timeline
+    /// wraps** under per-lane free-run: `loop_generation * span +
+    /// entry.tick`. For a song with no [`xmrs::core::module::Module::channel_loops`]
+    /// `loop_generation` stays `0`, so this equals `current_abs_tick`
+    /// — every tracker format is unaffected. The per-lane fold in
+    /// [`xmrs::core::module::Module::row_at_with_playhead`] and the
+    /// channel layer use this so each voice keeps drifting instead of
+    /// snapping back to 0 when the timeline replays.
+    pub fn current_abs_tick_monotonic(&self) -> u32 {
+        self.loop_generation
+            .saturating_mul(self.song_tick_span)
+            .saturating_add(self.current_abs_tick())
+    }
+
     // --- Cursor manipulation ---
 
     /// Jump to `(table_position, row)` at `speed`; if `speed == 0`, reset to
@@ -297,6 +339,9 @@ impl<'a> Sequencer<'a> {
         // Force the next advance_tick to be treated as a row-start tick.
         self.current_tick = 0;
         self.song_end_requested = false;
+        // Seeking resets the free-run replay count: the monotonic
+        // playhead is re-anchored at the sought position.
+        self.loop_generation = 0;
 
         true
     }
@@ -334,6 +379,7 @@ impl<'a> Sequencer<'a> {
 
         self.current_tick = 0;
         self.song_end_requested = false;
+        self.loop_generation = 0;
         true
     }
 
@@ -470,6 +516,22 @@ impl<'a> Sequencer<'a> {
             if e.song == song_u16 {
                 return Some(next);
             }
+        }
+        // Per-lane free-run: a song carrying `channel_loops` never wraps
+        // as a whole — each voice loops its own region independently and
+        // they drift forever (Whittaker-style). Replay the timeline from
+        // the song's first entry and bump `loop_generation` so the
+        // monotonic playhead keeps advancing; the per-lane fold then
+        // keeps every voice continuous across the replay (no global
+        // snap-back). Takes precedence over `song_loop_to`.
+        if self
+            .module
+            .channel_loops
+            .iter()
+            .any(|l| l.song == song_u16)
+        {
+            self.loop_generation = self.loop_generation.saturating_add(1);
+            return self.first_entry_of_current_song();
         }
         // End-of-song wrap.
         if let Some(loop_tick) = self.module.song_loop_to {
@@ -721,5 +783,93 @@ mod timeline_idx_tests {
             alloc::vec![0, 1, 0, 1, 0],
             "no song_loop_to → wrap to first entry of song"
         );
+    }
+
+    /// Per-lane free-run: a song carrying `channel_loops` replays its
+    /// timeline (no global wrap) while `current_abs_tick_monotonic`
+    /// keeps rising — so each voice's fold keeps drifting. A song
+    /// WITHOUT `channel_loops` leaves the monotonic tick equal to the
+    /// plain one (tracker non-regression).
+    #[test]
+    fn free_run_keeps_monotonic_tick_rising() {
+        use xmrs::core::daw::clip::Clip;
+        use xmrs::core::daw::loop_region::ChannelLoop;
+        use xmrs::core::daw::sorted_clips::SortedClips;
+        use xmrs::core::daw::timeline::{TimelineEntry, TimelineMap};
+        use xmrs::core::daw::track::Track;
+
+        // 4 rows, speed 3 → ticks 0/3/6/9, span = 9 + 3 = 12.
+        let build = |with_loop: bool| -> Module {
+            let mut m = Module::default();
+            m.tracks.push(Track::Notes {
+                name: "t".into(),
+                instrument: 0,
+                rows: alloc::vec![Cell::default(); 4],
+                muted: false,
+            });
+            m.clips = SortedClips::from_unsorted(alloc::vec![Clip {
+                track: 0,
+                song: 0,
+                target_channel: 0,
+                position_tick: 0,
+                speed_at_start: 3,
+                track_row_offset: 0,
+                source_start_row: 0,
+                end_tick: 12,
+            }]);
+            let mut entries = alloc::vec::Vec::new();
+            for r in 0..4u32 {
+                entries.push(TimelineEntry {
+                    song: 0,
+                    order_idx: 0,
+                    pattern_idx: 0,
+                    row_idx: r,
+                    loop_iter: 0,
+                    tick: r * 3,
+                    speed_at_row: 3,
+                    bpm_at_row: 125,
+                });
+            }
+            m.timeline_map = TimelineMap { entries };
+            if with_loop {
+                m.channel_loops.push(ChannelLoop {
+                    song: 0,
+                    channel: 0,
+                    start_tick: 0,
+                    end_tick: 12,
+                });
+            }
+            m
+        };
+
+        let collect = |m: &Module| -> alloc::vec::Vec<(u32, u32)> {
+            let mut seq = Sequencer::new(m, 0);
+            let mut ticks = alloc::vec::Vec::new();
+            for _ in 0..400 {
+                if let TickOutcome::RowStart { .. } = seq.advance_tick() {
+                    ticks.push((seq.current_abs_tick(), seq.current_abs_tick_monotonic()));
+                    if ticks.len() >= 8 {
+                        break;
+                    }
+                }
+            }
+            ticks
+        };
+
+        // Looping song: plain tick resets each pass (0,3,6,9,0,3,6,9),
+        // monotonic keeps rising (0,3,6,9,12,15,18,21) — no global snap.
+        let looped = collect(&build(true));
+        assert_eq!(
+            looped.iter().map(|&(_, mono)| mono).collect::<alloc::vec::Vec<_>>(),
+            alloc::vec![0, 3, 6, 9, 12, 15, 18, 21],
+            "free-run monotonic tick must keep rising across the timeline replay"
+        );
+        assert_eq!(looped[4].0, 0, "plain tick still resets to 0 at the replay");
+
+        // Tracker song (no channel_loops): monotonic == plain everywhere.
+        let plain = collect(&build(false));
+        for (i, &(plain_t, mono_t)) in plain.iter().enumerate() {
+            assert_eq!(plain_t, mono_t, "row {i}: no free-run → monotonic == plain");
+        }
     }
 }

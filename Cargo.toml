@@ -1,6 +1,6 @@
 [package]
 name = "xmrsplayer"
-version = "0.13.1"
+version = "0.13.2"
 edition = "2021"
 description = "XMrsPlayer is a safe no-std soundtracker music player"
 authors = ["Sebastien Bechet"]
@@ -16,7 +16,7 @@ categories = ["multimedia::audio", "embedded", "no-std"]
 [dependencies]
 # `xmrs` is pulled in without default features; the `std` feature (on by
 # default here) re-enables it below.
-xmrs = { version = "0.13.1", path = "../xmrs", default-features = false }
+xmrs = { version = "0.13.2", path = "../xmrs", default-features = false }
 # `clap` defaults drop the `suggestions` feature (`-Did you mean
 # --foo?` typo correction) — it pulls in `strsim` for fuzzy
 # string match and costs ~12 KB in the final binary while
@@ -75,6 +75,7 @@ import_xm  = ["xmrs/import_xm"]
 import_s3m = ["xmrs/import_s3m"]
 import_it  = ["xmrs/import_it"]
 import_sid = ["xmrs/import_sid"]
+import_dw  = ["xmrs/import_dw"]
 
 [lib]
 name = "xmrsplayer"
@@ -104,3 +105,10 @@ path = "examples/arp_bug.rs"
 name = "inspect_mod"
 path = "examples/inspect_mod.rs"
 required-features = ["demo"]
+
+# DW Tier-2 fidelity: player-side per-tick trace in the Paula-oracle CSV
+# schema, for diffing against xmrs/.../dw/oracle/*.csv → BASELINE.md.
+[[example]]
+name = "dw_oracle_trace"
+path = "examples/dw_oracle_trace.rs"
+required-features = ["std", "import_dw"]

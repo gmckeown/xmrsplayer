@@ -32,6 +32,10 @@ impl<'a> Channel<'a> {
         if let Some(instr) = self.live_mut(pool) {
             if !contains(flags, TRIGGER_KEEP_SAMPLE_POSITION) {
                 instr.sample_reset();
+                // Sample restarted from the head this tick = an audible
+                // re-attack. Exposed via the snapshot's `struck` for the
+                // DW oracle re-strike diff. Cleared at each tick start.
+                self.struck_this_tick = true;
             }
 
             if !contains(flags, TRIGGER_KEEP_ENVELOPE) {
@@ -129,12 +133,17 @@ impl<'a> Channel<'a> {
                     self.effect_tremolo.retrigger_q();
                 }
 
-                instr.update_frequency(
+                let points_pitch = self.track_pitch_points_delta();
+                let eff = instr.update_frequency(
                     self.period,
                     PitchDelta::ZERO,
-                    self.effect_vibrato.value_pitch_delta(),
+                    self.effect_vibrato.value_raw(),
+                    points_pitch,
                     self.effect_semitone,
                 );
+                // Record the played period (post-modulation) for the
+                // snapshot; default to the nominal period if no sample.
+                self.effective_period = eff.unwrap_or(self.period);
             }
         }
 
@@ -238,13 +247,20 @@ impl<'a> Channel<'a> {
             } else {
                 PitchDelta::ZERO
             };
+            let points_pitch = self.track_pitch_points_delta();
 
-            instr.update_frequency(
+            let eff = instr.update_frequency(
                 self.period,
                 arp_pitch,
-                self.effect_vibrato.value_pitch_delta(),
+                self.effect_vibrato.value_raw(),
+                points_pitch,
                 self.effect_semitone,
-            )
+            );
+            // `eff` is an owned `Option<Period>`, so the `instr` borrow
+            // of `self` (via `live_mut`) ends here — record the played
+            // period for the snapshot. Falls back to the nominal period
+            // when no sample is loaded.
+            self.effective_period = eff.unwrap_or(self.period);
         }
     }
 }

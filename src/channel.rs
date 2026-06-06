@@ -99,6 +99,21 @@ pub struct Channel<'a> {
     /// Current sub-song index. Set alongside
     /// [`Self::current_abs_tick`].
     pub(crate) current_song_idx: u16,
+    /// Tick index **within** the current row (`0` = row-start,
+    /// `1..tempo-1` = sustained ticks). [`Self::current_abs_tick`] is
+    /// only the row's start tick, so adding this gives the absolute
+    /// per-frame tick — needed by `TrackPitch` `Points` lanes (the DW
+    /// per-frame arpeggio) whose value changes within a row, unlike the
+    /// row-triggered Lfo/Slide/Glide lanes.
+    pub(crate) current_tick_in_row: usize,
+
+    /// Set `true` for the tick in which this channel restarts its
+    /// sample from the head (`trigger_pitch` → `sample_reset`) — an
+    /// audible re-attack. Cleared at the start of every tick. Mirrors
+    /// the DW Paula oracle's per-channel `struck` (a DMACON 0→1 edge):
+    /// it is the signal that tells a held/tied note from a re-trigger,
+    /// which gate/period/volume alias. Read by [`Self::snapshot`].
+    pub(crate) struck_this_tick: bool,
 
     /// Cached `Track.instrument` for the cell currently held in
     /// [`Self::current`]. Instruments live on the owning Track,
@@ -110,8 +125,25 @@ pub struct Channel<'a> {
     pub(crate) current_track_instrument: Option<usize>,
 
     /// Current period (Q-format). Slides accumulate `i16` deltas
-    /// via `Period::saturating_add_signed`.
+    /// via `Period::saturating_add_signed`. This is the **nominal**
+    /// note period — the base the row/portamento set, *before* the
+    /// per-tick pitch modulators (arpeggio, vibrato LFO, pitch
+    /// envelope, auto-vibrato) are folded in. A "which note is this"
+    /// reader wants this; a "what is Paula actually playing" reader
+    /// wants [`Self::effective_period`].
     period: Period,
+
+    /// The **played** period after every pitch modulation has been
+    /// applied this tick (arpeggio, vibrato, pitch envelope,
+    /// auto-vibrato) — the value that maps 1:1 to Paula's `AUDxPER`.
+    /// Written at the end of every `tickn_update_instr` /
+    /// `trigger_pitch` from [`StateInstrDefault::update_frequency`]'s
+    /// return; falls back to `period` when no voice is live (nothing
+    /// is being modulated). Exposed via [`ChannelSnapshot`] so the DW
+    /// Tier-2 oracle and any scope/VU observer can verify the
+    /// modulated pitch — `period` alone is blind to vibrato/arpeggio,
+    /// which only ever reach the sounding step, never the base.
+    effective_period: Period,
 
     channel_volume: ChannelVolume,
     /// Per-voice running volume, Q1.15 in `[0, 1]`. Was `f32`.
@@ -234,15 +266,18 @@ impl<'a> Channel<'a> {
             current: Cell::default(),
             current_abs_tick: 0,
             current_song_idx: 0,
+            current_tick_in_row: 0,
+            struck_this_tick: false,
             current_track_instrument: None,
             period: Period::ZERO,
+            effective_period: Period::ZERO,
             live: None,
             instr_midi_mute: false,
             effect_arpeggio: EffectArpeggio::new(module.quirks.ft2_arpeggio_lut, tempo),
             effect_note_retrig_backup: NoteRetrigState::default(),
             effect_note_retrig_counter: 0,
-            effect_panbrello: EffectVibratoTremolo::new(Waveform::Sine),
-            effect_tremolo: EffectVibratoTremolo::new(Waveform::Sine),
+            effect_panbrello: EffectVibratoTremolo::new(Waveform::BipolarSine),
+            effect_tremolo: EffectVibratoTremolo::new(Waveform::BipolarSine),
             effect_tremor: false,
             effect_tremor_on: 0,
             effect_tremor_off: 0,
@@ -256,7 +291,7 @@ impl<'a> Channel<'a> {
             // initial `atremor = 0` (not > 0, so toggle branch).
             effect_tremor_counter_s3m: -1,
             effect_tremor_silent_s3m: true,
-            effect_vibrato: EffectVibratoTremolo::new(Waveform::Sine),
+            effect_vibrato: EffectVibratoTremolo::new(Waveform::BipolarSine),
             vibrato_retrig_on_new_note: true,
             tremolo_retrig_on_new_note: true,
             effect_tone_portamento_goal: Period::ZERO,
@@ -345,4 +380,83 @@ impl<'a> Channel<'a> {
     pub fn is_muted(&self) -> bool {
         self.muted || self.instr_midi_mute
     }
+
+    /// Read-only snapshot of this channel's realized runtime state —
+    /// the *played* period, volume and gate, as opposed to the score
+    /// (`Cell`) the observer already sees. Surfaced to observers via
+    /// [`crate::observer::RowContext`] / [`crate::observer::TickContext`]
+    /// so oscilloscopes (frequency ← period), VU-meters (volume) and
+    /// channel-activity indicators (gate) can read the engine state
+    /// directly, and used by the DW Tier-2 oracle diff.
+    ///
+    /// Units are chosen to be 1:1 with Amiga Paula registers:
+    /// * `period` — nominal note period word (the un-modulated base).
+    /// * `effective_period` — the **played** period (= `AUDxPER`),
+    ///   after arpeggio / vibrato / pitch envelope / auto-vibrato.
+    /// * `volume` — `0..=64`, Paula's `AUDxVOL` scale (`Volume::to_byte_64`).
+    /// * `gate` — a live voice is allocated, i.e. the channel is
+    ///   producing sound (≈ Paula's per-channel DMA enable bit).
+    pub fn snapshot(&self) -> ChannelSnapshot {
+        // Report the **realized output** volume (= Paula `AUDxVOL`),
+        // not the bare channel `self.volume`. The two diverge once an
+        // instrument **volume envelope** shapes the level (the DW
+        // jump-table family bakes its per-tick volume envelope there):
+        // `self.volume` then stays full-scale while the envelope scales
+        // `get_volume()`. The pre-pan output volume `volume_q` is
+        // recoverable from the post-pan pair, since the pan split is
+        // linear (`pan_left + pan_right = 1`): `volume_q = actual[0] +
+        // actual[1]`. For every module without an instrument volume
+        // envelope `get_volume()` is unity, so this equals the old
+        // `self.volume` exactly (no change to the existing corpus).
+        let out = (self.actual_volume[0].to_byte_64() as u16
+            + self.actual_volume[1].to_byte_64() as u16)
+            .min(64) as u8;
+        // `effective_period` carries the per-tick pitch modulation
+        // (vibrato/arpeggio/pitch-env), which never reaches the bare
+        // `self.period`. When no voice is live it was never written
+        // this tick, so fall back to the nominal `period`.
+        let eff = if self.live.is_some() {
+            self.effective_period.raw()
+        } else {
+            self.period.raw()
+        };
+        ChannelSnapshot {
+            period: self.period.raw(),
+            effective_period: eff,
+            volume: out,
+            gate: self.live.is_some(),
+            struck: self.struck_this_tick,
+        }
+    }
+}
+
+/// One channel's realized runtime state, in Amiga Paula-register units.
+/// See [`Channel::snapshot`]. Delivered per-tick to observers through
+/// [`crate::observer::RowContext::channels`] /
+/// [`crate::observer::TickContext::channels`].
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub struct ChannelSnapshot {
+    /// Nominal note period word — the base set by the row /
+    /// portamento, **before** per-tick pitch modulation. Stable
+    /// across a held note; a "which note" reader (piano-roll cursor,
+    /// note-name display) wants this. For the actually-sounding pitch
+    /// use [`Self::effective_period`].
+    pub period: u16,
+    /// The **played** period word (= Amiga `AUDxPER`; sounding
+    /// frequency is `clock / effective_period`), after arpeggio,
+    /// vibrato LFO, pitch envelope and instrument auto-vibrato have
+    /// been folded in. Equals [`Self::period`] on a channel with no
+    /// active pitch modulation. This is the value to diff against a
+    /// hardware/replayer period trace (e.g. the DW Tier-2 oracle) and
+    /// the one a pitch-accurate scope/VU should read.
+    pub effective_period: u16,
+    /// Volume on Paula's `0..=64` `AUDxVOL` scale.
+    pub volume: u8,
+    /// `true` when a live voice is allocated (≈ DMA enable bit).
+    pub gate: bool,
+    /// `true` for the single tick in which this channel restarted its
+    /// sample from the head (a re-attack). Mirrors the DW Paula oracle's
+    /// per-channel `struck` (DMACON 0→1 edge); diff this to catch
+    /// re-trigger-vs-tie errors that gate/period/volume hide.
+    pub struck: bool,
 }

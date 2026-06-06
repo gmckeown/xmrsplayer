@@ -2,7 +2,7 @@
 //! Slide / Glide application from the DAW timeline.
 
 use xmrs::core::daw::automation::AutomationTarget;
-use xmrs::core::fixed::units::Period;
+use xmrs::core::fixed::units::{Period, PitchDelta};
 use xmrs::core::waveform::WaveformState;
 
 use super::Channel;
@@ -94,6 +94,49 @@ impl<'a> Channel<'a> {
     #[inline]
     fn current_track_idx(&self) -> Option<u32> {
         self.lookup_track_idx(self.current_abs_tick, self.current_song_idx)
+    }
+
+    /// The active **held pitch offset** (semitones) from any
+    /// `LaneKind::Points` lane on the current Track's `TrackPitch`
+    /// target, evaluated at the current tick.
+    ///
+    /// `Points` lanes on `TrackPitch` carry an *absolute, latched*
+    /// transpose ([`AutomationValue::Pitch`]) — as opposed to the
+    /// relative `Lfo` (vibrato) / `Slide` / `Glide` modulations that
+    /// also live on `TrackPitch`. [`AutomationLane::value_at`] holds
+    /// the latest point's value forward, so a transpose set mid-song
+    /// re-pitches even a sustained note every tick — the behaviour a
+    /// per-note instrument pitch-envelope can't give (the curve is on
+    /// the channel/Track timeline, not the note). The DW importer uses
+    /// this for the replayer's global transpose (which it recomputes
+    /// into every channel's base period each frame). Returns `ZERO`
+    /// when no such lane/point exists, so it is a measured no-op for
+    /// tracker formats (XM/IT/MOD never emit `Pitch` points).
+    #[inline]
+    pub(super) fn track_pitch_points_delta(&self) -> PitchDelta {
+        use xmrs::core::daw::automation::AutomationValue;
+        let Some(track_idx) = self.current_track_idx() else {
+            return PitchDelta::ZERO;
+        };
+        // `Points` on `TrackPitch` (the DW per-frame arpeggio) can
+        // change *within* a row, so evaluate at the absolute per-frame
+        // tick = row start + within-row tick. (`current_abs_tick` alone
+        // is the row's start and would freeze the arpeggio to row
+        // resolution.) Other `TrackPitch` lanes are row-triggered and
+        // unaffected — they don't use this helper.
+        let abs_tick = self
+            .current_abs_tick
+            .saturating_add(self.current_tick_in_row as u32);
+        let mut delta = PitchDelta::ZERO;
+        for lane in self
+            .module
+            .lanes_for(AutomationTarget::TrackPitch(track_idx))
+        {
+            if let Some(AutomationValue::Pitch(d)) = lane.value_at(abs_tick) {
+                delta = delta + d;
+            }
+        }
+        delta
     }
 
     /// `true` when an `AutomationLane` of `target` has an
@@ -216,7 +259,15 @@ impl<'a> Channel<'a> {
                 let row_has_depth_only = self
                     .lane_has_lfo_depthonly_at(AutomationTarget::TrackPitch(track_idx), abs_tick);
                 if current_tick == 0 {
-                    if row_has_main
+                    if self.module.quirks.pitch_vibrato_ticks_continuously {
+                        // DW: vibrato advances on every frame of the
+                        // held note, including the row-start frame
+                        // (1 frame = 1 tick). Without the tick-0 step
+                        // the phase would lose one of every `speed`
+                        // frames. Independent of `row_has_main`: once
+                        // armed the LFO keeps running until stopped.
+                        self.effect_vibrato.tick_q();
+                    } else if row_has_main
                         && self.module.quirks.it_vibrato_ticks_at_row_zero
                         && !self.module.quirks.it_old_effects
                     {
@@ -224,6 +275,7 @@ impl<'a> Channel<'a> {
                     }
                 } else if row_has_main
                     || (row_has_depth_only && self.module.quirks.volcol_b_advances_vibrato)
+                    || self.module.quirks.pitch_vibrato_ticks_continuously
                 {
                     self.effect_vibrato.tick_q();
                 }
@@ -326,7 +378,15 @@ impl<'a> Channel<'a> {
             .lanes_for(AutomationTarget::TrackPitch(track_idx))
             .find_map(|l| l.slide_state_at(abs_tick))
         {
-            if state.armed && state.fine == is_tick0 {
+            // A coarse slide (`fine == false`) normally runs on the
+            // `speed-1` non-row ticks. `pitch_slide_ticks_at_row_zero`
+            // (DW) extends it to tick 0 too, so the ramp advances on
+            // every frame of the held note — see the quirk doc.
+            let runs_this_tick = state.fine == is_tick0
+                || (is_tick0
+                    && !state.fine
+                    && self.module.quirks.pitch_slide_ticks_at_row_zero);
+            if state.armed && runs_this_tick {
                 let speed_i16 = state.rate.raw();
                 let new_period = self.period.saturating_add_signed(speed_i16);
                 if self.module.quirks.ft2_pitch_slide_overflow && speed_i16 > 0 {

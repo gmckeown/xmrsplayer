@@ -353,6 +353,18 @@ impl<'a> Channel<'a> {
         song: u16,
         pool: &mut VoicePool<'a>,
     ) {
+        // Per-lane loop fold. A Whittaker-style voice loops its own
+        // sequence independently of the others; fold the global
+        // playhead tick into this lane's loop body so the per-tick
+        // automation lane queries (vibrato / slide arm + advance, via
+        // `current_abs_tick`) replay each loop. The note content is
+        // folded symmetrically in `Module::row_at`. No `ChannelLoop`
+        // for this lane — every tracker format — leaves `abs_tick`
+        // unchanged.
+        let abs_tick = match self.module.channel_loop(song, self.track_index as u8) {
+            Some(l) => l.fold_tick(abs_tick),
+            None => abs_tick,
+        };
         self.current = pattern_slot.clone();
         self.current_track_instrument = track_instr;
         // Cache abs_tick / song for the row's tick run.
@@ -360,6 +372,12 @@ impl<'a> Channel<'a> {
         // these without re-threading from sequencer state.
         self.current_abs_tick = abs_tick;
         self.current_song_idx = song;
+        // Row-start tick: per-frame Points lanes read at exactly the
+        // row's abs_tick.
+        self.current_tick_in_row = 0;
+        // Clear the per-tick re-attack flag before any note trigger this
+        // row-load tick can set it (see `struck_this_tick`).
+        self.struck_this_tick = false;
 
         let delay = self.current.get_delay();
         // Always write `effect_note_delay` — whether 0 or the row's

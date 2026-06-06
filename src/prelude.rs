@@ -10,6 +10,7 @@
 /// `ChannelsObserver` (audio-side events). The built-in `DebugObserver`
 /// is re-exported too when `std` is available.
 pub use crate::audio_observer::{ChannelsContext, ChannelsObserver, MixContext, MixObserver};
+pub use crate::channel::ChannelSnapshot;
 pub use crate::midi_observer::{MidiEvent, MidiObserver};
 pub use crate::observer::{PatternChangeContext, PlayerObserver, RowContext, TickContext};
 pub use crate::xmrsplayer::XmrsPlayer;

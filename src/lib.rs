@@ -61,6 +61,12 @@ pub mod debug_midi_observer;
 
 pub mod xmrsplayer;
 
+/// Audition a single instrument/sample of a module that has no song
+/// (e.g. a David Whittaker `*-sfx.dw` bank) by splicing a temporary
+/// one-note timeline into it in place, rendering, then restoring it —
+/// no second module, no instrument cloning.
+pub mod sample_preview;
+
 /// Toggle and policy for humanisation of
 /// `Track::Euclidean` pulses at playback.
 pub mod humanize;

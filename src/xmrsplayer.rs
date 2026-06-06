@@ -430,6 +430,34 @@ impl<'a> XmrsPlayer<'a> {
         );
     }
 
+    // --- DW Tier-2 fidelity trace ---
+
+    /// Advance the player by **exactly one replayer tick** for tracing,
+    /// dispatching the tick's row-start / sustained-tick work (which
+    /// updates every channel's period / volume / gate) **without
+    /// rendering any audio samples**. Returns `false` at song end.
+    ///
+    /// This is the player-side counterpart of one `play_tick` call in
+    /// the DW Paula oracle: forcing the sample clock to a tick boundary
+    /// makes each call dispatch one — and only one — sequencer tick, so
+    /// `player tick N` lines up with `golden tick N`. Pair it with
+    /// [`Self::channel_snapshots`], capturing the snapshot *after* each
+    /// call. Audio observers are intentionally not fired (no samples
+    /// are produced). Used only by the oracle-diff tooling.
+    pub fn advance_trace_tick(&mut self) -> bool {
+        // Force a tick boundary so `step()` dispatches exactly one tick.
+        self.remaining_samples_in_tick = 0;
+        self.step()
+    }
+
+    /// Per-channel realized runtime snapshot (period / volume / gate) at
+    /// the current tick — the pull-based counterpart of the `channels`
+    /// slice delivered to observers. See [`crate::channel::ChannelSnapshot`]
+    /// and [`Self::advance_trace_tick`].
+    pub fn channel_snapshots(&self) -> Vec<crate::channel::ChannelSnapshot> {
+        self.voices.channel_snapshots()
+    }
+
     // --- Sample generation hot path ---
 
     /// Advance one sample's worth of time: stepping the sequencer when a
@@ -484,9 +512,15 @@ impl<'a> XmrsPlayer<'a> {
         // Each entry is `(Cell, Option<usize>)` — the cell plus
         // the cached Track-level instrument.
         let song = self.sequencer.current_song();
-        let abs_tick = self.sequencer.current_abs_tick();
+        // Monotonic playhead: under per-lane free-run it keeps rising
+        // across timeline replays so each voice keeps drifting; for
+        // every tracker song it equals `current_abs_tick`. Threaded
+        // identically to `row_at_with_playhead` (note content) and
+        // `process_row` → `tick0` (per-lane automation fold) so the two
+        // stay in lock-step.
+        let abs_tick = self.sequencer.current_abs_tick_monotonic();
         let cells_vec: Vec<(xmrs::core::cell::Cell, Option<usize>)> =
-            self.module.row_at(song, pattern, row);
+            self.module.row_at_with_playhead(song, pattern, row, abs_tick);
 
         // 1. Voices (the built-in row consumer) processes the row.
         //    `abs_tick` + `song` are threaded so the Channel layer
@@ -529,12 +563,15 @@ impl<'a> XmrsPlayer<'a> {
             // field.
             let cells_obs: Vec<xmrs::core::cell::Cell> =
                 cells_vec.iter().map(|(c, _)| c.clone()).collect();
+            // Realized per-channel state after the row was processed.
+            let channels = self.voices.channel_snapshots();
             let ctx = RowContext {
                 module: self.module,
                 song,
                 pattern,
                 row,
                 cells: &cells_obs,
+                channels: &channels,
                 tempo: self.sequencer.tempo(),
                 bpm: self.sequencer.bpm(),
             };
@@ -559,7 +596,7 @@ impl<'a> XmrsPlayer<'a> {
         if self.humanize_mode != HumanizeMode::Disabled {
             let abs_tick = self
                 .sequencer
-                .current_abs_tick()
+                .current_abs_tick_monotonic()
                 .saturating_add(tick as u32);
             let song = self.sequencer.current_song() as u16;
             self.voices
@@ -576,10 +613,14 @@ impl<'a> XmrsPlayer<'a> {
             let pat = self.sequencer.playing_pattern();
             let row = self.sequencer.playing_row();
             let song = self.sequencer.current_song();
+            // Same monotonic playhead the voices used, so observers see
+            // the folded (looping) content, not the un-looped row.
+            let abs_tick = self.sequencer.current_abs_tick_monotonic();
             let cells_vec: Vec<(xmrs::core::cell::Cell, Option<usize>)> =
-                self.module.row_at(song, pat, row);
+                self.module.row_at_with_playhead(song, pat, row, abs_tick);
             let cells_obs: Vec<xmrs::core::cell::Cell> =
                 cells_vec.iter().map(|(c, _)| c.clone()).collect();
+            let channels = self.voices.channel_snapshots();
             let ctx = TickContext {
                 module: self.module,
                 song,
@@ -587,6 +628,7 @@ impl<'a> XmrsPlayer<'a> {
                 row,
                 tick,
                 cells: &cells_obs,
+                channels: &channels,
             };
             for obs in self.observers.iter_mut() {
                 if obs.subscribes_to_ticks() {

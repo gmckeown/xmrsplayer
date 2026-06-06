@@ -71,6 +71,12 @@ pub struct RowContext<'a> {
     pub row: usize,
     /// One `Cell` per channel (length = `module.get_num_channels()`).
     pub cells: &'a [Cell],
+    /// Realized per-channel runtime state (period / volume / gate) right
+    /// after the row was processed — the *played* state, complementing
+    /// `cells` (the score). Same length and ordering as `cells`. Lets a
+    /// scope/VU/activity observer read the engine without re-deriving it.
+    /// See [`crate::channel::ChannelSnapshot`].
+    pub channels: &'a [crate::channel::ChannelSnapshot],
     /// Current song speed (ticks per row) at the moment this row starts.
     pub tempo: usize,
     /// Current song BPM at the moment this row starts.
@@ -88,6 +94,11 @@ pub struct TickContext<'a> {
     /// (which never reach `on_tick`), so this value is always >= 1.
     pub tick: usize,
     pub cells: &'a [Cell],
+    /// Realized per-channel runtime state (period / volume / gate) right
+    /// after this tick's per-tick effects ran — the *played* state. Same
+    /// length and ordering as `cells`. See
+    /// [`crate::channel::ChannelSnapshot`].
+    pub channels: &'a [crate::channel::ChannelSnapshot],
 }
 
 /// Context passed to [`PlayerObserver::on_pattern_change`].

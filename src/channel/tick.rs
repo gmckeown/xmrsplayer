@@ -27,6 +27,13 @@ pub(super) struct NoteRetrigState {
 
 impl<'a> Channel<'a> {
     pub(crate) fn tick(&mut self, current_tick: usize, pool: &mut VoicePool<'a>) {
+        // Record the within-row tick so the per-frame `TrackPitch`
+        // Points lane (DW arpeggio) reads its value at the absolute
+        // per-frame tick, not just the row start.
+        self.current_tick_in_row = current_tick;
+        // Clear the per-tick re-attack flag before any retrigger effect
+        // (e.g. Rxy) this tick can set it (see `struck_this_tick`).
+        self.struck_this_tick = false;
         if let Some(instr) = self.live_mut(pool) {
             instr.tick();
             self.tickn_effects(current_tick, pool);

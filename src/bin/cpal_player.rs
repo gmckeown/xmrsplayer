@@ -109,8 +109,9 @@ struct Cli {
     #[arg(short = 'f', long, required = true, value_name = "filename")]
     filename: Option<String>,
 
-    /// song number (default: 0)
-    #[arg(short = 's', long, default_value = "0")]
+    /// Sub-song number, counted from 1 (1 = first sub-song; most
+    /// formats have only one, DW modules expose several). Default: 1.
+    #[arg(short = 's', long, default_value = "1")]
     song: usize,
 
     /// Choose output wave file
@@ -144,6 +145,19 @@ struct Cli {
     /// Force speed
     #[arg(short = 'e', long, default_value = "0")]
     speed: usize,
+
+    /// Audition a single instrument/sample (0-based index) instead of
+    /// playing a song — for sound-effect banks (e.g. `*-sfx.dw`) that
+    /// carry samples but no song timeline, or to preview any module's
+    /// instruments. Pair with `--note` to choose the pitch; `--loops`
+    /// controls repeats (default: repeat forever).
+    #[arg(short = 'i', long, value_name = "index")]
+    instrument: Option<usize>,
+
+    /// Note used by `--instrument`, as a semitone index 0..=119
+    /// (C-0 = 0, C-4 = 48, the default).
+    #[arg(short = 'n', long, default_value = "48")]
+    note: u8,
 
     /// Compute the song's theoretical duration and exit without
     /// playing anything. The duration is reported as `MM:SS`,
@@ -208,11 +222,25 @@ fn sid_test_player(cli: &Cli) {
 }
 
 fn main() -> Result<(), std::io::Error> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // `--song` is 1-based for humans (song 1 = first sub-song), but
+    // every internal index — `XmrsPlayer::new`, `Module::duration`,
+    // the timeline `song` field — is 0-based. Validate the 0 case
+    // (no song 0 exists in 1-based numbering) and convert once here,
+    // so the whole downstream path keeps using a plain 0-based index.
+    if cli.song == 0 {
+        eprintln!(
+            "error: --song is counted from 1 (song 1 = first sub-song); \
+             0 is not a valid song number. Use -s 1 for the first song."
+        );
+        std::process::exit(2);
+    }
+    cli.song -= 1;
 
     // Term::stdout().clear_screen().unwrap();
     println!("--===~ XmRs Player Example ~===--");
-    println!("(c) 2023-2024 Sébastien Béchet\n");
+    println!("(c) 2023-2026 Sébastien Béchet\n");
     println!("Because demo scene can't die :)\n");
 
     // Ugly Hack just for fun
@@ -226,18 +254,98 @@ fn main() -> Result<(), std::io::Error> {
         println!("opening {}", filename);
         let contents = std::fs::read(filename.trim())?;
         match Module::load(&contents) {
-            Ok(module) => {
+            Ok(mut module) => {
                 drop(contents); // cleanup memory
-                                // `--duration` short-circuits before any audio
-                                // setup: we just want the theoretical length of
-                                // the chosen sub-song. Print as `MM:SS` and
-                                // exit — no playback, no device probing.
+                                // David Whittaker `.dw` files carry no embedded
+                                // song name — the importer tags them all with the
+                                // same generic "David Whittaker (.dw)". Derive a
+                                // per-file title from the filename stem so a folder
+                                // of `.dw` rips is distinguishable in the player /
+                                // any UI. Other formats keep their embedded name.
+                if module.origin == Some(xmrs::tracker::format::ModuleFormat::Dw) {
+                    if let Some(stem) = std::path::Path::new(filename.trim())
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                    {
+                        module.name = stem.to_string();
+                    }
+                }
+                // `--duration` short-circuits before any audio
+                // setup: we just want the theoretical length of
+                // the chosen sub-song. Print as `MM:SS` and
+                // exit — no playback, no device probing.
                 if cli.duration {
                     let d = module.duration(cli.song);
                     println!("{}", format_mm_ss(d));
                     return Ok(());
                 }
-                println!("Playing {} !", module.name);
+                // `--instrument N`: replace the song with a one-note
+                // audition of instrument N (sound-effect banks carry
+                // samples but no song). Splices a temporary timeline
+                // into the owned module in place and plays song 0 of it;
+                // `--loops` repeats the audition. No restore needed — the
+                // CLI discards the module on exit.
+                if let Some(instr) = cli.instrument {
+                    let pitch =
+                        xmrs::core::pitch::Pitch::try_from(cli.note).unwrap_or(xmrs::core::pitch::Pitch::C4);
+                    // ~4 s audition window per loop iteration, derived
+                    // from the module's row grid (seconds/row = 2.5 *
+                    // tempo / bpm).
+                    let sec_per_row = (2.5 * module.default_tempo.max(1) as f64)
+                        / module.default_bpm.max(1) as f64;
+                    let rows = (4.0 / sec_per_row).ceil().max(2.0) as usize;
+                    if !xmrsplayer::sample_preview::install_instrument_audition(
+                        &mut module,
+                        instr,
+                        pitch,
+                        rows,
+                    ) {
+                        eprintln!(
+                            "error: --instrument {instr} out of range \
+                             (module has {} instruments, 0..={})",
+                            module.instrument.len(),
+                            module.instrument.len().saturating_sub(1)
+                        );
+                        return Ok(());
+                    }
+                    cli.song = 0;
+                    println!("Auditioning instrument {instr} at {:?} (note {})", pitch, cli.note);
+                }
+
+                // Song count = highest `song` index in the timeline
+                // map + 1 (DW multi-sub-song modules expose several;
+                // most formats have just one).
+                let song_count = module
+                    .timeline_map
+                    .entries
+                    .iter()
+                    .map(|e| e.song as usize)
+                    .max()
+                    .map(|m| m + 1)
+                    .unwrap_or(1);
+                // Speed / BPM of the SELECTED sub-song, not the module
+                // defaults: `default_tempo`/`default_bpm` snapshot the
+                // primary (song 0) values, so for `-s N>0` they'd print
+                // the wrong tempo (e.g. a DW sub-song at speed 4 shown as
+                // the primary's 6). Read the first row of the chosen
+                // song's timeline instead — the same `speed_at_row` /
+                // `bpm_at_row` the sequencer applies on its first row.
+                let (song_speed, song_bpm) = module
+                    .timeline_map
+                    .entries
+                    .iter()
+                    .filter(|e| e.song as usize == cli.song && e.loop_iter == 0)
+                    .min_by_key(|e| e.tick)
+                    .map(|e| (e.speed_at_row as usize, e.bpm_at_row as usize))
+                    .unwrap_or((module.default_tempo, module.default_bpm));
+                println!(
+                    "Playing {} ! (song {}/{}, speed {}, bpm {})",
+                    module.name,
+                    cli.song + 1,
+                    song_count,
+                    song_speed,
+                    song_bpm,
+                );
 
                 let module = Box::new(module);
                 let module_ref: &'static Module = Box::leak(module);

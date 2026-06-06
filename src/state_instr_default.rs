@@ -539,25 +539,63 @@ impl<'a> StateInstrDefault<'a> {
     /// Pitch envelope and instrument auto-vibrato are read from
     /// `self` directly (not parameters) — they're voice-internal
     /// state.
+    ///
+    /// Returns the **effective period** actually sounding this tick —
+    /// the base `period` after every pitch modulation (arpeggio,
+    /// vibrato LFO, pitch envelope, instrument auto-vibrato) has been
+    /// folded in, i.e. the period that maps 1:1 to what Paula's
+    /// `AUDxPER` would hold. The caller ([`crate::channel::Channel`])
+    /// stashes it in `effective_period` so observers / the DW Tier-2
+    /// oracle can read the *played* pitch, not just the nominal note
+    /// (`Channel::period`, which stays the un-modulated base). Returns
+    /// `None` when no sample is loaded (nothing is sounding).
     pub fn update_frequency(
         &mut self,
         period: xmrs::core::fixed::units::Period,
         arp_pitch: PitchDelta,
-        vibrato: PitchDelta,
+        vibrato_raw: i16,
+        points_pitch: PitchDelta,
         semitone: bool,
-    ) {
-        if self.state_sample.is_none() {
-            return;
-        }
+    ) -> Option<xmrs::core::fixed::units::Period> {
+        self.state_sample.as_ref()?;
         let pitch_env_offset = self.get_pitch_envelope_offset();
         let vibrato_mod = self.state_vibrato.current_modulation;
 
-        // Sum the four pitch deltas. Each `PitchDelta` is Q8.8
-        // bounded to `±i16::MAX/256 ≈ ±128 semitones`; their
-        // saturating `+` keeps the result inside that range
-        // (and in practice each term is `± 32 semitones max`,
-        // so we never get near saturation).
-        let delta_q88 = (arp_pitch + pitch_env_offset + vibrato + vibrato_mod).as_q8_8_i32();
+        let is_amiga = matches!(
+            self.period_helper.freq_type,
+            FrequencyType::AmigaFrequencies
+        );
+
+        // The EFFECT vibrato is applied differently per frequency mode,
+        // matching FT2/Protracker `doVibrato` (`outPeriod = realPeriod ±
+        // tmpVib`):
+        //   * Amiga — a direct *period* delta added at the very end (the
+        //     Amiga period is `∝ 2^-pitch`, so a constant period nudge is
+        //     NOT a constant pitch nudge). Excluded from the semitone sum
+        //     here and folded in below; the lane stores `depth` in period
+        //     units. MOD, Amiga-XM and DW take this path.
+        //   * Linear — reinterpreted as Q8.8 semitones and summed with the
+        //     other deltas; on a pitch-affine linear period this is the
+        //     same operation, so the result is byte-identical to the old
+        //     `value_pitch_delta()` path.
+        // Arpeggio, pitch envelope and instrument auto-vibrato stay in
+        // semitone space in both modes (they are note/semitone effects in
+        // FT2 too).
+        let vibrato_semitone = if is_amiga {
+            PitchDelta::ZERO
+        } else {
+            PitchDelta::from_q8_8_i16(vibrato_raw)
+        };
+        // `points_pitch` is the held transpose from a `TrackPitch`
+        // `Points` lane (`AutomationValue::Pitch`) — an absolute,
+        // time-varying semitone shift of the note's base (e.g. a
+        // tracker global/channel transpose). It is summed like the
+        // other semitone deltas but, like the pitch envelope, is NOT a
+        // reason to engage the FT2 arpeggio LUT/clamp, so it stays out
+        // of `arp_active`.
+        let delta_q88 = (arp_pitch + pitch_env_offset + vibrato_semitone + vibrato_mod
+            + points_pitch)
+            .as_q8_8_i32();
         let arp_active = (arp_pitch + pitch_env_offset) != PitchDelta::ZERO;
 
         // Period → base pitch (Q8.8 semitones). Both branches
@@ -576,12 +614,24 @@ impl<'a> StateInstrDefault<'a> {
         let pitch_q = self.finalize_pitch(base_pitch_q88, delta_q88, arp_active, semitone);
 
         // Q-format end-to-end: Pitch → Period → Frequency → step.
-        let period_q = self.period_helper.note_to_period(pitch_q);
+        let mut period_q = self.period_helper.note_to_period(pitch_q);
+
+        // Amiga period-space vibrato: add the LFO output straight to the
+        // Paula period (FT2 `outPeriod = realPeriod ± tmpVib`). Saturates
+        // at the `u16` period bounds, like FT2's period clamp.
+        if is_amiga && vibrato_raw != 0 {
+            period_q = period_q.saturating_add_signed(vibrato_raw);
+        }
+
         let f = self.period_helper.period_to_frequency(period_q);
 
         if let Some(s) = &mut self.state_sample {
             s.set_step(f);
         }
+        // `period_q` is the post-modulation period that produced the
+        // step just set — hand it back so the channel can expose the
+        // played pitch (see the doc above).
+        Some(period_q)
     }
 
     /// Snap + clamp + sum + encode shared between the two

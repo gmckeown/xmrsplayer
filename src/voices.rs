@@ -280,6 +280,12 @@ impl<'a> Voices<'a> {
     pub fn num_channels(&self) -> usize {
         self.channel.len()
     }
+
+    /// Per-channel realized runtime snapshot (period / volume / gate).
+    /// See [`Channel::snapshot`].
+    pub fn channel_snapshots(&self) -> alloc::vec::Vec<crate::channel::ChannelSnapshot> {
+        self.channel.iter().map(|c| c.snapshot()).collect()
+    }
     pub fn set_mute_channel(&mut self, channel_num: usize, mute: bool) {
         if channel_num < self.channel.len() {
             self.channel[channel_num].muted = mute;

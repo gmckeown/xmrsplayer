@@ -122,12 +122,12 @@ mod tests {
     fn binary_world_inst14_auto_vibrato_is_nonzero() {
         // XM importer mapping (mirrors xmrs::tracker::import::xm::xminstrument):
         //   speed = byte / (63 * 4) = byte / 252
-        //   depth = byte / (15 * 2) = byte / 30
+        //   depth = byte / 64           (peak deviation in semitones)
         //   sweep = byte / 255
         let vibrato = Vibrato {
-            waveform: Waveform::TranslatedSine,
+            waveform: Waveform::AutoVibSine,
             speed: Q8_8::from_ratio(15, 63 * 4),
-            depth: PitchDelta::from_ratio(5, 15 * 2),
+            depth: PitchDelta::from_ratio(5, 64),
             sweep: Q8_8::from_ratio(65, 255),
         };
 
@@ -148,7 +148,7 @@ mod tests {
         assert_ne!(
             vibrato.depth.as_q8_8_i16(),
             0,
-            "vibrato.depth PitchDelta raw is zero — PitchDelta::from_ratio(5, 30) gave 0?",
+            "vibrato.depth PitchDelta raw is zero — PitchDelta::from_ratio(5, 64) gave 0?",
         );
         assert_ne!(
             vibrato.sweep.raw(),
@@ -157,7 +157,7 @@ mod tests {
         );
 
         // Q-format raw range checks. At Q8.8 (0.0586 → 15, 0.254 →
-        // 65) and PitchDelta Q8.8 (0.164 → 42 raw):
+        // 65) and PitchDelta Q8.8 (5/64 = 0.078 → 20 raw):
         let speed_raw = vibrato.speed.raw();
         let depth_raw = vibrato.depth.as_q8_8_i16();
         let sweep_raw = vibrato.sweep.raw();
@@ -167,8 +167,8 @@ mod tests {
             speed_raw
         );
         assert!(
-            depth_raw > 38 && depth_raw < 46,
-            "depth raw = {} (expected ≈ 42 = 0.164 in Q8.8)",
+            depth_raw > 17 && depth_raw < 23,
+            "depth raw = {} (expected ≈ 20 = 0.078 in Q8.8)",
             depth_raw
         );
         assert!(

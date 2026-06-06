@@ -12,7 +12,10 @@ It does not aim for bit-exact compatibility with every tracker ever written — 
 | FastTracker XM    | Works                                                                  |
 | ScreamTracker S3M | Works                                                                  |
 | Impulse Tracker IT| WIP — loader mostly done, playback in progress                         |
+| David Whittaker DW| Works — `.dw` Amiga player binaries reverse-engineered into the `Module` model |
 | SID (C64)         | Experimental — reverse-engineered from Rob Hubbard's 6510 player       |
+
+A word on **DW**: David Whittaker's Amiga tunes ship as self-contained 68000 player binaries with no magic header. The `xmrs` importer detects them structurally, reads the replayer's init-time constants, and re-interprets the original per-voice playback (per-voice loops, period-space vibrato, arpeggio pitch lanes, sub-song selection) into the generic `Module` model, so they play back through the same engine as the tracker formats. Load via `Module::load` (tried last in auto-detect) or `Module::load_dw`.
 
 A word on **SID**: tracks and effects can already be extracted from several of Hubbard's hits and played back through the generic module engine. One thing is still needed to go further — working *per-track* to reconstruct patterns (some tracks change length, which defeats a naive pattern builder), The module engine is already generic enough; the rest is a matter of time (and motivated contributors — Rust speakers welcome!).
 
@@ -168,6 +171,7 @@ backend — there's nothing to pick.
 | `import_xm`   | FastTracker XM            |
 | `import_s3m`  | ScreamTracker S3M         |
 | `import_it`   | Impulse Tracker IT        |
+| `import_dw`   | David Whittaker `.dw`     |
 | `import_sid`  | C64 SID                   |
 
 Build examples:
