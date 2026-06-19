@@ -1,0 +1,12 @@
+# DAW_GENERALIZATION_RFC §0 — frozen golden corpus.
+# Rebake: XM_GOLDEN_REGEN=1 cargo test -p xmrsplayer --test golden_corpus
+# A behavior-preserving phase must NOT change any line below.
+dw:archipelagos = eee4b13b9edf988a
+dw:bad_company = 6be82c90e13873d4
+dw:bubble_bobble = c829eb1a63c19675
+dw:grimblood = 4a6f69d271acfa6b
+it:myheart = 0e017250bf81a2e6
+mod:lizardking = 47208421d7ad5f04
+s3m:opl_min = 828a23e8d996eb35
+s3m:star_chips = a63535c94cd26585
+xm:lamb = 0746c672378ddaae

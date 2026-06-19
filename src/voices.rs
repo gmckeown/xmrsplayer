@@ -67,6 +67,12 @@ pub struct Voices<'a> {
     /// Stored as `Amplification` (Q4.12) so it can express up
     /// to 8× gain without leaving the i16 raw range.
     amplification: Amplification,
+    /// The module's master mix volume (`Module::mix_volume`, Q1.15),
+    /// read once at construction. Applied as a final constant gain in
+    /// [`Voices::apply_final_gain`], alongside `global_volume` and
+    /// `amplification`. `Volume::FULL` (identity) for formats that
+    /// carry no master volume, so they are unaffected.
+    mix_volume: Volume,
 
     /// Non-fine volume-slide speed latched on the last row that carried a
     /// `SongLevelEffect::VolumeSlide { fine: false }`. Applied once per tick as
@@ -93,6 +99,142 @@ pub struct Voices<'a> {
     /// Default [`crate::humanize::HumanizeMode::Disabled`] keeps
     /// playback strictly cycle-exact.
     humanize_mode: crate::humanize::HumanizeMode,
+
+    /// RFC §3B — runtime return/aux bus chains, cloned from
+    /// `module.buses` so stateful devices keep their state. Channels
+    /// feed them via `module.channel_sends`; their processed output is
+    /// summed into the master mix. Empty for every tracker import.
+    bus_chains: Vec<xmrs::core::daw::device::DeviceChain>,
+    /// RFC §3B — runtime master-bus insert chain, cloned from
+    /// `module.master_chain`. Applied to the final summed mix before
+    /// the output gain. Empty ⇒ pass-through ⇒ bit-identical.
+    master_chain: xmrs::core::daw::device::DeviceChain,
+
+    /// RFC §3C — runtime playback state for the module's audio clips.
+    /// Empty for every tracker import.
+    audio_clips: Vec<AudioClipRuntime>,
+
+    /// One shared OPL2 FM synthesiser, instantiated only when the module
+    /// carries at least one `InstrumentType::Opl` instrument. `None` for
+    /// every other module ⇒ the FM drive/render passes are measured
+    /// no-ops ⇒ bit-identical. See `OPL_SYNTHESIS_RFC.md`.
+    #[cfg(feature = "import_s3m")]
+    opl: Option<xmrs::generators::opl::driver::OplDriver>,
+
+    /// Per-instrument SID bank, instantiated only when the module carries at
+    /// least one `InstrumentType::RobSid` instrument. `None` for every other
+    /// module ⇒ the SID drive/fold passes are measured no-ops ⇒ bit-identical.
+    #[cfg(feature = "import_sid")]
+    sid: Option<xmrs::generators::sid::driver::SidDriver>,
+}
+
+/// RFC §3C — runtime playback state for one audio clip on the
+/// timeline. Empty `audio_clips` (every tracker import) ⇒ the audio
+/// pass is a measured no-op ⇒ bit-identical.
+struct AudioClipRuntime {
+    /// Index into `module.tracks` — the [`Track::Audio`] this clip plays.
+    track: usize,
+    /// Mixer channel this clip is routed to. Its resampled output is
+    /// injected **pre-insert** into that channel so it flows through the
+    /// same insert chain + sends as the channel's notes. Out-of-range ⇒
+    /// the clip falls back to a direct master sum.
+    target_channel: u8,
+    song: u16,
+    position_tick: u32,
+    end_tick: u32,
+    /// Source→output resample step, Q32.32 (`1 << 32` = 1.0).
+    step_q32: u64,
+    /// Current source read position, Q32.32.
+    cursor_q32: u64,
+    active: bool,
+}
+
+/// RFC §3C — resample every active audio clip and route it into the
+/// mixer. v2: a clip is injected **pre-insert** into its
+/// `target_channel`'s accumulator (`inject`), so it flows through that
+/// channel's insert chain *and* its sends — the full channel strip,
+/// exactly like the channel's notes. A clip whose `target_channel` is
+/// out of range falls back to a direct master sum (`master`) so its
+/// audio is never silently dropped (v1 reach preserved). A muted
+/// `Track::Audio` advances its cursor (so un-muting resumes in phase)
+/// but emits nothing. Activation is tick-granular: the cursor restarts
+/// at the clip region's first tick. A no-op when there are no clips.
+fn accumulate_audio_clips(
+    module: &Module,
+    clips: &mut [AudioClipRuntime],
+    abs_tick: u32,
+    song: u16,
+    inject: &mut [(i32, i32)],
+    master: &mut (i32, i32),
+) {
+    for c in clips.iter_mut() {
+        let active_now = c.song == song && abs_tick >= c.position_tick && abs_tick < c.end_tick;
+        if !active_now {
+            c.active = false;
+            continue;
+        }
+        if !c.active {
+            // Rising edge into the clip region: (re)start from the top.
+            c.active = true;
+            c.cursor_q32 = 0;
+        }
+        let Some(track) = module.tracks.get(c.track) else {
+            c.active = false;
+            continue;
+        };
+        // RFC §4: resolve through the module so a `Pooled` source reads
+        // the shared asset; `Inline` resolves to its own sample.
+        let Some((sample, _rate)) = module.track_audio(c.track) else {
+            c.active = false;
+            continue;
+        };
+        let floor = (c.cursor_q32 >> 32) as usize;
+        let frac = (c.cursor_q32 & 0xFFFF_FFFF) as i64;
+        // `seek` honours the sample's loop; `None` = past the end of a
+        // one-shot ⇒ the clip has finished even if the region hasn't.
+        let Some(i0) = sample.seek(floor, false) else {
+            c.active = false;
+            continue;
+        };
+        let i1 = sample.seek(floor + 1, false).unwrap_or(i0);
+        let (l0, r0) = sample.at(i0);
+        let (l1, r1) = sample.at(i1);
+        let lerp =
+            |a: i16, b: i16| -> i32 { a as i32 + (((b as i64 - a as i64) * frac) >> 32) as i32 };
+        let l = lerp(l0.as_q15_i16(), l1.as_q15_i16());
+        let r = lerp(r0.as_q15_i16(), r1.as_q15_i16());
+        // Advance the cursor whether or not the track is muted, so
+        // un-muting resumes at the position the clip would have reached.
+        c.cursor_q32 = c.cursor_q32.wrapping_add(c.step_q32);
+        if track.muted() {
+            continue;
+        }
+        match inject.get_mut(c.target_channel as usize) {
+            Some(slot) => {
+                slot.0 = slot.0.saturating_add(l);
+                slot.1 = slot.1.saturating_add(r);
+            }
+            None => {
+                master.0 = master.0.saturating_add(l);
+                master.1 = master.1.saturating_add(r);
+            }
+        }
+    }
+}
+
+/// RFC §3B — add channel `idx`'s post-insert stereo sample, scaled by
+/// each of its sends, into the corresponding return-bus accumulators.
+/// A no-op for every tracker import (`channel_sends` empty).
+#[inline]
+fn route_sends(module: &Module, idx: usize, l: Amp, r: Amp, bus_acc: &mut [(i32, i32)]) {
+    if let Some(sends) = module.channel_sends.get(idx) {
+        for s in sends {
+            if let Some(acc) = bus_acc.get_mut(s.bus as usize) {
+                s.level.apply(l).accumulate_into(&mut acc.0);
+                s.level.apply(r).accumulate_into(&mut acc.1);
+            }
+        }
+    }
 }
 
 impl<'a> Voices<'a> {
@@ -137,19 +279,120 @@ impl<'a> Voices<'a> {
             ch.reseed_rng(0xA5A5_0000 | (i as u32 + 1));
             ch.set_track_index(i);
         }
-        Self {
+        // RFC §3C: precompute the runtime state for every audio clip
+        // (a clip whose track is a `Track::Audio`). Empty for every
+        // tracker import, so the audio pass in `mix` is a no-op.
+        let out_rate = sr.hz().max(1) as u64;
+        let audio_clips: Vec<AudioClipRuntime> = module
+            .clips
+            .iter()
+            .filter_map(|c| {
+                // RFC §4: pool-aware — resolves `Inline` and `Pooled`.
+                let (_sample, rate) = module.track_audio(c.track as usize)?;
+                let step_q32 = if rate == 0 || rate as u64 == out_rate {
+                    1u64 << 32
+                } else {
+                    ((rate as u64) << 32) / out_rate
+                };
+                Some(AudioClipRuntime {
+                    track: c.track as usize,
+                    target_channel: c.target_channel,
+                    song: c.song,
+                    position_tick: c.position_tick,
+                    end_tick: c.end_tick,
+                    step_q32,
+                    cursor_q32: 0,
+                    active: false,
+                })
+            })
+            .collect();
+        // Captured before the struct literal moves `channels` into `channel`.
+        #[cfg(feature = "import_sid")]
+        let num_channels = channels.len();
+        let mut voices = Self {
             sample_rate: sr,
             module,
             channel: channels,
             pool: VoicePool::new(voice_pool_capacity),
             global_volume: Volume::FULL,
             amplification: Amplification::UNITY,
+            mix_volume: module.mix_volume,
             volume_slide_speed: Q15::ZERO,
             volume_slide_fine: true,
             row_has_global_volume_slide: false,
             pending_midi_events: Vec::new(),
             humanize_mode: crate::humanize::HumanizeMode::default(),
+            // RFC §3B: runtime clones of the bus / master chains
+            // (empty for every tracker import).
+            bus_chains: module.buses.iter().map(|b| b.chain.clone()).collect(),
+            master_chain: module.master_chain.clone(),
+            audio_clips,
+            // OPL chip only when the module actually uses FM instruments.
+            #[cfg(feature = "import_s3m")]
+            opl: module
+                .instrument
+                .iter()
+                .any(|i| matches!(i.instr_type, xmrs::prelude::InstrumentType::Opl(_)))
+                .then(|| xmrs::generators::opl::driver::OplDriver::new(sr.hz().max(1))),
+            // SID bank only when the module actually uses SID instruments.
+            // Default model/region (6581 / PAL); the PSID/RSID header hint is
+            // a later refinement.
+            #[cfg(feature = "import_sid")]
+            sid: module
+                .instrument
+                .iter()
+                .any(|i| matches!(i.instr_type, xmrs::prelude::InstrumentType::RobSid(_)))
+                .then(|| {
+                    use xmrs::generators::sid::{
+                        coupled::CoupledSid,
+                        driver::{SidBank, SidDriver},
+                        SidModel, SidRegion,
+                    };
+                    use xmrs::prelude::InstrumentType;
+                    let rate = sr.hz().max(1);
+                    let speed = module.default_tempo as u8; // ticks-per-row → drum noise burst
+                                                            // Coupled (shared-chip) model when the song's voices
+                                                            // hard-sync / ring-modulate each other OR any instrument
+                                                            // drives the global SID filter — both need the 3 SID voices
+                                                            // on one chip. Otherwise the per-instrument model (the
+                                                            // default, all other tunes byte-identical).
+                    let uses_coupled = module.instrument.iter().any(|i| {
+                        if let InstrumentType::RobSid(irs) = &i.instr_type {
+                            let v = &irs.voice;
+                            v.ctrl_sync || v.ctrl_rm || irs.fx.filter.enable
+                        } else {
+                            false
+                        }
+                    });
+                    if uses_coupled {
+                        SidDriver::Coupled(Box::new(CoupledSid::new(
+                            rate,
+                            SidModel::Mos6581,
+                            SidRegion::Pal,
+                            speed,
+                        )))
+                    } else {
+                        SidDriver::PerInstrument(SidBank::new(
+                            rate,
+                            module.instrument.len(),
+                            num_channels,
+                            speed,
+                            SidModel::Mos6581,
+                            SidRegion::Pal,
+                        ))
+                    }
+                }),
+        };
+        // Native DSP devices: prepare the bus / master chains for the
+        // output rate (size buffers, precompute coeffs). Per-channel
+        // insert chains are prepared in `Channel::set_track_index`. No-op
+        // for the empty chains every tracker import produces.
+        let rate_hz = sr.hz();
+        for chain in &mut voices.bus_chains {
+            chain.prepare(rate_hz);
         }
+        voices.master_chain.prepare(rate_hz);
+        voices
     }
 
     pub(crate) fn set_humanize_mode(&mut self, mode: crate::humanize::HumanizeMode) {
@@ -310,6 +553,10 @@ impl<'a> Voices<'a> {
     /// Called by the facade on a `goto` (external seek) so each channel
     /// clears what it safely can without touching pitch. Mirrors the
     /// previous behaviour of the old `XmrsPlayer::goto` cleanup loop.
+    pub(crate) fn allocated_voice_count(&self) -> usize {
+        self.pool.allocated_count()
+    }
+
     pub(crate) fn reset_for_goto(&mut self) {
         self.global_volume = Volume::FULL;
         // Split borrow: take `&mut self.channel` and `&mut self.pool`
@@ -318,7 +565,26 @@ impl<'a> Voices<'a> {
         for ch in &mut self.channel {
             ch.clear_ghosts(pool);
             ch.trigger_pitch(TRIGGER_KEEP_PERIOD, pool);
+            // Native DSP devices: a seek must clear insert-chain tails
+            // (delay/reverb/filter history) so the jump is deterministic.
+            // No-op for the empty chains every tracker import produces.
+            ch.reset_insert_chain();
         }
+        // RFC §3C: a seek invalidates the free-running audio-clip
+        // cursors — they track *continuous* playback, so a jump would
+        // leave them desynced from the timeline (the clip would keep
+        // reading from a stale source position). Reset them so each
+        // clip re-enters its region cleanly from the top on the next
+        // tick that lands inside it. No audio clips ⇒ no-op.
+        for c in &mut self.audio_clips {
+            c.active = false;
+            c.cursor_q32 = 0;
+        }
+        // Native DSP devices: clear bus / master tails on the same seek.
+        for chain in &mut self.bus_chains {
+            chain.reset();
+        }
+        self.master_chain.reset();
     }
 
     // --- Row / tick dispatch ---
@@ -337,8 +603,8 @@ impl<'a> Voices<'a> {
     ) {
         // Song-level global volume / volume slide come from the
         // `GlobalVolume` AutomationLanes.
-        self.apply_global_volume_from_lane(abs_tick);
-        self.apply_global_volume_slide_from_lane(abs_tick);
+        self.apply_global_volume_from_lane(abs_tick, song);
+        self.apply_global_volume_slide_from_lane(abs_tick, song);
 
         // MIDI event buffer is per-row — the facade drains it after
         // processing. Clearing here so leftovers from a previous row
@@ -355,6 +621,8 @@ impl<'a> Voices<'a> {
             }
             self.apply_row_per_channel_effects(i, cell);
         }
+        self.drive_opl();
+        self.drive_sid();
     }
 
     /// Per-channel cell effects that need to fire at row-start.
@@ -383,9 +651,9 @@ impl<'a> Voices<'a> {
     /// row, which would clobber any in-flight volume slide; the
     /// strict-equality check matches the legacy "set only on the row
     /// that carries the Volume effect" semantic.
-    fn apply_global_volume_from_lane(&mut self, abs_tick: u32) {
+    fn apply_global_volume_from_lane(&mut self, abs_tick: u32, song: u16) {
         use xmrs::core::daw::automation::{AutomationTarget, AutomationValue, LaneEvent};
-        for lane in self.module.lanes_for(AutomationTarget::GlobalVolume) {
+        for lane in self.module.lanes_for(AutomationTarget::GlobalVolume, song) {
             for ev in lane.events_in(abs_tick, abs_tick.saturating_add(1)) {
                 if let LaneEvent::Point(p) = ev {
                     if let AutomationValue::Normalized(q) = p.value {
@@ -401,10 +669,10 @@ impl<'a> Voices<'a> {
     /// `latch_bpm_slide_from_lane`: when armed, write `speed` / `fine`
     /// and, for fine slides, apply once at tick 0; when unarmed,
     /// clear the latch so `process_tick` stops sliding.
-    fn apply_global_volume_slide_from_lane(&mut self, abs_tick: u32) {
+    fn apply_global_volume_slide_from_lane(&mut self, abs_tick: u32, song: u16) {
         use xmrs::core::daw::automation::AutomationTarget;
         let mut armed = false;
-        for lane in self.module.lanes_for(AutomationTarget::GlobalVolume) {
+        for lane in self.module.lanes_for(AutomationTarget::GlobalVolume, song) {
             if let Some(state) = lane.slide_state_at(abs_tick) {
                 if state.armed {
                     if state.fine {
@@ -444,7 +712,131 @@ impl<'a> Voices<'a> {
         if self.row_has_global_volume_slide && !self.volume_slide_fine {
             self.global_volume = self.global_volume.with_tremolo(self.volume_slide_speed);
         }
+        self.drive_opl();
+        self.drive_sid();
     }
+
+    /// Push each channel's current OPL gesture (trigger / key-off / cut, or
+    /// a held note's live pitch / volume / pan) into the shared chip.
+    /// No-op unless the module instantiated an `OplDriver`.
+    #[cfg(feature = "import_s3m")]
+    fn drive_opl(&mut self) {
+        use crate::channel::opl::OplEdge;
+        if self.opl.is_none() {
+            return;
+        }
+        let driver = self.opl.as_mut().unwrap();
+        let module = self.module;
+        for (i, ch) in self.channel.iter_mut().enumerate() {
+            let Some(upd) = ch.take_opl_update() else {
+                continue;
+            };
+            match upd.edge {
+                OplEdge::Cut => driver.note_cut(i),
+                OplEdge::KeyOff => driver.note_off(i),
+                OplEdge::Trigger => {
+                    if let Some(h) = &upd.held {
+                        if let Some(xmrs::prelude::InstrumentType::Opl(o)) =
+                            module.instrument.get(h.instr).map(|x| &x.instr_type)
+                        {
+                            driver.note_on(i, o, h.milli_hz, h.vol63, h.pan_l, h.pan_r);
+                        }
+                    }
+                }
+                OplEdge::None => {
+                    if let Some(h) = &upd.held {
+                        driver.set_frequency(i, h.milli_hz);
+                        driver.set_volume(i, h.vol63);
+                        driver.set_pan(i, h.pan_l, h.pan_r);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "import_s3m"))]
+    #[inline]
+    fn drive_opl(&mut self) {}
+
+    /// Push each channel's current SID gesture (trigger / key-off / cut, or a
+    /// held note's live pitch) into the per-instrument bank. No-op unless the
+    /// module instantiated a `SidBank`.
+    #[cfg(feature = "import_sid")]
+    fn drive_sid(&mut self) {
+        use crate::channel::sid::SidEdge;
+        if self.sid.is_none() {
+            return;
+        }
+        let bank = self.sid.as_mut().unwrap();
+        // Advance the replayer's global VBlank counter once per frame (drives
+        // the shared vibrato / arpeggio phase).
+        bank.begin_frame();
+        for (i, ch) in self.channel.iter_mut().enumerate() {
+            // Honour per-channel mute for the SID exactly like the sample
+            // mixer does for ordinary voices. The chip is folded as a whole
+            // by `mix_frame`, so there is no per-voice gain to zero at mix
+            // time — instead we hard-cut a muted channel's SID voice every
+            // frame, which lets `-c <n>` / `set_mute_channel` solo a single
+            // SID voice for debugging by ear. We still drain the pending
+            // update (`take_sid_update` advances the freq-slide accumulator)
+            // so the channel's slide state stays consistent if it is later
+            // unmuted; an unmuted voice resumes sounding on its next trigger.
+            if ch.is_muted() {
+                let _ = ch.take_sid_update();
+                bank.note_cut(i);
+                continue;
+            }
+            let Some(upd) = ch.take_sid_update() else {
+                continue;
+            };
+            match upd.edge {
+                SidEdge::Cut => bank.note_cut(i),
+                SidEdge::KeyOff => {
+                    // Ordinary note-end release: the replayer may "kill adsr"
+                    // (gate-off + AD/SR=0) on this path for v10/v15 — is_fetch=false.
+                    bank.note_off(i, false);
+                    // The voice keeps sounding through its release — keep its
+                    // per-frame modulation advancing.
+                    bank.advance_fx(i);
+                }
+                SidEdge::KeyOffFetch => {
+                    // Appended note-stream entry = a note-FETCH frame: the
+                    // replayer skips the per-frame effects (PW sweep / vibrato /
+                    // drum HOLD this frame), like a trigger. Release the gate but
+                    // do NOT advance the effects — and NEVER zero AD/SR (the
+                    // replayer re-fetches them from the instrument here, so a long
+                    // note rings out on its release nibble). is_fetch=true.
+                    bank.note_off(i, true);
+                }
+                SidEdge::Trigger => {
+                    if let Some(h) = &upd.held {
+                        if let Some(xmrs::prelude::InstrumentType::RobSid(irs)) =
+                            self.module.instrument.get(h.instr).map(|x| &x.instr_type)
+                        {
+                            // Trigger frame: no effect advance (state starts at
+                            // frame 0).
+                            bank.note_on(i, h.instr, &irs.voice, &irs.fx, h.milli_hz);
+                        }
+                    }
+                }
+                SidEdge::None => {
+                    if let Some(h) = &upd.held {
+                        // Held note, one frame elapses: refresh the tracker
+                        // pitch, then advance the Rob-Hubbard modulation.
+                        bank.set_frequency(i, h.milli_hz);
+                        bank.advance_fx(i);
+                    }
+                }
+            }
+        }
+        // Diagnostic: snapshot this frame's SID register state (no-op unless a
+        // capture is active).
+        bank.capture_frame();
+    }
+
+    #[cfg(not(feature = "import_sid"))]
+    #[inline]
+    fn drive_sid(&mut self) {}
 
     // --- Sample generation ---
 
@@ -465,28 +857,63 @@ impl<'a> Voices<'a> {
     /// accumulator; if a single channel ever saturates it's
     /// the channel's own gain mistake, not a mix-bus stacking
     /// issue).
-    pub(crate) fn mix(&mut self, per_channel_out: Option<&mut [(i16, i16)]>) -> (i32, i32) {
+    pub(crate) fn mix(
+        &mut self,
+        abs_tick: u32,
+        song: u16,
+        per_channel_out: Option<&mut [(i16, i16)]>,
+    ) -> (i32, i32) {
         let mut left: i32 = 0;
         let mut right: i32 = 0;
+
+        // RFC §3B: per-return-bus input accumulators. Empty for every
+        // tracker import (no buses), so the send routing and the
+        // bus/master passes below are measured no-ops ⇒ bit-identical.
+        let mut bus_acc: Vec<(i32, i32)> = vec![(0, 0); self.bus_chains.len()];
+        let module = self.module;
+
+        // RFC §3C: resolve the audio clips for this tick into a
+        // per-channel **pre-insert** injection (so each clip runs its
+        // target channel's insert chain + sends, just like that
+        // channel's notes). `master_extra` collects clips whose target
+        // channel is out of range (direct master sum, v1 reach). Empty
+        // `audio_clips` (every tracker import) ⇒ all-zero injection ⇒
+        // `next_sample_with_inject` ≡ `next_sample` ⇒ bit-identical.
+        let mut audio_inject: Vec<(i32, i32)> = vec![(0, 0); self.channel.len()];
+        let mut master_extra: (i32, i32) = (0, 0);
+        if !self.audio_clips.is_empty() {
+            accumulate_audio_clips(
+                module,
+                &mut self.audio_clips,
+                abs_tick,
+                song,
+                &mut audio_inject,
+                &mut master_extra,
+            );
+        }
 
         let pool = &mut self.pool;
         match per_channel_out {
             None => {
-                for ch in &mut self.channel {
-                    if let Some((l, r)) = ch.next_sample(pool) {
+                for (idx, ch) in self.channel.iter_mut().enumerate() {
+                    let inj = audio_inject.get(idx).copied().unwrap_or((0, 0));
+                    if let Some((l, r)) = ch.next_sample_with_inject(pool, inj) {
                         if !ch.is_muted() {
                             l.accumulate_into(&mut left);
                             r.accumulate_into(&mut right);
+                            route_sends(module, idx, l, r, &mut bus_acc);
                         }
                     }
                 }
             }
             Some(buf) => {
                 for (idx, ch) in self.channel.iter_mut().enumerate() {
-                    let val = match ch.next_sample(pool) {
+                    let inj = audio_inject.get(idx).copied().unwrap_or((0, 0));
+                    let val = match ch.next_sample_with_inject(pool, inj) {
                         Some((l, r)) if !ch.is_muted() => {
                             l.accumulate_into(&mut left);
                             r.accumulate_into(&mut right);
+                            route_sends(module, idx, l, r, &mut bus_acc);
                             (l.as_q15_i16(), r.as_q15_i16())
                         }
                         _ => (0, 0),
@@ -498,25 +925,100 @@ impl<'a> Voices<'a> {
             }
         }
 
+        // OPL (FM): render one chip frame and fold it into the master mix
+        // (RFC Phase A — master-summed; per-channel routing is Phase B).
+        // `None`/idle chip ⇒ skipped ⇒ bit-identical. The chip advances one
+        // step per output frame, matching `mix`'s per-frame cadence.
+        #[cfg(feature = "import_s3m")]
+        if let Some(opl) = self.opl.as_mut() {
+            if opl.any_active() {
+                // Operator output is now ±4084 (the chip's 12-bit width); lift
+                // into the Q1.15 mix domain. Gain calibrated against Schism's
+                // OPL render of `and_this_is_ultrasound.s3m`: the level lands
+                // within ~1 dB at ×9/4 (the previous ±1024-scale ×9, divided by
+                // 4 for the 4× wider operator output).
+                const OPL_OUTPUT_GAIN: i32 = 9;
+                let (ol, or) = opl.render_frame();
+                left = left.saturating_add(ol.saturating_mul(OPL_OUTPUT_GAIN) >> 2);
+                right = right.saturating_add(or.saturating_mul(OPL_OUTPUT_GAIN) >> 2);
+            }
+        }
+
+        // SID: advance every active per-instrument chip one frame and fold the
+        // summed mono mix into the master (Phase A — master-summed; per-voice
+        // routing is Phase B). Each chip's `mix` is already an i16-range,
+        // 3-voice-normalised value, so summing ≤3 active chips lands near
+        // full-scale — folded into the Q1.15 accumulator directly (the master
+        // clamp catches the rare 3-loud-voice peak). `None`/idle ⇒ skipped ⇒
+        // bit-identical.
+        #[cfg(feature = "import_sid")]
+        if let Some(sid) = self.sid.as_mut() {
+            if sid.any_active() {
+                let s = sid.mix_frame();
+                left = left.saturating_add(s);
+                right = right.saturating_add(s);
+            }
+        }
+
+        // RFC §3B: run each return bus's accumulated input through its
+        // chain and sum back into the master mix. No buses ⇒ skipped.
+        for (i, chain) in self.bus_chains.iter_mut().enumerate() {
+            let input = (
+                Amp::from_q15_i32_sat(bus_acc[i].0),
+                Amp::from_q15_i32_sat(bus_acc[i].1),
+            );
+            let out = if chain.is_active() {
+                chain.process(input)
+            } else {
+                input
+            };
+            out.0.accumulate_into(&mut left);
+            out.1.accumulate_into(&mut right);
+        }
+
+        // RFC §3C: audio clips with an out-of-range target channel were
+        // collected into `master_extra` above — fold them straight into
+        // the master accumulator (before the master chain, so they still
+        // get master processing). In-range clips already reached here via
+        // their channel strip. (0, 0) for every tracker import.
+        left = left.saturating_add(master_extra.0);
+        right = right.saturating_add(master_extra.1);
+
+        // RFC §3B: master-bus insert chain on the final summed mix.
+        // Empty ⇒ left/right untouched ⇒ bit-identical to the pre-3B
+        // accumulator that `apply_final_gain` consumes.
+        if self.master_chain.is_active() {
+            let m = self
+                .master_chain
+                .process((Amp::from_q15_i32_sat(left), Amp::from_q15_i32_sat(right)));
+            left = m.0.as_q15_i16() as i32;
+            right = m.1.as_q15_i16() as i32;
+        }
+
         (left, right)
     }
 
-    /// Apply `global_volume × amplification` to a pre-gain
-    /// accumulator and saturate to `i16` Q1.15. Matches the OLD
-    /// f32 iterator path's gain composition: `mix_volume` is
-    /// kept in `self` for the rarely-used `voices.mix(true, _)`
-    /// path but is **NOT** folded in here, because the OLD
-    /// iterator path didn't apply it either — folding it now
-    /// would attenuate the output by `module.mix_volume / 8`
-    /// (≈ 21× quieter / −26 dB on XM modules where
-    /// `mix_volume = 48/128`).
+    /// Apply `global_volume × mix_volume × amplification` to a
+    /// pre-gain accumulator and saturate to `i16` Q1.15.
+    ///
+    /// `mix_volume` is the module's master mix scaling (IT/S3M read it
+    /// from the file; XM/MOD use the format's conventional headroom;
+    /// other formats leave it at `Volume::FULL` = identity, so they are
+    /// unaffected). It is folded into the `global_volume` factor while
+    /// both are still ≤ 1 in Q1.15, which keeps the multiply in the same
+    /// bit budget as a two-factor gain (no overflow) and, crucially,
+    /// attenuates **before** the i16 clamp so a hot mix can't clip first
+    /// and then be scaled down into distortion.
     pub(crate) fn apply_final_gain(&self, sum: (i32, i32)) -> (i16, i16) {
         let gv = self.global_volume.as_q15_i32() as i64; // Q1.15
+        let mv = self.mix_volume.as_q15_i32() as i64; // Q1.15
         let amp = self.amplification.as_q4_12_i32() as i64; // Q4.12
 
-        // Q1.15 × Q4.12 = Q5.27. Apply to sample (i32 Q1.15) →
-        // Q6.42. Narrow `>> 27` round-half.
-        let g_q27 = gv.max(0) * amp.max(0); // Q5.27
+        // Fold the two ≤1 factors first, staying in Q1.15 (round-half):
+        // `global_volume × mix_volume`. Then × amplification → Q5.27,
+        // applied to the Q1.15 sample and narrowed `>> 27`.
+        let gvm = (gv.max(0) * mv.max(0) + (1 << 14)) >> 15; // Q1.15
+        let g_q27 = gvm * amp.max(0); // Q5.27
 
         let bias: i64 = 1 << 26;
         let apply = |s: i32| -> i16 {

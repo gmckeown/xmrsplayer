@@ -162,16 +162,16 @@ impl<'a> VoicePool<'a> {
         self.slots.len()
     }
 
-    /// Number of slots currently occupied. Test-only.
-    #[cfg(test)]
+    /// Number of slots currently occupied.
     pub fn allocated_count(&self) -> usize {
         self.allocated
     }
 
-    /// `true` when every slot is occupied. Test-only: `allocate`
-    /// no longer fails on full so production code never needs to
-    /// check.
-    #[cfg(test)]
+    /// `true` when every slot is occupied. Consulted by the NNA
+    /// trigger path (`Channel::spawn_ghost_for_outgoing`) to decide
+    /// whether the outgoing voice can be backgrounded without forcing
+    /// an eviction — mirroring schism's `csf_get_nna_channel`, which
+    /// returns 0 (refuse to background) when no NNA channel is free.
     pub fn is_full(&self) -> bool {
         self.free_head == NIL
     }

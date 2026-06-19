@@ -3,7 +3,7 @@
 //! reset flags, and the per-tick instrument tick.
 
 use xmrs::core::fixed::fixed::Q15;
-use xmrs::core::fixed::units::{Panning, PitchDelta, Volume};
+use xmrs::core::fixed::units::PitchDelta;
 use xmrs::prelude::*;
 
 use crate::triggerkeep::{
@@ -127,17 +127,17 @@ impl<'a> Channel<'a> {
                 // take the `TRIGGER_KEEP_PERIOD` path above and skip this
                 // block entirely — they don't count as new-note triggers.
                 if self.vibrato_retrig_on_new_note {
-                    self.effect_vibrato.retrigger_q();
+                    self.retrigger_vibrato_all();
                 }
                 if self.tremolo_retrig_on_new_note {
-                    self.effect_tremolo.retrigger_q();
+                    self.retrigger_tremolo_all();
                 }
 
                 let points_pitch = self.track_pitch_points_delta();
                 let eff = instr.update_frequency(
                     self.period,
                     PitchDelta::ZERO,
-                    self.effect_vibrato.value_raw(),
+                    self.vibrato_value_raw(),
                     points_pitch,
                     self.effect_semitone,
                 );
@@ -185,82 +185,43 @@ impl<'a> Channel<'a> {
         }
     }
 
+    /// RFC §2A — assemble this channel's per-tick [`VoiceMod`] bus: a
+    /// pure read of the channel-side modulation (period, volume, pan,
+    /// channel-volume, the §1B-summed LFO outputs, arpeggio, Points
+    /// transpose, glissando/tremor flags). The voice-internal envelope
+    /// is deliberately *absent* — a voice folds that in itself at
+    /// [`StateInstrDefault::apply_voice_mod`] time.
+    pub(super) fn voice_mod(&self) -> crate::voice_mod::VoiceMod {
+        let arp_pitch = if self.current.has_arpeggio() {
+            self.effect_arpeggio.value_pitch_delta()
+        } else {
+            PitchDelta::ZERO
+        };
+        crate::voice_mod::VoiceMod {
+            period: self.period,
+            volume: self.volume,
+            panning: self.panning,
+            channel_volume: self.channel_volume,
+            arp_pitch,
+            vibrato_raw: self.vibrato_value_raw(),
+            points_pitch: self.track_pitch_points_delta(),
+            semitone: self.effect_semitone,
+            tremolo: self.tremolo_value_q15(),
+            panbrello: self.panbrello_value_q15(),
+            tremor: self.effect_tremor,
+        }
+    }
+
     pub(super) fn tickn_update_instr(&mut self, pool: &mut VoicePool<'a>) {
+        // RFC §2A: fill the modulation bus from the channel, then let
+        // the live voice consume it (combining with its own envelope).
+        // One consumer today → bit-identical to the pre-2A inline path;
+        // §2B re-points `apply_voice_mod` across every voice.
+        let m = self.voice_mod();
         if let Some(instr) = self.live_mut(pool) {
-            // Panning chain in pure Q1.15 raw arithmetic.
-            //
-            //   pan      = self.panning             (Q1.15 [0, 32768])
-            //   spc      = 1 − 2·|pan − 0.5|        (Q1.15 [0, 32768])
-            //              = 32768 − 2·|pan − 16384|
-            //   env_off  = envelope.value − 0.5     (Q1.15 signed
-            //                                       [-16384, +16384])
-            //   panbrello = LFO output              (Q1.15 signed
-            //                                       [-32768, +32767])
-            //   panning  = pan
-            //            + (env_off    × spc) >> 15
-            //            + (panbrello  × spc) >> 15
-            //   panning = clamp(panning, 0, 32767)
-            const HALF: i32 = 16384; // 0.5 in Q1.15 raw
-            const ONE: i32 = 32768; // 1.0 in Q1.15 raw (same as Volume::FULL+1)
-            let pan_q15: i32 = self.panning.as_q15_i32();
-            let dist = (pan_q15 - HALF).abs();
-            let spc_q15: i32 = ONE - 2 * dist; // [0, 32768]
-            let env_off_q15: i32 = instr.envelope_panning.value.as_q15_i32() - HALF;
-            let panbrello_q15: i32 = self.effect_panbrello.value_q15().raw() as i32;
-
-            // Q1.15 × Q1.15 = Q2.30, narrow >> 15 → Q1.15.
-            // The intermediate fits in i32: max 32768 × 16384 = 5 × 10^8.
-            let env_contrib = (env_off_q15 * spc_q15) >> 15;
-            let panbrello_contrib = (panbrello_q15 * spc_q15) >> 15;
-            let panning = Panning::from_q15(Q15::from_i32_unsigned_sat(
-                pan_q15 + env_contrib + panbrello_contrib,
-            ));
-
-            // Volume chain: pure Q1.15 from `self.volume` to the
-            // final `Volume`.
-            //
-            //   volume.with_tremolo(tremolo)             // Volume + Q15
-            //         .scaled_by(instr.get_volume())     // × Volume
-            //         .let cv.applied_to(...)            // × ChannelVolume
-            let volume_q = if !self.effect_tremor {
-                let v = self
-                    .volume
-                    .with_tremolo(self.effect_tremolo.value_q15())
-                    .scaled_by(instr.get_volume());
-                self.channel_volume.applied_to(v)
-            } else {
-                Volume::SILENT
-            };
-
-            // Tracker panning is linear: 0 → full left, FULL → full
-            // right. `actual_volume[0]` multiplies the left sample
-            // channel, `actual_volume[1]` the right (every
-            // historical tracker — PT/ST3/FT2/IT — and schism's
-            // `sndmix.c:544`).
-            let (pan_left, pan_right) = panning.stereo_split_linear();
-            self.actual_volume[0] = volume_q.scaled_by(pan_left);
-            self.actual_volume[1] = volume_q.scaled_by(pan_right);
-
-            // Frequency
-            let arp_pitch = if self.current.has_arpeggio() {
-                self.effect_arpeggio.value_pitch_delta()
-            } else {
-                PitchDelta::ZERO
-            };
-            let points_pitch = self.track_pitch_points_delta();
-
-            let eff = instr.update_frequency(
-                self.period,
-                arp_pitch,
-                self.effect_vibrato.value_raw(),
-                points_pitch,
-                self.effect_semitone,
-            );
-            // `eff` is an owned `Option<Period>`, so the `instr` borrow
-            // of `self` (via `live_mut`) ends here — record the played
-            // period for the snapshot. Falls back to the nominal period
-            // when no sample is loaded.
-            self.effective_period = eff.unwrap_or(self.period);
+            let (actual_volume, effective_period) = instr.apply_voice_mod(&m);
+            self.actual_volume = actual_volume;
+            self.effective_period = effective_period;
         }
     }
 }

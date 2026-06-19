@@ -16,6 +16,7 @@ pub(crate) mod state_filter;
 pub(crate) mod state_instr_default;
 pub(crate) mod state_sample;
 pub(crate) mod voice;
+pub(crate) mod voice_mod;
 
 /// Generational arena of `Voice`s, indexed by opaque `VoiceId`
 /// handles. Owns every live and ghost voice the player has in

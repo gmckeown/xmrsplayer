@@ -358,6 +358,10 @@ impl<'a> XmrsPlayer<'a> {
     // --- Global gain accessors (replace pre-0.10 `pub` fields) ---
 
     /// Q1.15 song-driven master volume.
+    pub fn allocated_voice_count(&self) -> usize {
+        self.voices.allocated_voice_count()
+    }
+
     pub fn global_volume(&self) -> xmrs::core::fixed::units::Volume {
         self.voices.global_volume()
     }
@@ -519,8 +523,9 @@ impl<'a> XmrsPlayer<'a> {
         // `process_row` → `tick0` (per-lane automation fold) so the two
         // stay in lock-step.
         let abs_tick = self.sequencer.current_abs_tick_monotonic();
-        let cells_vec: Vec<(xmrs::core::cell::Cell, Option<usize>)> =
-            self.module.row_at_with_playhead(song, pattern, row, abs_tick);
+        let cells_vec: Vec<(xmrs::core::cell::Cell, Option<usize>)> = self
+            .module
+            .row_at_with_playhead(song, pattern, row, abs_tick);
 
         // 1. Voices (the built-in row consumer) processes the row.
         //    `abs_tick` + `song` are threaded so the Channel layer
@@ -706,12 +711,18 @@ impl<'a> XmrsPlayer<'a> {
             return None;
         }
 
+        // RFC §3C: audio clips are positioned by the current playback
+        // tick + sub-song. Constant across a tick's samples; the
+        // per-clip cursor gives sample accuracy inside the tick.
+        let audio_tick = self.sequencer.current_abs_tick_monotonic();
+        let audio_song = self.current_song() as u16;
+
         let capture = !self.audio_channels_observers.is_empty();
         let mix_pre_gain_i32 = if capture {
             let buf = self.per_channel_buffer.as_mut_slice();
-            self.voices.mix(Some(buf))
+            self.voices.mix(audio_tick, audio_song, Some(buf))
         } else {
-            self.voices.mix(None)
+            self.voices.mix(audio_tick, audio_song, None)
         };
 
         // Pre-gain mix as i16 for the observer dispatch — saturating

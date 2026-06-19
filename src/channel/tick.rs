@@ -34,6 +34,9 @@ impl<'a> Channel<'a> {
         // Clear the per-tick re-attack flag before any retrigger effect
         // (e.g. Rxy) this tick can set it (see `struck_this_tick`).
         self.struck_this_tick = false;
+        // RFC §3A: drive insert-device params from automation (no-op
+        // unless this channel has a non-empty insert chain).
+        self.update_device_params();
         if let Some(instr) = self.live_mut(pool) {
             instr.tick();
             self.tickn_effects(current_tick, pool);
@@ -42,6 +45,22 @@ impl<'a> Channel<'a> {
             self.tickn_effects(current_tick, pool);
             self.tickn_update_instr(pool);
         }
+        // OPL (FM) channel with no sample voice: still run the channel-level
+        // effects so the held FM note tracks porta / pitch-slide / vibrato /
+        // arpeggio / volume-slide / tremolo. The voice-coupled work inside
+        // `tickn_effects` no-ops (no live voice); there's no sample step to
+        // update. Gated on a held OPL note ⇒ never fires for sample channels
+        // ⇒ bit-identical.
+        #[cfg(feature = "import_s3m")]
+        if self.opl.instr.is_some() && self.live(pool).is_none() && !self.current.has_delay() {
+            self.tickn_effects(current_tick, pool);
+        }
+        // NOTE: a SID channel does NOT run `tickn_effects` here (unlike OPL). The
+        // SID is a linear-frequency chip, so a pitch slide must accumulate in Hz
+        // space, not in the semitone-linear `self.period` (period-space porta is
+        // exponential in Hz and diverges ~25% mid-sweep from the chip). The SID
+        // freq slide is applied directly in milli-Hz by `sid_advance_freq_slide`
+        // — see `channel/sid.rs`.
         // Advance ghost voices even if the live instrument is gone —
         // ghosts have independent envelope state and must keep
         // decaying regardless of what the pattern is doing.

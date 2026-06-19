@@ -4,6 +4,7 @@ use crate::{
     state_auto_vibrato::StateAutoVibrato, state_envelope::StateEnvelope, state_filter::StateFilter,
     state_sample::StateSample,
 };
+use xmrs::core::cell::NoteExpression;
 use xmrs::core::fixed::fixed::Q15;
 use xmrs::core::fixed::units::{Amp, EnvValue, Finetune, Panning, PitchDelta, SampleRate, Volume};
 use xmrs::prelude::*;
@@ -104,6 +105,14 @@ pub struct StateInstrDefault<'a> {
     /// the enable flag); otherwise remains in pass-through. Applied
     /// on every output sample in `Iterator::next`.
     pub(crate) filter: StateFilter,
+
+    /// RFC §2C — this voice's per-note expression (MPE), snapshotted
+    /// from the triggering cell. Folded into the voice's own pitch
+    /// (`update_frequency`) and volume / pan (`apply_voice_mod`) so two
+    /// voices on the same channel (a held ghost + a fresh note) carry
+    /// **independent** modulation. [`NoteExpression::NEUTRAL`] for every
+    /// tracker note ⇒ the fold is a measured no-op ⇒ bit-identical.
+    pub expression: NoteExpression,
 }
 
 impl<'a> StateInstrDefault<'a> {
@@ -143,6 +152,7 @@ impl<'a> StateInstrDefault<'a> {
             sample_volume_is_static_gain,
             panning: Panning::CENTER,
             filter,
+            expression: NoteExpression::NEUTRAL,
         }
     }
 
@@ -474,37 +484,44 @@ impl<'a> StateInstrDefault<'a> {
             //   modifier   = (value - 0.5) * 512
             //   new_cutoff = base * (modifier + 256) / 256
             //              = base * (value * 512) / 256
-            //              = base * value * 2
+            //              = base * value * 2          (= schism register S, 0..255)
             //
-            // Cases:
-            //   value = 0.0 → cutoff = 0       (filter fully closed)
-            //   value = 0.5 → cutoff = base    (no change)
-            //   value = 1.0 → cutoff = 2*base  (clamped at 127)
+            // Cases (schism register S):
+            //   value = 0.0 → S = 0      (filter fully closed)
+            //   value = 0.5 → S = base   (neutral)
+            //   value = 1.0 → S = 2*base
             //
-            // The base cutoff comes from the instrument header byte
-            // — the bottom 7 bits of `initial_filter_cutoff` (bit 7
-            // is the enable flag and is consumed elsewhere). xmrs's
-            // cutoff register is clamped to 0..=127 by
-            // `set_cutoff_reg`, so the modulated value clamps there
-            // even though schism allows 0..255. That's a property
-            // of xmrs's filter coefficient table, unrelated to the
-            // modulation logic.
+            // Two corrections vs. the original code:
             //
-            // The previous code substituted `value * 127` as the
-            // cutoff outright, which: (a) ignored the instrument's
-            // base cutoff entirely, and (b) silenced any sample at
-            // envelope-value 0.5 (true neutral) by setting cutoff
-            // to ~63 regardless of intent.
+            // (1) **Base default.** Schism initialises every voice's
+            //     cutoff to 0x7F and only overwrites it when the
+            //     instrument's IFC *enable* bit (0x80) is set
+            //     (`effects.c`: `if (penv->ifc & 0x80) chan->cutoff =
+            //     penv->ifc & 0x7F`). A filter envelope with no
+            //     explicit IFC therefore sweeps from a *fully open*
+            //     127 base — not 0. The old code used `ifc & 0x7F`
+            //     unconditionally, so an envelope-only filter (IFC=0,
+            //     the common case — e.g. `xemogasa_-_azure.it`) was
+            //     pinned shut at ~130 Hz, gutting the midrange.
+            //
+            // (2) **Register scale.** `base*value*2` is schism's 0..255
+            //     register `S`. xmrs's cutoff LUT is the *half-scale*
+            //     0..127 register (LUT exponent = reg/24 = S/48), and
+            //     the static path already feeds it `base` (≡ S/2). The
+            //     envelope path must match: feed `S/2 = base*value`,
+            //     i.e. `>> 15` (not `>> 14`). The old `>> 14` doubled
+            //     the exponent — too bright by an octave-plus and
+            //     clipping at the 127 ceiling.
             if self.instr.voice.pitch_envelope_as_low_pass_filter {
-                // Q-format integer modulation:
-                //   modulated = clamp(base × envelope_value × 2, 0, 127)
-                // base ∈ 0..=127, envelope_value Q1.15 raw [0, 32767].
-                //   `(base × env_q15 × 2) >> 15`
-                // = `(base × env_q15) >> 14`
-                // Saturate at 127.
-                let base = (self.instr.voice.initial_filter_cutoff & 0x7F) as i32;
+                let ifc = self.instr.voice.initial_filter_cutoff;
+                let base = if ifc & 0x80 != 0 {
+                    (ifc & 0x7F) as i32
+                } else {
+                    0x7F
+                };
                 let env_q15 = self.envelope_pitch.value.as_q15_i32().max(0);
-                let modulated = ((base * env_q15) >> 14).min(127) as u8;
+                // modulated = base * value  (= S/2, the xmrs-scale register)
+                let modulated = ((base * env_q15) >> 15).min(127) as u8;
                 self.filter.set_cutoff_reg(modulated);
             }
         }
@@ -593,8 +610,17 @@ impl<'a> StateInstrDefault<'a> {
         // other semitone deltas but, like the pitch envelope, is NOT a
         // reason to engage the FT2 arpeggio LUT/clamp, so it stays out
         // of `arp_active`.
-        let delta_q88 = (arp_pitch + pitch_env_offset + vibrato_semitone + vibrato_mod
-            + points_pitch)
+        // RFC §2C: this voice's own per-note pitch bend (MPE) joins the
+        // semitone-space delta sum, just like the Points transpose. It
+        // is `ZERO` for every tracker note ⇒ no change. Like the pitch
+        // envelope it does NOT engage the FT2 arpeggio LUT/clamp, so it
+        // stays out of `arp_active`.
+        let delta_q88 = (arp_pitch
+            + pitch_env_offset
+            + vibrato_semitone
+            + vibrato_mod
+            + points_pitch
+            + self.expression.pitch_bend)
             .as_q8_8_i32();
         let arp_active = (arp_pitch + pitch_env_offset) != PitchDelta::ZERO;
 
@@ -632,6 +658,69 @@ impl<'a> StateInstrDefault<'a> {
         // step just set — hand it back so the channel can expose the
         // played pitch (see the doc above).
         Some(period_q)
+    }
+
+    /// RFC §2A — apply a channel's per-tick [`VoiceMod`] bus to **this**
+    /// voice: combine the channel-side modulation with the voice's own
+    /// envelope state to produce the final stereo gains and set the
+    /// per-sample step. Returns `(actual_volume[L, R], effective_period)`.
+    ///
+    /// This is the verbatim relocation of the panning / volume /
+    /// frequency arithmetic that lived inline in
+    /// `Channel::tickn_update_instr` before 2A — same Q1.15 constants,
+    /// same order. The only change is *who owns it*: the per-voice apply
+    /// point that §2B re-points across every voice (live + ghosts, MPE).
+    pub fn apply_voice_mod(
+        &mut self,
+        m: &crate::voice_mod::VoiceMod,
+    ) -> ([Volume; 2], xmrs::core::fixed::units::Period) {
+        // Panning chain in pure Q1.15 raw arithmetic (see the original
+        // derivation in `tickn_update_instr`).
+        // `HALF` is the canonical Q1.15 0.5 (`0x4000`). `ONE` is the
+        // arithmetic unity *scale* `2^15`, deliberately **not**
+        // `Q15::ONE` (`0x7FFF`): the `>> 15` math below needs the true
+        // power-of-two so the `spc_q15` triangle reaches full scale.
+        const HALF: i32 = Q15::HALF.raw() as i32;
+        const ONE: i32 = 1 << 15;
+        let pan_q15: i32 = m.panning.as_q15_i32();
+        let dist = (pan_q15 - HALF).abs();
+        let spc_q15: i32 = ONE - 2 * dist; // [0, 32768]
+        let env_off_q15: i32 = self.envelope_panning.value.as_q15_i32() - HALF;
+        let panbrello_q15: i32 = m.panbrello.raw() as i32;
+        let env_contrib = (env_off_q15 * spc_q15) >> 15;
+        let panbrello_contrib = (panbrello_q15 * spc_q15) >> 15;
+        // RFC §2C: this voice's per-note pan offset (MPE), `ZERO` for
+        // tracker notes. Added on top of the channel pan + panbrello.
+        let panning = Panning::from_q15(Q15::from_i32_unsigned_sat(
+            pan_q15 + env_contrib + panbrello_contrib,
+        ))
+        .shifted_by(self.expression.pan);
+
+        // Volume chain. RFC §2C: the per-note volume delta (MPE
+        // pressure) folds in like a second tremolo — `ZERO` for tracker
+        // notes ⇒ unchanged.
+        let volume_q = if !m.tremor {
+            let v = m
+                .volume
+                .with_tremolo(m.tremolo)
+                .with_tremolo(self.expression.volume)
+                .scaled_by(self.get_volume());
+            m.channel_volume.applied_to(v)
+        } else {
+            Volume::SILENT
+        };
+
+        let (pan_left, pan_right) = panning.stereo_split_linear();
+        let actual_volume = [volume_q.scaled_by(pan_left), volume_q.scaled_by(pan_right)];
+
+        let eff = self.update_frequency(
+            m.period,
+            m.arp_pitch,
+            m.vibrato_raw,
+            m.points_pitch,
+            m.semitone,
+        );
+        (actual_volume, eff.unwrap_or(m.period))
     }
 
     /// Snap + clamp + sum + encode shared between the two

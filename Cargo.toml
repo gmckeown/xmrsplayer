@@ -1,22 +1,32 @@
 [package]
 name = "xmrsplayer"
-version = "0.13.2"
+version = "0.14.0"
 edition = "2021"
-description = "XMrsPlayer is a safe no-std soundtracker music player"
+description = "Safe, no_std SoundTracker music player — plays MOD/XM/S3M/IT/DW with cycle-accurate SID and OPL/AdLib FM synthesis."
 authors = ["Sebastien Bechet"]
 documentation = "https://docs.rs/xmrsplayer"
 repository = "https://codeberg.org/sbechet/xmrsplayer"
 
 readme = "README.md"
 license = "MIT"
+# Internal design/RE notes under `src/` are kept in-tree but excluded from the
+# published tarball (`README.md` sits at the crate root, so it still ships).
+exclude = [
+    "src/**/*.md",
+    # Integration tests + their ~1.3 MB of fixtures (corpus/pcm/sid_oracle) run
+    # from the repo, never by downstream consumers — don't bloat the tarball.
+    "tests/",
+    # Python dev helper — has no place in a published Rust crate.
+    "examples/regdiff.py",
+]
 
-keywords = ["xm", "mod", "s3m", "it", "soundtracker"]
+keywords = ["soundtracker", "chiptune", "sid", "tracker", "music"]
 categories = ["multimedia::audio", "embedded", "no-std"]
 
 [dependencies]
 # `xmrs` is pulled in without default features; the `std` feature (on by
 # default here) re-enables it below.
-xmrs = { version = "0.13.2", path = "../xmrs", default-features = false }
+xmrs = { version = "0.14.0", path = "../xmrs", default-features = false }
 # `clap` defaults drop the `suggestions` feature (`-Did you mean
 # --foo?` typo correction) — it pulls in `strsim` for fuzzy
 # string match and costs ~12 KB in the final binary while
@@ -69,7 +79,20 @@ demo = ["std", "import", "clap", "console", "cpal", "hound"]
 # `import` is an umbrella for all importers. Downstreams that want
 # a smaller binary can disable it and pick only the formats they
 # need, e.g. `features = ["std", "import_xm"]`.
-import = ["xmrs/import"]
+#
+# It must enable xmrsplayer's *own* per-format features (not just
+# `xmrs/import`), because player-side code is now gated on them — e.g.
+# the OPL FM synthesiser is `#[cfg(feature = "import_s3m")]`. Without
+# this, a default / `demo` build would silently drop FM playback.
+import = [
+    "xmrs/import",
+    "import_mod",
+    "import_xm",
+    "import_s3m",
+    "import_it",
+    "import_sid",
+    "import_dw",
+]
 import_mod = ["xmrs/import_mod"]
 import_xm  = ["xmrs/import_xm"]
 import_s3m = ["xmrs/import_s3m"]
@@ -87,24 +110,32 @@ lto = true
 codegen-units = 1
 panic = "abort"
 
+[dev-dependencies]
+# Serde round-trip harness for the DAW-generalization compatibility
+# contract (DAW_GENERALIZATION_RFC §0.3). Test-only; the library itself
+# stays serde-format-agnostic.
+serde_json = "1.0"
+# Decompresses the gzip-packed SID-oracle fixtures (tests/fixtures_sid_oracle/
+# *.csv.gz) for the `sid_oracle_fidelity_golden` gate. Test-only.
+flate2 = "1.0"
+
 [[bin]]
 name = "xmrsplayer"
 path = "src/bin/cpal_player.rs"
 required-features = ["demo"]
 
-# arp_bug is a pure-computation example that uses only core/std — no
-# feature-gated deps needed.
-[[example]]
-name = "arp_bug"
-path = "examples/arp_bug.rs"
+# arp_bug needs no explicit [[example]] block: it sits at the default path and
+# pulls no feature-gated deps, so auto-discovery handles it (pure-computation,
+# uses only core/std).
 
-# Read-only DAW-layer dump for chasing import-time regressions.
-# Gated behind `demo` because it uses `Module::load` autodetection
-# (which pulls every importer).
+# Read-only DAW-layer dump for chasing import-time regressions. Needs `std`
+# (reads a file off disk) + `import` (`Module::load` autodetection); it touches
+# none of the `demo`-only deps (cpal/hound/clap/console), so don't over-gate it
+# to `demo`. (`xmrs/import` doesn't even build without `std`.)
 [[example]]
 name = "inspect_mod"
 path = "examples/inspect_mod.rs"
-required-features = ["demo"]
+required-features = ["std", "import"]
 
 # DW Tier-2 fidelity: player-side per-tick trace in the Paula-oracle CSV
 # schema, for diffing against xmrs/.../dw/oracle/*.csv → BASELINE.md.

@@ -524,12 +524,7 @@ impl<'a> Sequencer<'a> {
         // monotonic playhead keeps advancing; the per-lane fold then
         // keeps every voice continuous across the replay (no global
         // snap-back). Takes precedence over `song_loop_to`.
-        if self
-            .module
-            .channel_loops
-            .iter()
-            .any(|l| l.song == song_u16)
-        {
+        if self.module.channel_loops.iter().any(|l| l.song == song_u16) {
             self.loop_generation = self.loop_generation.saturating_add(1);
             return self.first_entry_of_current_song();
         }
@@ -559,10 +554,10 @@ impl<'a> Sequencer<'a> {
     /// (or absent), the latch is cleared to 0 — already done by the
     /// caller right above, so this method only writes when armed.
     fn latch_bpm_slide_from_lane(&mut self, abs_tick: u32) {
-        for lane in self
-            .module
-            .lanes_for(xmrs::core::daw::automation::AutomationTarget::Bpm)
-        {
+        for lane in self.module.lanes_for(
+            xmrs::core::daw::automation::AutomationTarget::Bpm,
+            self.current_song as u16,
+        ) {
             if let Some(state) = lane.slide_state_at(abs_tick) {
                 if state.armed {
                     self.bpm_slide_delta = state.rate.raw() as isize;
@@ -860,7 +855,10 @@ mod timeline_idx_tests {
         // monotonic keeps rising (0,3,6,9,12,15,18,21) — no global snap.
         let looped = collect(&build(true));
         assert_eq!(
-            looped.iter().map(|&(_, mono)| mono).collect::<alloc::vec::Vec<_>>(),
+            looped
+                .iter()
+                .map(|&(_, mono)| mono)
+                .collect::<alloc::vec::Vec<_>>(),
             alloc::vec![0, 3, 6, 9, 12, 15, 18, 21],
             "free-run monotonic tick must keep rising across the timeline replay"
         );

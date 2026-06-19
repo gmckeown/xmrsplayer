@@ -106,7 +106,19 @@ use xmrs::tracker::import::sid::sid_module::SidModule;
 #[derive(Parser)]
 struct Cli {
     /// Choose XM or XmRs File
-    #[arg(short = 'f', long, required = true, value_name = "filename")]
+    #[cfg_attr(
+        feature = "import_sid",
+        arg(
+            short = 'f',
+            long,
+            required_unless_present = "sid_test_player",
+            value_name = "filename"
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "import_sid"),
+        arg(short = 'f', long, required = true, value_name = "filename")
+    )]
     filename: Option<String>,
 
     /// Sub-song number, counted from 1 (1 = first sub-song; most
@@ -171,46 +183,90 @@ struct Cli {
     #[arg(short = 'D', long, default_value = "false")]
     duration: bool,
 
-    /// Test SID player as a Proof of Concept
+    /// Test the SID player (Proof of Concept). Takes a tune name
+    /// (e.g. `monty`, `lightforce`), or `list` to print every
+    /// available name and exit. Bare `--sid` (no value) is treated
+    /// as `list`. See `SID_REGISTRY` for the full set. In this mode
+    /// `--filename` is not required.
     #[cfg(feature = "import_sid")]
-    #[arg(short = 'z', long, default_value = "false")]
-    sid_test_player: bool,
+    #[arg(
+        long = "sid",
+        value_name = "name|list",
+        num_args = 0..=1,
+        default_missing_value = "list"
+    )]
+    sid_test_player: Option<String>,
 }
 
+/// Every SID tune the PoC can build, as `(cli name, constructor)`.
+/// This is the single source of truth: `--sid <name>` and `--sid list`
+/// both read from here, so adding a tune is one line and needs no
+/// other change.
+/// A bundled SID tune: its CLI name and a zero-arg constructor.
 #[cfg(feature = "import_sid")]
-fn sid_test_player(cli: &Cli) {
-    // let sidmodule = SidModule::get_sid_commando();
-    // let sidmodule = SidModule::get_sid_crazy_comets();
-    let sidmodule = SidModule::get_sid_monty_on_the_run();
-    // let sidmodule = SidModule::get_sid_last_v8();
-    // let sidmodule = SidModule::get_sid_thing_on_a_spring();
-    // let sidmodule = SidModule::get_sid_zoid();
-    // let sidmodule = SidModule::get_sid_ace_2();
-    // let sidmodule = SidModule::get_sid_delta();
-    // let sidmodule = SidModule::get_sid_human_race();
-    // let sidmodule = SidModule::get_sid_international_karate();
-    // let sidmodule = SidModule::get_sid_lightforce();
-    // let sidmodule = SidModule::get_sid_sanxion_song_1();
-    // let sidmodule = SidModule::get_sid_sanxion_song_2();
-    // let sidmodule = SidModule::get_sid_spellbound();
+type SidTune = (&'static str, fn() -> SidModule);
 
-    let modules = sidmodule.to_modules(false);
+#[cfg(feature = "import_sid")]
+const SID_REGISTRY: &[SidTune] = &[
+    ("commando", SidModule::get_sid_commando),
+    ("crazy_comets", SidModule::get_sid_crazy_comets),
+    ("last_v8", SidModule::get_sid_last_v8),
+    ("monty", SidModule::get_sid_monty_on_the_run),
+    ("thing_on_a_spring", SidModule::get_sid_thing_on_a_spring),
+    ("zoid", SidModule::get_sid_zoid),
+    // --- WIP ---
+    ("ace_2", SidModule::get_sid_ace_2),
+    ("delta", SidModule::get_sid_delta),
+    ("human_race", SidModule::get_sid_human_race),
+    (
+        "international_karate",
+        SidModule::get_sid_international_karate,
+    ),
+    ("lightforce", SidModule::get_sid_lightforce),
+    ("sanxion_song_1", SidModule::get_sid_sanxion_song_1),
+    ("sanxion_song_2", SidModule::get_sid_sanxion_song_2),
+    ("spellbound", SidModule::get_sid_spellbound),
+    ("thrust", SidModule::get_sid_thrust),
+];
 
+/// Build a SID tune by name and play (or time, with `--duration`) it.
+#[cfg(feature = "import_sid")]
+fn sid_play_one(cli: &Cli, name: &str, ctor: fn() -> SidModule) {
+    let modules = ctor().to_modules();
     let leaked_modules: &'static [Module] = Box::leak(modules.into_boxed_slice());
-    let module_ref: &'static Module = &leaked_modules[0];
+    let total = leaked_modules.len();
+
+    // Unlike DW (sub-songs share one Module timeline), `SidModule::to_modules`
+    // emits ONE Module per sub-song. So `--song` selects WHICH module here, and
+    // each is mono-song — we always play its internal song 0.
+    let Some(module_ref) = leaked_modules.get(cli.song) else {
+        eprintln!(
+            "error: --song {} out of range ({name} has {total} sub-song(s), 1..={total})",
+            cli.song + 1,
+        );
+        std::process::exit(2);
+    };
+
+    // Header: the importer already baked the SID metadata into the Module
+    // (`name` = tune name, `comment` = "copyright - author"), so just read it
+    // back instead of reaching into the SidModule.
+    println!("SID tune: {name}");
+    println!("  Name      : {}", module_ref.name);
+    println!("  Comment   : {}", module_ref.comment);
+    println!("  Sub-song  : {}/{}", cli.song + 1, total);
 
     // `--duration` short-circuits here too — the SID-test path
     // can answer the question without ever spinning up an audio
     // stream.
     if cli.duration {
-        let d = module_ref.duration(cli.song);
+        let d = module_ref.duration(0);
         println!("{}", format_mm_ss(d));
         return;
     }
 
     play_music(
         module_ref,
-        cli.song,
+        0,
         cli.amplification,
         cli.position,
         cli.loops,
@@ -219,6 +275,25 @@ fn sid_test_player(cli: &Cli) {
         cli.speed,
         cli.output.clone(),
     );
+}
+
+#[cfg(feature = "import_sid")]
+fn sid_test_player(cli: &Cli, selector: &str) {
+    match selector {
+        "list" => {
+            println!("Available SID tunes (use --sid <name>):");
+            for (name, _) in SID_REGISTRY {
+                println!("  {name}");
+            }
+        }
+        name => match SID_REGISTRY.iter().find(|(n, _)| *n == name) {
+            Some((name, ctor)) => sid_play_one(cli, name, *ctor),
+            None => {
+                eprintln!("error: unknown SID tune '{name}'. Use --sid list to see all.");
+                std::process::exit(2);
+            }
+        },
+    }
 }
 
 fn main() -> Result<(), std::io::Error> {
@@ -245,8 +320,8 @@ fn main() -> Result<(), std::io::Error> {
 
     // Ugly Hack just for fun
     #[cfg(feature = "import_sid")]
-    if cli.sid_test_player {
-        sid_test_player(&cli);
+    if let Some(selector) = cli.sid_test_player.clone() {
+        sid_test_player(&cli, &selector);
         return Ok(());
     }
 
@@ -286,8 +361,8 @@ fn main() -> Result<(), std::io::Error> {
                 // `--loops` repeats the audition. No restore needed — the
                 // CLI discards the module on exit.
                 if let Some(instr) = cli.instrument {
-                    let pitch =
-                        xmrs::core::pitch::Pitch::try_from(cli.note).unwrap_or(xmrs::core::pitch::Pitch::C4);
+                    let pitch = xmrs::core::pitch::Pitch::try_from(cli.note)
+                        .unwrap_or(xmrs::core::pitch::Pitch::C4);
                     // ~4 s audition window per loop iteration, derived
                     // from the module's row grid (seconds/row = 2.5 *
                     // tempo / bpm).
@@ -309,7 +384,10 @@ fn main() -> Result<(), std::io::Error> {
                         return Ok(());
                     }
                     cli.song = 0;
-                    println!("Auditioning instrument {instr} at {:?} (note {})", pitch, cli.note);
+                    println!(
+                        "Auditioning instrument {instr} at {:?} (note {})",
+                        pitch, cli.note
+                    );
                 }
 
                 // Song count = highest `song` index in the timeline

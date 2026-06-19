@@ -12,6 +12,23 @@ impl<'a> Channel<'a> {
     /// — a channel whose live note has cut but whose NNA=Continue
     /// ghosts are still ringing keeps producing audio.
     pub(crate) fn next_sample(&mut self, pool: &mut VoicePool<'a>) -> Option<(Amp, Amp)> {
+        self.next_sample_with_inject(pool, (0, 0))
+    }
+
+    /// As [`Self::next_sample`], but first mixes a **pre-insert**
+    /// stereo contribution (`inject`, Q1.15 `i32`) into the channel's
+    /// accumulator — RFC §3C audio clips routed to this mixer channel,
+    /// so a recorded-audio clip flows through the *same* per-channel
+    /// insert chain (and, in `voices.mix`, the same sends) as the
+    /// channel's notes. A non-zero `inject` keeps the channel audible
+    /// even when no voice is ringing. `inject == (0, 0)` (every tracker
+    /// import, and every channel with no audio clip) reproduces
+    /// [`Self::next_sample`] exactly ⇒ bit-identical.
+    pub(crate) fn next_sample_with_inject(
+        &mut self,
+        pool: &mut VoicePool<'a>,
+        inject: (i32, i32),
+    ) -> Option<(Amp, Amp)> {
         // Q-format integer accumulation: each contributing voice
         // is `(Amp, Amp)` Q1.15 (raw `i16`). Promote to `i32`
         // for the sum so 64+ stacked voices can't overflow the
@@ -19,9 +36,12 @@ impl<'a> Channel<'a> {
         // bottom. Saturating clamp on each accumulation step is
         // belt-and-braces (rare to need it in practice — a
         // typical 32-channel mix sums to ≤ ±16 of `Amp::FULL`).
-        let mut left: i32 = 0;
-        let mut right: i32 = 0;
-        let mut any = false;
+        let mut left: i32 = inject.0;
+        let mut right: i32 = inject.1;
+        // A pre-insert audio injection makes the channel audible on its
+        // own — it must run the insert chain and reach the mix even when
+        // no voice is ringing.
+        let mut any = inject.0 != 0 || inject.1 != 0;
 
         // Live voice.
         if let Some(i) = self.live_mut(pool) {
@@ -61,7 +81,20 @@ impl<'a> Channel<'a> {
             // unit when several voices stack at full volume —
             // that's expected; the final mix-bus saturation
             // happens in `voices.mix`.
-            Some((Amp::from_q15_i32_sat(left), Amp::from_q15_i32_sat(right)))
+            let out = (Amp::from_q15_i32_sat(left), Amp::from_q15_i32_sat(right));
+
+            // RFC §3B: run this mixer channel's stereo output through
+            // its runtime insert chain (params driven by `DeviceParam`
+            // automation in `update_device_params`). Every tracker
+            // import leaves the chain empty (`is_active()` false), so
+            // this is a measured no-op and the render is bit-identical
+            // to the pre-3B mixer.
+            let out = if self.insert_chain.is_active() {
+                self.insert_chain.process(out)
+            } else {
+                out
+            };
+            Some(out)
         } else {
             None
         }

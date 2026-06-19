@@ -34,7 +34,10 @@ fn main() -> Result<(), String> {
         ));
     }
     let path = &args[1];
-    let ticks: usize = args.get(2).map(|s| s.parse().unwrap_or(1500)).unwrap_or(1500);
+    let ticks: usize = args
+        .get(2)
+        .map(|s| s.parse().unwrap_or(1500))
+        .unwrap_or(1500);
     let out = args.get(3).cloned();
 
     // Optional sub-song selector (`DW_SUBSONG=2`), default the primary

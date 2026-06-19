@@ -13,6 +13,7 @@
 //! terminate when their envelope × fadeout product reaches silence.
 
 use crate::state_instr_default::StateInstrDefault;
+use crate::voice_mod::VoiceMod;
 use xmrs::core::fixed::fixed::Q15;
 use xmrs::core::fixed::units::{Amp, ChannelVolume, Panning, Period, PitchDelta, Volume};
 use xmrs::core::instrument_behavior::NewNoteAction;
@@ -66,6 +67,14 @@ pub(crate) struct Voice<'a> {
     /// envelope-driven pitch drift stops at the moment the voice
     /// becomes a ghost.
     pub period_at_fork: Period,
+
+    /// RFC §2B — per-tick stereo gain when this voice is driven by a
+    /// `ModScope::Voice` lane. `Some` means [`Voice::tick_scoped`] ran
+    /// the channel modulation bus through this voice's own base this
+    /// tick (overriding the frozen-gain path in [`Voice::next`]);
+    /// `None` (the default, and always so for live voices and
+    /// `Track`-scoped ghosts) keeps the historical behaviour.
+    pub scoped_volume: Option<[Volume; 2]>,
 }
 
 impl<'a> Voice<'a> {
@@ -85,6 +94,7 @@ impl<'a> Voice<'a> {
             note: None,
             sample_num: None,
             period_at_fork: Period::ZERO,
+            scoped_volume: None,
         }
     }
 
@@ -112,6 +122,7 @@ impl<'a> Voice<'a> {
             note,
             sample_num,
             period_at_fork,
+            scoped_volume: None,
         }
     }
 
@@ -191,6 +202,12 @@ impl<'a> Voice<'a> {
     /// progress at the same cadence the live channel's envelopes do.
     #[inline]
     pub fn tick(&mut self) {
+        // Default (`ModScope::Track`) path: no channel modulation
+        // reaches this ghost, so clear any scoped gain a previous
+        // `Voice`-scoped tick left behind — `next` falls back to the
+        // frozen-gain chain. A no-op for every tracker render (the
+        // scope is always `Track`, so this is always already `None`).
+        self.scoped_volume = None;
         self.instr.tick();
         // Re-run frequency computation with the stored period so
         // the pitch envelope's contribution reaches the sample step
@@ -212,6 +229,36 @@ impl<'a> Voice<'a> {
             PitchDelta::ZERO,
             false,
         );
+    }
+
+    /// RFC §2B (`ModScope::Voice`) — advance this ghost like
+    /// [`Voice::tick`], but fold the channel's per-tick modulation bus
+    /// into it instead of leaving it frozen. The voice keeps its **own
+    /// base** (`period_at_fork`, frozen gains, and its own envelopes)
+    /// and receives the channel's **deltas** (vibrato / tremolo /
+    /// panbrello / arpeggio / Points transpose). The resulting stereo
+    /// gain is stashed in [`Self::scoped_volume`] for [`Self::next`];
+    /// the per-sample step is set by `apply_voice_mod` itself.
+    #[inline]
+    pub fn tick_scoped(&mut self, channel: &VoiceMod) {
+        self.instr.tick();
+        let m = VoiceMod {
+            // Base — this voice's own, not the live note's.
+            period: self.period_at_fork,
+            volume: self.vol_frozen,
+            panning: self.panning_frozen,
+            channel_volume: self.channel_volume_frozen,
+            // Deltas — the channel's current modulation.
+            arp_pitch: channel.arp_pitch,
+            vibrato_raw: channel.vibrato_raw,
+            points_pitch: channel.points_pitch,
+            semitone: channel.semitone,
+            tremolo: channel.tremolo,
+            panbrello: channel.panbrello,
+            tremor: channel.tremor,
+        };
+        let (actual_volume, _effective_period) = self.instr.apply_voice_mod(&m);
+        self.scoped_volume = Some(actual_volume);
     }
 
     /// `true` while the voice still owns its pool slot. A voice is
@@ -283,18 +330,25 @@ impl<'a> Voice<'a> {
         if self.instr.volume_fading_out && self.instr.volume_fadeout.raw() == Q15::ZERO {
             return None;
         }
-        // Pure Q-format gain chain. Three saturating Q1.15
-        // mults compose `vol_frozen × channel_volume_frozen ×
-        // instr.get_volume()`, then a final stereo split by
-        // `panning_frozen`.
-        let v_q = self
-            .channel_volume_frozen
-            .applied_to(self.vol_frozen)
-            .scaled_by(self.instr.get_volume());
-
-        let (pan_left, pan_right) = self.panning_frozen.stereo_split_linear();
-        let l_gain = v_q.scaled_by(pan_left);
-        let r_gain = v_q.scaled_by(pan_right);
+        // RFC §2B: a `ModScope::Voice` ghost had its gain computed for
+        // this tick by `tick_scoped` (channel bus folded onto its own
+        // base) — use it, matching how the live voice's `actual_volume`
+        // is computed once per tick and applied every sample. Otherwise
+        // (the default `Track` path) take the frozen-gain chain: three
+        // saturating Q1.15 mults composing `vol_frozen ×
+        // channel_volume_frozen × instr.get_volume()`, then a stereo
+        // split by `panning_frozen`.
+        let (l_gain, r_gain) = match self.scoped_volume {
+            Some([l, r]) => (l, r),
+            None => {
+                let v_q = self
+                    .channel_volume_frozen
+                    .applied_to(self.vol_frozen)
+                    .scaled_by(self.instr.get_volume());
+                let (pan_left, pan_right) = self.panning_frozen.stereo_split_linear();
+                (v_q.scaled_by(pan_left), v_q.scaled_by(pan_right))
+            }
+        };
 
         self.instr
             .next()

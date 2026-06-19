@@ -1,6 +1,6 @@
 # XMrsPlayer — a safe, `no_std` soundtracker music player
 
-XMrsPlayer plays real soundtracker modules, on desktops and on tiny embedded targets alike. The crate is **100% safe Rust** (`#![forbid(unsafe_code)]`) and builds on `no_std`; it reuses the data structures defined by the companion [`xmrs`](https://codeberg.org/sbechet/xmrs) crate.
+XMrsPlayer plays real soundtracker modules, on desktops and on tiny embedded targets alike. Beyond the tracker formats (MOD, XM, S3M, IT) it also plays David Whittaker (DW) Amiga tunes, and renders OPL2/AdLib FM and Commodore 64 SID instruments through clean-room synthesizers. The crate is **100% safe Rust** (`#![forbid(unsafe_code)]`) and builds on `no_std`; it reuses the data structures defined by the companion [`xmrs`](https://codeberg.org/sbechet/xmrs) crate.
 
 It does not aim for bit-exact compatibility with every tracker ever written — that target is unreachable given the historical and ever-shifting nature of the demo scene — but it aims to be close enough to amaze you. :-)
 
@@ -8,18 +8,18 @@ It does not aim for bit-exact compatibility with every tracker ever written — 
 
 | Format            | Status                                                                 |
 | ----------------- | ---------------------------------------------------------------------- |
-| Amiga Module (MOD)| Works                                                                  |
-| FastTracker XM    | Works                                                                  |
-| ScreamTracker S3M | Works                                                                  |
-| Impulse Tracker IT| WIP — loader mostly done, playback in progress                         |
-| David Whittaker DW| Works — `.dw` Amiga player binaries reverse-engineered into the `Module` model |
-| SID (C64)         | Experimental — reverse-engineered from Rob Hubbard's 6510 player       |
+| Amiga Module (MOD)| Works — replay semantics follow ProTracker (pt2-clone)                 |
+| FastTracker XM    | Works — replay semantics follow FastTracker 2 (ft2-clone)              |
+| ScreamTracker S3M | Works — replay semantics follow Schism Tracker                         |
+| Impulse Tracker IT| Works — replay semantics follow Schism Tracker, validated over a 322-file corpus |
+| David Whittaker DW| Works — reverse-engineered from the original `.dw` 68000 player binaries |
+| SID (C64)         | Plays — Rob Hubbard's tunes through a cycle-accurate 6581/8580 synthesizer |
 
 A word on **DW**: David Whittaker's Amiga tunes ship as self-contained 68000 player binaries with no magic header. The `xmrs` importer detects them structurally, reads the replayer's init-time constants, and re-interprets the original per-voice playback (per-voice loops, period-space vibrato, arpeggio pitch lanes, sub-song selection) into the generic `Module` model, so they play back through the same engine as the tracker formats. Load via `Module::load` (tried last in auto-detect) or `Module::load_dw`.
 
-A word on **SID**: tracks and effects can already be extracted from several of Hubbard's hits and played back through the generic module engine. One thing is still needed to go further — working *per-track* to reconstruct patterns (some tracks change length, which defeats a naive pattern builder), The module engine is already generic enough; the rest is a matter of time (and motivated contributors — Rust speakers welcome!).
+A word on **SID**: Commodore 64 tunes are played back the way the FM instruments are — through a dedicated synthesizer rather than the sample engine. The `xmrs` importer reverse-engineers Rob Hubbard's 6510 replayer into `InstrRobSid` instruments (a `SidVoice` patch plus his signature per-tick effect tables: waveform cycling, pulse-width sweep, frequency arpeggio, vibrato), and the player drives them through a cycle-accurate MOS 6581/8580 synthesis core (`xmrs::generators::sid`, built on the `sidera` chip model). The mapping is one chip per instrument, with the chip's three hardware voices serving as that instrument's polyphony pool — exactly like the OPL driver's slots. Note pitch, portamento, freq slides and vibrato track each note like a sample voice. The imported `Module` is fully generic, so volume, panning, automation and DAW routing are all representable and editable like any other track — but at render the chip is currently summed mono into the master (only per-channel mute is honoured), so those per-track controls aren't yet applied to SID voices.
 
-FM instruments are supported by the underlying `xmrs` data structures and are ready for future formats.
+A word on **FM**: OPL2 / AdLib instruments embedded in S3M modules play back through a clean-room OPL2 synthesizer (`xmrs::generators::opl`), modeled on the documented YMF262 (OPL3) hardware behaviour with integer-only, const-generated tables — no vendored emulator code. The same `xmrs` data structures are ready for OPL in future formats (MPTM, native FM patches).
 
 ## Using it as a library
 
@@ -80,17 +80,19 @@ The player also exposes a subscription API — hook into row/tick changes with `
 Every imported `Module` stores songs natively in a DAW-style layout —
 the legacy `Pattern → Row → TrackUnit` matrix is gone:
 
-- `module.tracks: Vec<Track>` — an enum with two variants.
+- `module.tracks: Vec<Track>` — an enum with three variants.
   `Track::Notes` carries the classic per-row `Vec<Cell>` (one cell
   per row); `Track::Euclidean` is a Bjorklund generator that
   synthesises one cell per row at playback time (see
-  *Euclidean rhythm tracks* below). Both variants bind to a fixed
-  `instrument` index. Cells carry a typed `CellEvent`
-  (`NoteOn { pitch, velocity }`, `InstrReset`,
-  `NoteOff { retrig }`, …) plus a vector of **discrete**
+  *Euclidean rhythm tracks* below); `Track::Audio` is a
+  recorded-audio clip (see *The DAW signal graph* below). The note
+  variants bind to a fixed `instrument` index. Cells carry a typed
+  `CellEvent` (`NoteOn { pitch, velocity }`, `InstrReset`,
+  `NoteOff { retrig }`, …), a vector of **discrete**
   `TrackEffect`s (Arpeggio, NoteDelay/Cut/Off/Retrig/FadeOut,
   Tremor, Volume/Panning/ChannelVolume set, instrument switches,
-  MidiMacro).
+  MidiMacro), and a per-note `NoteExpression` (pitch-bend / volume /
+  pan — neutral for every tracker import).
 - `module.clips: SortedClips` — placements of those tracks on the
   timeline (`song`, `target_channel`, `position_tick`, `end_tick`).
 - `module.automation: Vec<AutomationLane>` — every **continuous**
@@ -118,6 +120,23 @@ it in place as a `Track::Euclidean` variant carrying the
 `Cell` directly on the Track. The cells are regenerated on-the-fly
 by `Module::row_at`, so playback is bit-identical while the on-disk
 Track is tiny.
+
+### The DAW signal graph
+
+The player also renders the `xmrs` **DAW generalization** — a native
+signal graph (`Device` insert chains per channel, aux/return `Bus`es
+fed by `Send`s, a master chain), recorded-audio `Track::Audio` clips
+(linear-resampled, routed through the same channel strip as notes and
+drawn from the shared `Module::assets` pool), `DeviceParam`
+automation, per-voice `ModScope::Voice` modulation, and per-note
+`NoteExpression`. The contract stays strict for the modulation and
+routing model: a loaded MOD / XM / S3M / DW module leaves the whole
+graph empty / neutral, so its render is **bit-identical** to a build
+without it. The one deliberate exception is IT mix-plugins — the loader
+projects a module's DMO / VST `mix_plugins` onto native device inserts,
+so a plugin-bearing `.it` renders its effects (a plugin-free `.it` stays
+bit-identical). Everything else exists for editors and authored modules
+built on the `xmrs` data model.
 
 ### Talking to the player in `f32`
 
@@ -224,7 +243,7 @@ Interactive keys while playing: `Space` to pause, `←`/`→` to move, `Enter`/`
 - **Safety first.** Both this crate and its dependency `xmrs` are `#![forbid(unsafe_code)]`.
 - **Dependencies are lean**, and gated behind features — this matters not only for embedded.
 - **Concert pitch by default.** Notes resolve to MIDI-aligned frequencies (A-4 = 440 Hz exactly), so tracker output mixes cleanly with any 440-Hz-aligned source. The legacy FT2 / ProTracker reference values (≈ −2 cents in linear mode, ≈ +17 cents in Amiga mode) are still available in `xmrs::fixed::tables` for bit-numerical comparison against reference players.
-- **Playback decisions are quirk-driven.** Per-format runtime behaviour — FT2's arpeggio LUT and `E60` pattern-loop bug, IT's persistent tremor state and pan-reset policy, the per-format `Sample.volume` semantics, and so on — is exposed as individual flags on `PlaybackQuirks` inside `Module::profile`. `module.profile.format` itself is metadata only (used for display, export, and editor UI). The `CompatibilityProfile::ft2()`, `it214()`, `pt()`, etc. constructors preset coherent quirk bundles per format; an editor or modern authored module can compose the quirks freely without lying about the format tag. See `xmrs::module::PlaybackQuirks` for the canonical list.
+- **Playback decisions are quirk-driven.** Per-format runtime behaviour — FT2's arpeggio LUT and `E60` pattern-loop bug, IT's persistent tremor state and pan-reset policy, the per-format `Sample.volume` semantics, and so on — is exposed as individual flags on `module.quirks` (a `PlaybackQuirks`). The sibling `module.origin` tag (an `Option<ModuleFormat>`) is metadata only (used for display, export, and editor UI). The `xmrs::tracker::profiles::ft2()`, `it214()`, `pt()`, etc. free functions preset coherent quirk bundles per format, and `PlaybackQuirks::default()` is the quirk-free editor default; an editor or modern authored module can compose the quirks freely without lying about the format tag. See `xmrs::core::compatibility::PlaybackQuirks` for the canonical list.
 - **Embedded-friendly.** The code should be progressively degradable to older processors through successive optimizations, and it would be a lot of fun to see what LLVM can do with it on float-less architectures like the [Z80](https://github.com/jacobly0/llvm-project), the [MOS 6502 family](https://github.com/llvm-mos/llvm-mos), or on the 68k target.
 
 ## Contributing

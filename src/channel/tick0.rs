@@ -71,13 +71,17 @@ impl<'a> Channel<'a> {
                     // modules this is a cheap no-op because their
                     // importers leave NNA = NoteCut (the default).
                     self.spawn_ghost_for_outgoing(pool);
-                    let state = StateInstrDefault::new(
+                    let mut state = StateInstrDefault::new(
                         id,
                         instrnr,
                         self.period_helper.clone(),
                         self.rate,
                         self.module.quirks.sample_volume_is_static_gain,
                     );
+                    // RFC §2C: snapshot this note's per-note expression
+                    // (MPE) onto the voice. Neutral for every tracker
+                    // cell, so the voice behaves exactly as before.
+                    state.expression = self.current.expression;
                     self.install_live(pool, state, id.midi_mute_computer);
                     // Consume any one-shot S73–S76 override — it
                     // only affects this one trigger.
@@ -98,7 +102,7 @@ impl<'a> Channel<'a> {
     }
 
     /// Return true if it was the same instrument
-    fn tick0_load_instrument(&mut self, pool: &mut VoicePool<'a>) -> bool {
+    fn tick0_load_instrument(&mut self, had_live: bool, pool: &mut VoicePool<'a>) -> bool {
         // Determine whether this cell carries an instrument-column
         // load (mirror of the legacy `cell.instrument.is_some()`
         // semantic gate). The value of the instrument index lives in
@@ -117,7 +121,7 @@ impl<'a> Channel<'a> {
             return true;
         }
 
-        if self.row_has_tone_portamento_lane() {
+        if had_live && self.row_has_tone_portamento_lane() {
             self.trigger_pitch(TRIGGER_KEEP_PERIOD | TRIGGER_KEEP_SAMPLE_POSITION, pool);
             return self.tick0_change_instr(true, pool);
         }
@@ -180,7 +184,7 @@ impl<'a> Channel<'a> {
         self.tick0_change_instr(false, pool)
     }
 
-    fn tick0_load_pitch(&mut self, was_same_instr: bool, pool: &mut VoicePool<'a>) {
+    fn tick0_load_pitch(&mut self, was_same_instr: bool, had_live: bool, pool: &mut VoicePool<'a>) {
         // Extract the actual pitch from the cell's event. Non-trigger
         // variants dispatch their own behaviour and return; only the
         // two `NoteOn` flavours carry on to instrument/pitch loading.
@@ -222,8 +226,11 @@ impl<'a> Channel<'a> {
             }
         };
 
-        // Instr?
-        let has_tone_porta = self.row_has_tone_portamento_lane();
+        // Instr? Tone portamento only slides when a voice was already
+        // live to slide *from* (`had_live`). With no prior voice the
+        // `Gxx` is a normal note trigger (IT/Schism behaviour) — fall
+        // through to the SetNote path below.
+        let has_tone_porta = had_live && self.row_has_tone_portamento_lane();
         if let Some(instr) = self.live_mut(pool) {
             // Portamento?
             if has_tone_porta {
@@ -321,9 +328,9 @@ impl<'a> Channel<'a> {
         //
         // Key constraints:
         //   - This is canonical FT2/XM behaviour, gated on
-        //     `module.quirks.k00_eats_note`. The FT2
-        //     `CompatibilityProfile` sets it; modern / IT / S3M /
-        //     MOD profiles leave it off.
+        //     `module.quirks.k00_eats_note`. The FT2 preset
+        //     (`profiles::ft2()`) sets it; modern / IT / S3M /
+        //     MOD presets leave it off.
         //   - Only K00 (param 0) short-circuits. For Kxy with y > 0 FT2
         //     takes the normal getNewNote path and then fires keyOffCmd at
         //     tick y, which means the note DOES play.
@@ -334,15 +341,52 @@ impl<'a> Channel<'a> {
             return;
         }
 
+        // OPL (FM) fast path: a row that plays an OPL instrument is handled
+        // entirely by the FM glue (`channel/opl.rs`) and never installs a
+        // sample voice. Intercept *before* the sample path, whose no-voice
+        // fall-through would `cut_pitch` (zeroing the channel volume the FM
+        // note needs). A sample note taking the channel cuts any held FM
+        // note via `opl_clear_for_sample`.
+        #[cfg(feature = "import_s3m")]
+        {
+            if let Some(opl_instr) = self.row_targets_opl() {
+                self.drop_live(pool); // an FM note silences any prior sample voice
+                self.tick0_opl(opl_instr);
+                return;
+            }
+            self.opl_clear_for_sample();
+        }
+
+        // SID fast path: identical contract to the OPL one above — a row that
+        // plays a `RobSid` instrument is handled entirely by `channel/sid.rs`
+        // and never installs a sample voice. A sample note taking the channel
+        // cuts any held SID note via `sid_clear_for_sample`.
+        #[cfg(feature = "import_sid")]
+        {
+            if let Some(sid_instr) = self.row_targets_sid() {
+                self.drop_live(pool);
+                self.tick0_sid(sid_instr);
+                return;
+            }
+            self.sid_clear_for_sample();
+        }
+
         // First, load instr. `was_same_instr` is true when the instrument
         // slot on this row matches the one currently held by the channel
         // (or when there's no instrument to load — see tick0_load_instrument
         // for the exact contract). This flag drives the keyoff branch in
         // tick0_load_pitch: a keyoff with a *different* instrument must
         // retrigger rather than just cut.
-        let was_same_instr: bool = self.tick0_load_instrument(pool);
+        // Tone portamento slides the *currently playing* voice toward
+        // the new note; with no live voice to slide from (e.g. seeking
+        // mid-song onto a `Gxx` row, or a `Gxx` as a channel's first
+        // note) IT/Schism trigger the note normally instead. Capture
+        // "was a voice live *before* this row" once, before
+        // `tick0_load_instrument` can install one, so both stages agree.
+        let had_live: bool = self.live(pool).is_some();
+        let was_same_instr: bool = self.tick0_load_instrument(had_live, pool);
         // Next, choose sample from note
-        self.tick0_load_pitch(was_same_instr, pool);
+        self.tick0_load_pitch(was_same_instr, had_live, pool);
     }
 
     pub(crate) fn tick0(
@@ -378,6 +422,9 @@ impl<'a> Channel<'a> {
         // Clear the per-tick re-attack flag before any note trigger this
         // row-load tick can set it (see `struck_this_tick`).
         self.struck_this_tick = false;
+        // RFC §3A: drive insert-device params from automation (no-op
+        // unless this channel has a non-empty insert chain).
+        self.update_device_params();
 
         let delay = self.current.get_delay();
         // Always write `effect_note_delay` — whether 0 or the row's
@@ -407,7 +454,7 @@ impl<'a> Channel<'a> {
                 self.effect_arpeggio.retrigger();
             }
 
-            if self.effect_vibrato.in_progress() && !self.row_has_vibrato_lane() {
+            if self.vibrato_any_in_progress() && !self.row_has_vibrato_lane() {
                 // When leaving a Vibrato (main-effect 4xx/6xx) row, clear
                 // the lingering period offset so the next row plays at
                 // `realPeriod`.
@@ -422,7 +469,7 @@ impl<'a> Channel<'a> {
                     && self.row_has_vibrato_depth_only_lane();
                 if !xm_volcol_b_alone {
                     // Only clear the output modulation.
-                    self.effect_vibrato.clear_output();
+                    self.vibrato_clear_output_all();
                 }
             }
 

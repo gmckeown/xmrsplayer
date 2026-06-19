@@ -1,15 +1,15 @@
 //! Audition one instrument/sample of a module that has **no song**.
 //!
 //! [`XmrsPlayer`](crate::xmrsplayer::XmrsPlayer) is timeline-driven: it
-//! advances a [`Module`]'s clips/lanes and **stops the instant there is
+//! advances a [`Module`](xmrs::core::module::Module)'s clips/lanes and **stops the instant there is
 //! nothing to play** (verified: a module with an empty timeline yields
 //! zero samples). Some modules carry instruments but no playable
 //! timeline — most notably David Whittaker sound-effect banks
 //! (`*-sfx.dw`), which the `.dw` importer turns into instrument-only
-//! [`Module`]s (`tracks=0`). The samples are right there, but there is
+//! [`Module`](xmrs::core::module::Module)s (`tracks=0`). The samples are right there, but there is
 //! nothing for the player to tick through.
 //!
-//! [`render_instrument`] auditions one of them **without building a
+//! [`render_instrument`](crate::sample_preview::render_instrument) auditions one of them **without building a
 //! second module and without cloning instruments**: it temporarily
 //! splices a one-note timeline into the module *in place* (your "add a
 //! temporary element, play it, then erase it"), renders it through the
@@ -166,7 +166,11 @@ pub fn render_instrument(
     let rows = rows_for_samples(module, sample_rate, max_samples);
 
     let backup = TimelineBackup::take(module);
-    build_timeline_layer(module, &[vec![0]], &[audition_pattern(instrument, pitch, rows)]);
+    build_timeline_layer(
+        module,
+        &[vec![0]],
+        &[audition_pattern(instrument, pitch, rows)],
+    );
 
     // Render with the temporary timeline (immutable reborrow of
     // `module`); the player is dropped at the end of this block so the
@@ -210,14 +214,16 @@ mod tests {
             sustain_loop_flag: LoopType::No,
             sustain_loop_start: 0,
             sustain_loop_length: 0,
-            data: Some(SampleDataType::Mono8(data)),
+            data: Some(SampleDataType::Mono8(data.into())),
         };
         let mut instr = InstrDefault::default();
         instr.sample.push(Some(sample));
         instr.keyboard.map_all_to(0);
 
-        let mut bank = Module::default();
-        bank.frequency_type = FrequencyType::AmigaFrequencies;
+        let mut bank = Module {
+            frequency_type: FrequencyType::AmigaFrequencies,
+            ..Module::default()
+        };
         bank.instrument.push(Instrument {
             name: "sfx".into(),
             instr_type: InstrumentType::Default(instr),

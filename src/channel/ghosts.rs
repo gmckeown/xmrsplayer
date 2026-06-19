@@ -62,6 +62,22 @@ impl<'a> Channel<'a> {
             // old one (today's behaviour). No ghost.
             return;
         }
+        // Pool-full guard — mirror schism's `csf_get_nna_channel`
+        // returning 0 (`effects.c:1637/1679`): when no NNA channel is
+        // free, the outgoing voice is NOT backgrounded. Here, backing
+        // it grows the population by one (the ghost keeps its slot and
+        // `install_live` allocates a *fresh* slot for the new note),
+        // so a full pool would force `allocate_live` to evict an
+        // unrelated background voice. Refusing to background instead
+        // lets `install_live` release the outgoing voice's own slot
+        // and reuse it — exactly schism's "overwrite the host channel,
+        // leave the existing NNA voices untouched". Without this an
+        // NNA = Continue tune (DCT = Off, non-decaying instruments)
+        // decimates its own sustained layer once the pool saturates,
+        // dropping ~8 dB partway through (e.g. `beside you.it`).
+        if pool.is_full() {
+            return;
+        }
         // Live-voice → ghost promotion. The voice itself stays in
         // its pool slot; only the channel-side bookkeeping changes
         // (live → ghosts list). Before parking, snapshot the
@@ -138,12 +154,26 @@ impl<'a> Channel<'a> {
     /// are released back to the pool here, freeing their slot for
     /// future forks.
     pub(super) fn tick_ghosts(&mut self, pool: &mut VoicePool<'a>) {
+        // RFC §2B: under a `ModScope::Voice` lane the channel's per-tick
+        // modulation bus reaches every ghost (each folds it onto its own
+        // base via `tick_scoped`); the default `Track` path leaves them
+        // frozen (`tick`). `voice_scope_active` is always false for
+        // tracker imports, so this is bit-identical there.
+        let channel_mod = if !self.ghosts.is_empty() && self.voice_scope_active() {
+            Some(self.voice_mod())
+        } else {
+            None
+        };
+
         // First pass: tick every live handle. Stale handles (from
         // double-release races, which 1.3 shouldn't produce but the
         // pool tolerates) are silently skipped via `get_mut`.
         for id in &self.ghosts {
             if let Some(v) = pool.get_mut(*id) {
-                v.tick();
+                match &channel_mod {
+                    Some(m) => v.tick_scoped(m),
+                    None => v.tick(),
+                }
             }
         }
         // Second pass: drop dead voices from the channel's list and

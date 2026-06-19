@@ -17,6 +17,10 @@ mod ghosts;
 mod lanes;
 mod macros;
 mod mix;
+#[cfg(feature = "import_s3m")]
+pub(crate) mod opl;
+#[cfg(feature = "import_sid")]
+pub(crate) mod sid;
 mod tick;
 mod tick0;
 mod triggers;
@@ -166,6 +170,20 @@ pub struct Channel<'a> {
     /// Tone-portamento target period. Was `f32`; now `Period`.
     effect_tone_portamento_goal: Period,
     effect_tremolo: EffectVibratoTremolo,
+    /// RFC §1B — summed modulator stack. `effect_vibrato` /
+    /// `effect_tremolo` / `effect_panbrello` are the **primary** LFO
+    /// (the single one every tracker importer emits per
+    /// `(target, kind)`); these hold the **additional** LFO instances a
+    /// DAW author stacks on the *same* parameter. Their per-tick outputs
+    /// are summed into the primary at the consumer
+    /// ([`Channel::vibrato_value_raw`] & co.). Always empty for tracker
+    /// imports — the importers emit at most one LFO lane per
+    /// `(target, kind)` (see the additive assertion in
+    /// `golden_corpus.rs`), so the fold reduces to the primary alone and
+    /// is bit-identical to the pre-1B player.
+    effect_vibrato_extras: alloc::vec::Vec<EffectVibratoTremolo>,
+    effect_tremolo_extras: alloc::vec::Vec<EffectVibratoTremolo>,
+    effect_panbrello_extras: alloc::vec::Vec<EffectVibratoTremolo>,
     effect_tremor: bool,
     effect_tremor_on: usize,
     effect_tremor_off: usize,
@@ -197,6 +215,14 @@ pub struct Channel<'a> {
     /// `Voices::new`) and never modified afterwards. Used to look
     /// up the channel's lanes on the timeline.
     track_index: usize,
+
+    /// RFC §3A/§3B — runtime copy of this mixer channel's insert chain
+    /// (`Module::channel_inserts[track_index]`). Cloned at
+    /// [`Self::set_track_index`]; its device params are driven each tick
+    /// by `DeviceParam` automation in [`Self::update_device_params`],
+    /// and `next_sample` runs the channel output through it. **Empty for
+    /// every tracker import** ⇒ inactive ⇒ bit-identical.
+    insert_chain: xmrs::core::daw::device::DeviceChain,
 
     pub muted: bool,
 
@@ -236,11 +262,23 @@ pub struct Channel<'a> {
     /// Euclidean humanisation state — see
     /// [`crate::state_humanize_ekn`].
     pub(crate) humanize_ekn: crate::state_humanize_ekn::StateHumanizeEkn,
+
+    /// OPL (FM) state — non-empty only while this channel sounds an
+    /// `InstrumentType::Opl`. Default/empty for every sample channel, so
+    /// the FM path is inert. See [`self::opl`].
+    #[cfg(feature = "import_s3m")]
+    opl: opl::OplChannelState,
+
+    /// SID state — non-empty only while this channel sounds an
+    /// `InstrumentType::RobSid`. Default/empty for every other channel, so
+    /// the SID path is inert. See [`self::sid`].
+    #[cfg(feature = "import_sid")]
+    sid: sid::SidChannelState,
 }
 
 impl<'a> Channel<'a> {
     /// Build a channel. Format-specific quirks (FT2 arpeggio LUT,
-    /// FT2 arpeggio period clamp) are driven by `module.profile.format` via
+    /// FT2 arpeggio period clamp) are driven by `module.quirks` via
     /// `EffectArpeggio` and `PeriodHelper`; Channel itself no longer
     /// carries an `Ft2Quirks` field, so there is only one source of
     /// truth for "is this an XM?".
@@ -292,6 +330,9 @@ impl<'a> Channel<'a> {
             effect_tremor_counter_s3m: -1,
             effect_tremor_silent_s3m: true,
             effect_vibrato: EffectVibratoTremolo::new(Waveform::BipolarSine),
+            effect_vibrato_extras: alloc::vec::Vec::new(),
+            effect_tremolo_extras: alloc::vec::Vec::new(),
+            effect_panbrello_extras: alloc::vec::Vec::new(),
             vibrato_retrig_on_new_note: true,
             tremolo_retrig_on_new_note: true,
             effect_tone_portamento_goal: Period::ZERO,
@@ -299,6 +340,7 @@ impl<'a> Channel<'a> {
             effect_note_delay: 0,
             muted: false,
             track_index: 0,
+            insert_chain: xmrs::core::daw::device::DeviceChain::default(),
             actual_volume: [Volume::SILENT, Volume::SILENT],
             ghosts: Vec::new(),
             nna_override: None,
@@ -308,6 +350,10 @@ impl<'a> Channel<'a> {
             // construction so the streams stay independent.
             rng: xmrs::core::xorshift::XorShift32::default(),
             humanize_ekn: crate::state_humanize_ekn::StateHumanizeEkn::new(0xC0DE_0001),
+            #[cfg(feature = "import_s3m")]
+            opl: opl::OplChannelState::default(),
+            #[cfg(feature = "import_sid")]
+            sid: sid::SidChannelState::default(),
         }
     }
 
@@ -367,6 +413,66 @@ impl<'a> Channel<'a> {
     /// list keyed on the spawning channel.
     pub(crate) fn set_track_index(&mut self, idx: usize) {
         self.track_index = idx;
+        // RFC §3B: take this channel's runtime insert chain from the
+        // module (empty for every tracker import). Its params are then
+        // driven by `DeviceParam` automation each tick.
+        self.insert_chain = self
+            .module
+            .channel_inserts
+            .get(idx)
+            .cloned()
+            .unwrap_or_default();
+        // Native DSP devices: size time-based buffers / precompute
+        // rate-dependent coefficients now that the chain is materialised.
+        // No-op for the empty chains every tracker import produces.
+        self.insert_chain.prepare(self.rate.hz());
+    }
+
+    /// Clear this channel's insert-chain transient device state on a seek
+    /// (filter history, delay tails). Parameters are kept. No-op for the
+    /// empty chains every tracker import produces ⇒ bit-identical.
+    pub(crate) fn reset_insert_chain(&mut self) {
+        self.insert_chain.reset();
+    }
+
+    /// RFC §3A — drive this channel's insert-device params from any
+    /// `DeviceParam` automation lanes targeting it. A measured no-op
+    /// when the chain has no devices (every tracker import), so it adds
+    /// nothing to the hot path there.
+    pub(super) fn update_device_params(&mut self) {
+        if self.insert_chain.devices.is_empty() {
+            return;
+        }
+        use xmrs::core::daw::automation::{AutomationTarget, AutomationValue};
+        let abs_tick = self
+            .current_abs_tick
+            .saturating_add(self.current_tick_in_row as u32);
+        let me = self.track_index as u32;
+        // Collect first so the `self.module` borrow ends before we
+        // mutate `self.insert_chain`.
+        let mut updates: Vec<(usize, u16, xmrs::core::fixed::fixed::Q15)> = Vec::new();
+        for lane in &self.module.automation {
+            if !lane.enabled || lane.song != self.current_song_idx {
+                continue;
+            }
+            if let AutomationTarget::DeviceParam {
+                track,
+                device,
+                param,
+            } = lane.target
+            {
+                if track == me {
+                    if let Some(AutomationValue::Normalized(v)) = lane.value_at(abs_tick) {
+                        updates.push((device as usize, param, v));
+                    }
+                }
+            }
+        }
+        for (device, param, v) in updates {
+            if let Some(d) = self.insert_chain.devices.get_mut(device) {
+                d.set_param(param, v);
+            }
+        }
     }
 
     // --- Live-voice accessors --------------------------------------

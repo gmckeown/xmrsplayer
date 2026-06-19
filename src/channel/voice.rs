@@ -73,7 +73,7 @@ impl<'a> Channel<'a> {
     /// note-off should sound" is a format-level semantic, not
     /// an FT2 bug:
     ///
-    /// * Quirk **on** (XM via `CompatibilityProfile::ft2()`) —
+    /// * Quirk **on** (XM via `profiles::ft2()`) —
     ///   reproduce `ft2_replayer.c:keyOff()`: if the instrument
     ///   has a volume envelope, flip `sustained` so the envelope
     ///   enters its release segment and `volume_fadeout` starts
