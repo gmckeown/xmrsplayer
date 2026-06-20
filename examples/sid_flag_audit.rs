@@ -30,8 +30,8 @@ fn main() {
         ("zoids", SidModule::get_sid_zoid),
     ];
     println!(
-        "{:<22} {:<13} {}",
-        "tune", "driver", "flags coupled-only posés (count instr)"
+        "{:<22} {:<13} flags coupled-only posés (count instr)",
+        "tune", "driver"
     );
     for (name, f) in tunes {
         let sm = f();

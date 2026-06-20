@@ -1078,7 +1078,7 @@ dependencies = [
 
 [[package]]
 name = "xmrs"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "serde",
  "sidera",
@@ -1086,7 +1086,7 @@ dependencies = [
 
 [[package]]
 name = "xmrsplayer"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "clap",
  "console",

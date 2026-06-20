@@ -88,9 +88,9 @@ fn avg_spectrum(x: &[f32]) -> Vec<f32> {
         let mut re: Vec<f32> = x[i..i + N].to_vec();
         let mut im = vec![0.0f32; N];
         // Hann
-        for k in 0..N {
+        for (k, re_k) in re.iter_mut().enumerate() {
             let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * k as f32 / N as f32).cos();
-            re[k] *= w;
+            *re_k *= w;
         }
         fft(&mut re, &mut im);
         for k in 0..N / 2 {
@@ -150,10 +150,7 @@ fn main() {
         syn.len(),
         orc.len()
     );
-    println!(
-        "win  cosine  rmsS    rmsO    S/O    {}",
-        "(S/O<<1 = chunk manquant)"
-    );
+    println!("win  cosine  rmsS    rmsO    S/O    (S/O<<1 = chunk manquant)");
     let nwin = (syn.len().min(orc.len())) / win;
     for w in 0..nwin {
         let s = &syn[w * win..(w + 1) * win];

@@ -671,7 +671,8 @@ fn sid_oracle_fidelity_golden() {
     const SECS: usize = 16;
     const FREQ_HI_TOL: i32 = 8;
 
-    let tunes: &[(&str, fn() -> SidModule)] = &[
+    type SidTune = (&'static str, fn() -> SidModule);
+    let tunes: &[SidTune] = &[
         ("commando", SidModule::get_sid_commando),
         ("crazy_comets", SidModule::get_sid_crazy_comets),
         ("last_v8", SidModule::get_sid_last_v8),
@@ -750,6 +751,7 @@ fn sid_oracle_fidelity_golden() {
 ///     first `play()` at frame 1, our capture dumps the first `play()` at frame
 ///     0 (a 0..6-frame constant lead, tune-dependent).
 ///   * **per-voice phase** — voices ring out / re-trigger a frame or two apart.
+///
 /// The last two are absorbed by searching, PER VOICE, the small integer `shift`
 /// that best aligns the GATE + pitch (the structural timing signal) and counting
 /// every metric at that shift. What survives is genuine value divergence: a gate
@@ -771,6 +773,11 @@ const ALIGN_WINDOW: i32 = 8;
 /// ALIGN_WINDOW) OR a huge residual on an ALTERNATING register (gate that toggles
 /// every frame via v30 wave-alt, or octave-arp freq-hi) is the *accepted*
 /// 1-frame-phase artefact, NOT a value error — see `fixtures_sid_oracle/ACCEPTED.md`.
+// The inner loops index the oracle by frame number `v`/`i` while ALSO using it
+// for register-offset and synth-frame arithmetic (`4 + v*7`, `round(i·scale)`);
+// the index is a coordinate driving math, not a plain cursor, so a range loop
+// reads clearest here.
+#[allow(clippy::needless_range_loop)]
 #[cfg(feature = "import_sid")]
 fn aligned_voice_counts(
     syn: &[[u8; 25]],

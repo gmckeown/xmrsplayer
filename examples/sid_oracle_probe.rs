@@ -57,6 +57,11 @@ fn load(name: &str) -> Vec<[u8; 25]> {
         .collect()
 }
 
+// The frame-alignment loops index the oracle by frame number `i` while ALSO
+// mapping it to a synth frame `j = round(i·scale)`; the index is a time
+// coordinate driving arithmetic, not a plain array cursor, so a range loop is
+// the clear form here.
+#[allow(clippy::needless_range_loop)]
 fn main() {
     let name = std::env::args().nth(1).unwrap_or_else(|| "zoid".into());
     let song: usize = std::env::args()
