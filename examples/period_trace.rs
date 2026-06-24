@@ -1,8 +1,8 @@
 //! Period-trace oracle: print a channel's effective Amiga period per row.
 //! Usage: period_trace <file.s3m> <channel_idx> <num_rows>
+use std::env;
 use xmrs::prelude::*;
 use xmrsplayer::prelude::*;
-use std::env;
 
 fn main() {
     let a: Vec<String> = env::args().collect();
@@ -22,10 +22,14 @@ fn main() {
         if row != last_row {
             last_row = row;
             let s = &p.channel_snapshots()[ch];
-            println!("row {:2}: period={} eff_period={} vol={} gate={}",
-                row, s.period, s.effective_period, s.volume, s.gate);
+            println!(
+                "row {:2}: period={} eff_period={} vol={} gate={}",
+                row, s.period, s.effective_period, s.volume, s.gate
+            );
             printed += 1;
-            if printed >= rows { break; }
+            if printed >= rows {
+                break;
+            }
         }
     }
 }
