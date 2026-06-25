@@ -15,7 +15,17 @@ use super::{compose_played_pitch, Channel};
 
 impl<'a> Channel<'a> {
     fn tick0_change_instr(&mut self, sample_only: bool, pool: &mut VoicePool<'a>) -> bool {
-        let instrnr = self.current_track_instrument.unwrap();
+        // `current_track_instrument` is `None` only for an
+        // effect-only track (`Track::instrument() ==
+        // EFFECT_ONLY_INSTRUMENT`). The importers never couple that
+        // sentinel with an instrument-column cell, so this branch is
+        // unreachable from any imported module — but a hand-crafted
+        // or deserialized `Module` could, and `tick0_load_instrument`
+        // already treats `None` as a legitimate state (`if let
+        // Some(instr)`). Bail cleanly instead of unwrapping `None`.
+        let Some(instrnr) = self.current_track_instrument else {
+            return false;
+        };
 
         // Arm / disarm Euclidean humanisation tracking. A trigger
         // coming from a [`Track::Euclidean`] arms the channel (the

@@ -1,6 +1,6 @@
 [package]
 name = "xmrsplayer"
-version = "0.14.1"
+version = "0.14.3"
 edition = "2021"
 description = "Safe, no_std SoundTracker music player — plays MOD/XM/S3M/IT/DW with cycle-accurate SID and OPL/AdLib FM synthesis."
 authors = ["Sebastien Bechet"]

@@ -19,7 +19,32 @@ struct LoopRegion {
 }
 
 impl LoopRegion {
-    fn new(start: usize, length: usize, flag: LoopType) -> Self {
+    /// Build a loop region, clamping `start`/`length` against the
+    /// decoded sample length `data_len` so the region can never
+    /// overrun the actual data.
+    ///
+    /// This defends the per-frame seek against loop metadata that
+    /// declares `loop_end > data_len`. The XM loader already clamps
+    /// at import (`xm/xmsample.rs`), but the IT loader copies
+    /// `loop_beginning`/`loop_end` verbatim — so a crafted `.it`
+    /// can declare a forward/ping-pong loop whose end runs past the
+    /// decoded bytes. Without this clamp, once the play position
+    /// passes `region.end` the wrapped index lands in
+    /// `[data_len, loop_end)` and `Sample::at` indexes the backing
+    /// vec out of bounds → panic.
+    ///
+    /// For a well-formed sample (`start < data_len` and
+    /// `start + length <= data_len`) both `.min(..)` are no-ops, so
+    /// the cached region — and therefore the rendered audio — is
+    /// byte-identical.
+    fn new(start: usize, length: usize, flag: LoopType, data_len: usize) -> Self {
+        let (start, length) = if data_len == 0 {
+            (0, 0)
+        } else {
+            let start = start.min(data_len - 1);
+            let length = length.min(data_len - start);
+            (start, length)
+        };
         Self {
             start,
             length,
@@ -91,11 +116,13 @@ impl<'a> StateSample<'a> {
                 sample.loop_start as usize,
                 sample.loop_length as usize,
                 sample.loop_flag,
+                cached_len,
             ),
             cached_sustain_loop: LoopRegion::new(
                 sample.sustain_loop_start as usize,
                 sample.sustain_loop_length as usize,
                 sample.sustain_loop_flag,
+                cached_len,
             ),
         }
     }
@@ -340,5 +367,82 @@ impl<'a> Iterator for StateSample<'a> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
+    use xmrs::core::fixed::units::{
+        ChannelVolume, Finetune, Frequency, Panning, SampleRate, Volume,
+    };
+    use xmrs::core::sample::{LoopType, Sample, SampleDataType};
+
+    /// A loop region declared past the end of the decoded data
+    /// (`loop_end > data_len`) — which the IT loader can copy
+    /// verbatim from a crafted file — must never make the per-frame
+    /// seek index the backing vec out of bounds. Before the
+    /// `LoopRegion::new` clamp, ticking past `region.end` panicked in
+    /// `Sample::at`.
+    fn sample_with_loop(
+        data_len: usize,
+        flag: LoopType,
+        loop_start: u32,
+        loop_length: u32,
+    ) -> Sample {
+        let data: Vec<i8> = (0..data_len as i32).map(|i| (i % 100) as i8).collect();
+        Sample {
+            name: "evil".into(),
+            relative_pitch: 0,
+            finetune: Finetune::default(),
+            volume: ChannelVolume::FULL,
+            default_note_volume: Volume::FULL,
+            panning: Panning::CENTER,
+            loop_flag: flag,
+            loop_start,
+            loop_length,
+            sustain_loop_flag: LoopType::No,
+            sustain_loop_start: 0,
+            sustain_loop_length: 0,
+            data: Some(SampleDataType::Mono8(data.into())),
+        }
+    }
+
+    fn tick_well_past_loop(sample: &Sample) {
+        let mut state = StateSample::new(sample, SampleRate::from_hz(48_000));
+        state.set_step(Frequency::from_hz(48_000)); // one data frame per output frame
+                                                    // Far more frames than `loop_end`, so the play position
+                                                    // climbs past `region.end` and exercises the wrap branch.
+        for _ in 0..4096 {
+            let _ = state.tick();
+        }
+    }
+
+    #[test]
+    fn forward_loop_overrunning_data_does_not_panic() {
+        // data_len = 16, but the forward loop claims [4, 1000).
+        tick_well_past_loop(&sample_with_loop(16, LoopType::Forward, 4, 996));
+    }
+
+    #[test]
+    fn pingpong_loop_overrunning_data_does_not_panic() {
+        tick_well_past_loop(&sample_with_loop(16, LoopType::PingPong, 4, 996));
+    }
+
+    #[test]
+    fn loop_start_past_end_does_not_panic() {
+        // Even loop_start itself beyond the data is clamped.
+        tick_well_past_loop(&sample_with_loop(16, LoopType::Forward, 9000, 996));
+    }
+
+    #[test]
+    fn valid_loop_region_is_unchanged_by_clamp() {
+        // A well-formed loop (loop_end == data_len) must be preserved
+        // bit-for-bit by the clamp — same start/length/end.
+        let sample = sample_with_loop(64, LoopType::Forward, 16, 48);
+        let state = StateSample::new(&sample, SampleRate::from_hz(48_000));
+        assert_eq!(state.cached_loop.start, 16);
+        assert_eq!(state.cached_loop.length, 48);
+        assert_eq!(state.cached_loop.end, 64);
     }
 }

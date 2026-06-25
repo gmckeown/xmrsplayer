@@ -114,6 +114,19 @@ pub struct Voices<'a> {
     /// Empty for every tracker import.
     audio_clips: Vec<AudioClipRuntime>,
 
+    /// Reusable scratch buffers for [`Self::mix`], kept alive across
+    /// frames so the realtime audio path performs **no per-sample heap
+    /// allocation**. `mix` runs once per output frame; allocating these
+    /// each time churned the allocator on the audio thread (a latency /
+    /// priority-inversion hazard) and, for every tracker import (no
+    /// audio clips, no buses), was pure waste. They are `mem::take`-n
+    /// out during `mix` to dodge the self-borrow against `self.channel`
+    /// / `self.pool`, then restored before returning. Sized lazily via
+    /// `clear()` + `resize(.., (0, 0))`, which is bit-identical to the
+    /// former `vec![(0, 0); len]`.
+    audio_inject_scratch: Vec<(i32, i32)>,
+    bus_acc_scratch: Vec<(i32, i32)>,
+
     /// One shared OPL2 FM synthesiser, instantiated only when the module
     /// carries at least one `InstrumentType::Opl` instrument. `None` for
     /// every other module ⇒ the FM drive/render passes are measured
@@ -327,6 +340,8 @@ impl<'a> Voices<'a> {
             bus_chains: module.buses.iter().map(|b| b.chain.clone()).collect(),
             master_chain: module.master_chain.clone(),
             audio_clips,
+            audio_inject_scratch: Vec::new(),
+            bus_acc_scratch: Vec::new(),
             // OPL chip only when the module actually uses FM instruments.
             #[cfg(feature = "import_s3m")]
             opl: module
@@ -869,7 +884,11 @@ impl<'a> Voices<'a> {
         // RFC §3B: per-return-bus input accumulators. Empty for every
         // tracker import (no buses), so the send routing and the
         // bus/master passes below are measured no-ops ⇒ bit-identical.
-        let mut bus_acc: Vec<(i32, i32)> = vec![(0, 0); self.bus_chains.len()];
+        // Reuse a persistent buffer (taken out to dodge the self-borrow
+        // below) instead of allocating per frame on the audio thread.
+        let mut bus_acc = core::mem::take(&mut self.bus_acc_scratch);
+        bus_acc.clear();
+        bus_acc.resize(self.bus_chains.len(), (0, 0));
         let module = self.module;
 
         // RFC §3C: resolve the audio clips for this tick into a
@@ -879,7 +898,9 @@ impl<'a> Voices<'a> {
         // channel is out of range (direct master sum, v1 reach). Empty
         // `audio_clips` (every tracker import) ⇒ all-zero injection ⇒
         // `next_sample_with_inject` ≡ `next_sample` ⇒ bit-identical.
-        let mut audio_inject: Vec<(i32, i32)> = vec![(0, 0); self.channel.len()];
+        let mut audio_inject = core::mem::take(&mut self.audio_inject_scratch);
+        audio_inject.clear();
+        audio_inject.resize(self.channel.len(), (0, 0));
         let mut master_extra: (i32, i32) = (0, 0);
         if !self.audio_clips.is_empty() {
             accumulate_audio_clips(
@@ -994,6 +1015,11 @@ impl<'a> Voices<'a> {
             left = m.0.as_q15_i16() as i32;
             right = m.1.as_q15_i16() as i32;
         }
+
+        // Return the scratch buffers to their fields so next frame
+        // reuses their capacity (no further allocation after warm-up).
+        self.bus_acc_scratch = bus_acc;
+        self.audio_inject_scratch = audio_inject;
 
         (left, right)
     }
