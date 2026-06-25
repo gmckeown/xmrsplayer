@@ -26,7 +26,7 @@ categories = ["multimedia::audio", "embedded", "no-std"]
 [dependencies]
 # `xmrs` is pulled in without default features; the `std` feature (on by
 # default here) re-enables it below.
-xmrs = { version = "0.14.1", path = "../xmrs", default-features = false }
+xmrs = { version = "0.14.3", path = "../xmrs", default-features = false }
 # `clap` defaults drop the `suggestions` feature (`-Did you mean
 # --foo?` typo correction) — it pulls in `strsim` for fuzzy
 # string match and costs ~12 KB in the final binary while
