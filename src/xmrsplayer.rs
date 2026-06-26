@@ -355,6 +355,13 @@ impl<'a> XmrsPlayer<'a> {
         self.generated_samples
     }
 
+    /// Index, in `module.timeline_map.entries`, of the row currently
+    /// sounding (the seek target after [`Self::seek_seconds`] /
+    /// [`Self::goto_entry`]). Stable across a row's tick cycle.
+    pub fn timeline_index(&self) -> usize {
+        self.sequencer.timeline_idx()
+    }
+
     // --- Global gain accessors (replace pre-0.10 `pub` fields) ---
 
     /// Q1.15 song-driven master volume.
@@ -413,6 +420,114 @@ impl<'a> XmrsPlayer<'a> {
         self.remaining_samples_in_tick = 0;
         self.song_end_notified = false;
         true
+    }
+
+    /// Jump to an explicit timeline entry by index. Like [`Self::goto`]
+    /// / [`Self::goto_tick`] this RESETS voice state (no carried
+    /// effect/envelope memory). The index space is
+    /// `module.timeline_map.entries`; the entry must belong to the
+    /// current sub-song. Unlike `goto_tick` it can target a pattern-loop
+    /// body repeat (`loop_iter > 0`). Returns `false` if out of range.
+    pub fn goto_entry(&mut self, entry_idx: usize) -> bool {
+        if !self.sequencer.goto_entry(entry_idx) {
+            return false;
+        }
+        self.voices.reset_for_goto();
+        self.remaining_samples_in_tick = 0;
+        self.song_end_notified = false;
+        true
+    }
+
+    // --- Time / timeline seek ---
+
+    /// Seconds occupied by one timeline entry (row) at its row-start
+    /// tempo: `speed` ticks × `2.5 / bpm` s per tick. (Replayer ticks
+    /// run at `bpm × 0.4` Hz, so one tick lasts `2.5 / bpm` s.) Uses the
+    /// row-start BPM — an intra-row `Txx` BPM slide is not modelled, so
+    /// this is a row-granular estimate.
+    fn entry_seconds(e: &xmrs::core::daw::timeline::TimelineEntry) -> f64 {
+        let bpm = (e.bpm_at_row as f64).max(1.0);
+        (e.speed_at_row as f64) * 2.5 / bpm
+    }
+
+    /// Total play time of the current sub-song's timeline, in seconds,
+    /// at its baked per-row tempo/BPM. For a song that loops forever via
+    /// per-lane free-run (`channel_loops`) this is the length of a
+    /// SINGLE pass. Row-granular estimate (intra-row BPM slides not
+    /// modelled).
+    pub fn duration_seconds(&self) -> f64 {
+        let song = self.sequencer.current_song() as u16;
+        self.module
+            .timeline_map
+            .entries
+            .iter()
+            .filter(|e| e.song == song)
+            .map(Self::entry_seconds)
+            .sum()
+    }
+
+    /// Current playback position within the sub-song, in seconds — the
+    /// summed duration of every timeline row before the one sounding,
+    /// plus the ticks elapsed inside it. Pairs with
+    /// [`Self::duration_seconds`] for a progress bar, and resets to the
+    /// seek target after [`Self::seek_seconds`]. (Distinct from
+    /// [`Self::generated_samples`], which only ever counts forward and
+    /// does not rewind on a backward seek.)
+    pub fn position_seconds(&self) -> f64 {
+        let song = self.sequencer.current_song() as u16;
+        let cur = self.sequencer.timeline_idx();
+        let mut acc = 0.0;
+        for (i, e) in self.module.timeline_map.entries.iter().enumerate() {
+            if i >= cur {
+                break;
+            }
+            if e.song == song {
+                acc += Self::entry_seconds(e);
+            }
+        }
+        let tick_secs = 2.5 / (self.sequencer.bpm().max(1) as f64);
+        acc + (self.sequencer.current_tick() as f64) * tick_secs
+    }
+
+    /// Map wall-clock `seconds` to the index (in `timeline_map.entries`)
+    /// of the current sub-song's row that contains it, snapping DOWN to
+    /// that row's start. Clamps past-the-end to the last row and
+    /// negative to the first. `None` only when the sub-song has no
+    /// entries.
+    fn resolve_seconds_to_entry(&self, seconds: f64) -> Option<usize> {
+        let song = self.sequencer.current_song() as u16;
+        let target = seconds.max(0.0);
+        let mut acc = 0.0;
+        let mut chosen = None;
+        for (i, e) in self.module.timeline_map.entries.iter().enumerate() {
+            if e.song != song {
+                continue;
+            }
+            // Remember the last seen entry so an overshoot clamps to the end.
+            chosen = Some(i);
+            let dur = Self::entry_seconds(e);
+            if target < acc + dur {
+                break; // `target` falls inside this row → snap to it
+            }
+            acc += dur;
+        }
+        chosen
+    }
+
+    /// Seek to wall-clock `seconds` into the current sub-song. Resolves
+    /// the time to the timeline row that contains it (snapping DOWN to
+    /// the row start, so playback always lands on a row boundary — never
+    /// mid-tick) and jumps there. Times past the end clamp to the last
+    /// row; negative times clamp to the start. Returns `false` only when
+    /// the sub-song has no rows.
+    ///
+    /// Like [`Self::goto`] / [`Self::goto_tick`] this resets voice state
+    /// at the landing row (no carried effect/envelope memory).
+    pub fn seek_seconds(&mut self, seconds: f64) -> bool {
+        match self.resolve_seconds_to_entry(seconds) {
+            Some(idx) => self.goto_entry(idx),
+            None => false,
+        }
     }
 
     /// Euclidean humanisation scheduler — peek at the NEXT row
@@ -814,5 +929,170 @@ impl<'a> Iterator for XmrsPlayer<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.sample_one()
+    }
+}
+
+#[cfg(all(test, feature = "import_xm"))]
+mod seek_tests {
+    use super::*;
+
+    const SR: u32 = 48_000;
+
+    fn note_module() -> Module {
+        let data = include_bytes!("../../xmrs/examples/note.xm");
+        Module::load_xm(data).expect("load note.xm")
+    }
+
+    /// Cumulative start time (s) of every entry of song 0, mirroring the
+    /// player's `entry_seconds` math, for assertions.
+    fn entry_start_times(module: &Module) -> Vec<f64> {
+        let mut acc = 0.0;
+        let mut out = Vec::new();
+        for e in module.timeline_map.entries.iter().filter(|e| e.song == 0) {
+            out.push(acc);
+            let bpm = (e.bpm_at_row as f64).max(1.0);
+            acc += (e.speed_at_row as f64) * 2.5 / bpm;
+        }
+        out
+    }
+
+    #[test]
+    fn duration_and_zero_position() {
+        let module = note_module();
+        let mut p = XmrsPlayer::new(&module, SR, 0);
+        assert!(p.duration_seconds() > 0.0, "song should have a duration");
+        assert!(p.seek_seconds(0.0), "seek to 0 should succeed");
+        assert!(p.position_seconds().abs() < 1e-9, "position at 0 s");
+    }
+
+    /// Resolving a time in the middle of a row snaps the position back to
+    /// that row's start — playback lands on a row boundary, never mid-tick.
+    #[test]
+    fn seek_snaps_to_row_start() {
+        let module = note_module();
+        let starts = entry_start_times(&module);
+        if starts.len() < 3 {
+            return;
+        }
+        for i in 0..starts.len() {
+            let row_dur = if i + 1 < starts.len() {
+                starts[i + 1] - starts[i]
+            } else {
+                0.01
+            };
+            let mid = starts[i] + row_dur * 0.5;
+            let mut p = XmrsPlayer::new(&module, SR, 0);
+            assert!(p.seek_seconds(mid), "seek should succeed (i={i})");
+            assert_eq!(p.timeline_index(), i, "snapped to containing row");
+            assert!(
+                (p.position_seconds() - starts[i]).abs() < 1e-6,
+                "position == row start (i={i})",
+            );
+        }
+    }
+
+    /// Times beyond the end clamp to the last row; negatives clamp to the
+    /// first.
+    #[test]
+    fn seek_clamps_out_of_range() {
+        let module = note_module();
+        let starts = entry_start_times(&module);
+        if starts.is_empty() {
+            return;
+        }
+        let last = starts.len() - 1;
+        let mut p = XmrsPlayer::new(&module, SR, 0);
+        assert!(p.seek_seconds(p.duration_seconds() * 4.0));
+        assert_eq!(p.timeline_index(), last, "overshoot clamps to last row");
+        assert!(p.seek_seconds(-10.0));
+        assert_eq!(p.timeline_index(), 0, "negative clamps to first row");
+    }
+
+    /// The seek lands on the target row and resets voice state: nothing is
+    /// allocated until the target row is actually dispatched on the next
+    /// sample (same contract as `goto` / `goto_tick`).
+    #[test]
+    fn seek_lands_and_resets_voices() {
+        let module = note_module();
+        let n = module
+            .timeline_map
+            .entries
+            .iter()
+            .filter(|e| e.song == 0)
+            .count();
+        if n < 4 {
+            return;
+        }
+        let target_idx = n / 2;
+        let mut p = XmrsPlayer::new(&module, SR, 0);
+        assert!(p.goto_entry(target_idx));
+        assert_eq!(p.timeline_index(), target_idx);
+        assert_eq!(p.allocated_voice_count(), 0, "seek resets voices");
+    }
+
+    /// `position_seconds` reflects the ticks elapsed inside the current
+    /// row, not just the row start: one sample past a row boundary lands
+    /// strictly between this row's start and the next row's start. Guards
+    /// the `current_tick * (2.5 / bpm)` term (invisible at row start where
+    /// `current_tick == 0`).
+    #[test]
+    fn position_seconds_advances_within_a_row() {
+        let module = note_module();
+        let entries: Vec<_> = module
+            .timeline_map
+            .entries
+            .iter()
+            .filter(|e| e.song == 0)
+            .cloned()
+            .collect();
+        if entries.len() < 3 {
+            return;
+        }
+        let starts = entry_start_times(&module);
+        // A non-edge row with more than one tick, so a single sample leaves
+        // us strictly inside it.
+        let i = match (1..entries.len() - 1).find(|&i| entries[i].speed_at_row > 1) {
+            Some(i) => i,
+            None => return,
+        };
+        let mut p = XmrsPlayer::new(&module, SR, 0);
+        assert!(p.seek_seconds(starts[i]));
+        assert!(
+            (p.position_seconds() - starts[i]).abs() < 1e-9,
+            "exactly at row start before any sample",
+        );
+        assert!(p.sample(true).is_some());
+        assert_eq!(p.timeline_index(), i, "still inside row {i}");
+        let pos = p.position_seconds();
+        assert!(
+            pos > starts[i],
+            "advanced past row start ({pos} > {})",
+            starts[i]
+        );
+        assert!(
+            pos < starts[i + 1],
+            "still before the next row ({pos} < {})",
+            starts[i + 1],
+        );
+    }
+
+    /// Seeking to a time that falls exactly on a row boundary lands on
+    /// THAT row (the snap is `<`, not `<=`): `starts[k]` → row `k`.
+    #[test]
+    fn seek_to_exact_row_boundary_lands_on_that_row() {
+        let module = note_module();
+        let starts = entry_start_times(&module);
+        if starts.len() < 3 {
+            return;
+        }
+        for (k, &start) in starts.iter().enumerate().skip(1) {
+            let mut p = XmrsPlayer::new(&module, SR, 0);
+            assert!(p.seek_seconds(start));
+            assert_eq!(
+                p.timeline_index(),
+                k,
+                "exact boundary time lands on row {k}"
+            );
+        }
     }
 }

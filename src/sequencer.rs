@@ -342,6 +342,7 @@ impl<'a> Sequencer<'a> {
         // Seeking resets the free-run replay count: the monotonic
         // playhead is re-anchored at the sought position.
         self.loop_generation = 0;
+        self.reset_loop_detection();
 
         true
     }
@@ -380,7 +381,50 @@ impl<'a> Sequencer<'a> {
         self.current_tick = 0;
         self.song_end_requested = false;
         self.loop_generation = 0;
+        self.reset_loop_detection();
         true
+    }
+
+    /// Seek to an explicit timeline entry by index, bypassing the
+    /// `loop_iter == 0` filter that [`Self::goto_tick`] applies. The
+    /// entry must belong to the current sub-song. Used by the player's
+    /// time/timeline seek, which resolves seconds → entry index and can
+    /// legitimately target a pattern-loop body repeat (`loop_iter > 0`)
+    /// that `goto_tick` would refuse. Mirrors `goto`/`goto_tick` for the
+    /// tempo/BPM/loop-detection reset; tempo and BPM come from the
+    /// entry's baked row-start values.
+    pub(crate) fn goto_entry(&mut self, entry_idx: usize) -> bool {
+        let entry = match self.module.timeline_map.entries.get(entry_idx) {
+            Some(e) if e.song as usize == self.current_song => *e,
+            _ => return false,
+        };
+        self.timeline_idx = entry_idx;
+        self.restart_row = true;
+        self.started = true;
+        self.tempo = (entry.speed_at_row as usize).max(1);
+        self.bpm = (entry.bpm_at_row as usize).max(1);
+        self.bpm_slide_delta = 0;
+        self.current_tick = 0;
+        self.song_end_requested = false;
+        self.loop_generation = 0;
+        self.reset_loop_detection();
+        true
+    }
+
+    /// Clear the `max_loop_count` bookkeeping. Called on every seek
+    /// (`goto`/`goto_tick`): both the per-row visit table and the live
+    /// `loop_count` carry pre-seek history, and `row_start_tick`
+    /// re-reads `loop_count` from the table on the very next row-start
+    /// (`self.loop_count = *slot`), so zeroing `loop_count` alone is
+    /// not enough — seeking onto a row already visited `max_loop_count`
+    /// times would otherwise latch an immediate `SongEnd`. Only
+    /// observable when `max_loop_count > 0` (render / oracle harnesses);
+    /// live playback leaves it at `0` and is unaffected.
+    fn reset_loop_detection(&mut self) {
+        self.loop_count = 0;
+        for order_slot in &mut self.row_loop_count {
+            order_slot.iter_mut().for_each(|s| *s = 0);
+        }
     }
 
     // --- Tick advance (driven by the facade) ---
@@ -634,6 +678,105 @@ mod timeline_idx_tests {
             }
             _ => panic!("expected RowStart after goto_tick"),
         }
+    }
+
+    /// Regression: a seek must clear the loop-detection bookkeeping.
+    /// With `max_loop_count = 1`, playing the song to its natural end
+    /// marks every canonical row visited once; a `goto` back to the
+    /// start must let playback resume instead of latching an immediate
+    /// `SongEnd` (which it would if `row_loop_count`/`loop_count` were
+    /// left stale — `row_start_tick` re-reads `loop_count` from the
+    /// table on the first row-start after the seek).
+    #[test]
+    fn goto_resets_loop_detection_so_seek_replays() {
+        let data = include_bytes!("../../xmrs/examples/note.xm");
+        let module = Module::load_xm(data).expect("load");
+        let mut seq = Sequencer::new(&module, 0);
+        seq.set_max_loop_count(1);
+
+        // Drive to the natural end (one full pass).
+        let mut ended = false;
+        for _ in 0..1_000_000 {
+            if let TickOutcome::SongEnd = seq.advance_tick() {
+                ended = true;
+                break;
+            }
+        }
+        assert!(ended, "song should reach SongEnd within the cap");
+
+        // Seek back to the start: bookkeeping must be cleared so the
+        // next row-start plays rather than ending immediately.
+        assert!(seq.goto(0, 0, 0), "goto to (0,0) should succeed");
+        match seq.advance_tick() {
+            TickOutcome::RowStart { row, .. } => assert_eq!(row, 0),
+            other => panic!("expected RowStart after goto, got {other:?}"),
+        }
+    }
+
+    /// `goto_entry` accepts an entry of the current sub-song, rejects an
+    /// entry belonging to a different sub-song, and rejects an
+    /// out-of-range index. Exercises the `e.song == current_song` guard
+    /// (unreachable with a single-song module).
+    #[test]
+    fn goto_entry_rejects_entry_of_another_song() {
+        use xmrs::core::cell::Cell;
+        use xmrs::core::daw::clip::Clip;
+        use xmrs::core::daw::sorted_clips::SortedClips;
+        use xmrs::core::daw::timeline::{TimelineEntry, TimelineMap};
+        use xmrs::core::daw::track::Track;
+
+        let mut m = Module::default();
+        m.tracks.push(Track::Notes {
+            name: "t".into(),
+            instrument: 0,
+            rows: alloc::vec![Cell::default(); 4],
+            muted: false,
+        });
+        m.clips = SortedClips::from_unsorted(alloc::vec![Clip {
+            track: 0,
+            song: 0,
+            target_channel: 0,
+            position_tick: 0,
+            speed_at_start: 6,
+            track_row_offset: 0,
+            source_start_row: 0,
+            end_tick: 24,
+        }]);
+        let mut entries = alloc::vec::Vec::new();
+        for row in 0..4u32 {
+            entries.push(TimelineEntry {
+                song: 0,
+                order_idx: 0,
+                pattern_idx: 0,
+                row_idx: row,
+                loop_iter: 0,
+                tick: row * 6,
+                speed_at_row: 6,
+                bpm_at_row: 125,
+            });
+        }
+        // A second sub-song (index 4 onwards) the cursor must refuse.
+        for row in 0..2u32 {
+            entries.push(TimelineEntry {
+                song: 1,
+                order_idx: 0,
+                pattern_idx: 0,
+                row_idx: row,
+                loop_iter: 0,
+                tick: row * 6,
+                speed_at_row: 6,
+                bpm_at_row: 125,
+            });
+        }
+        m.timeline_map = TimelineMap { entries };
+
+        let mut seq = Sequencer::new(&m, 0);
+        assert!(seq.goto_entry(0), "a song-0 entry is accepted");
+        assert!(
+            !seq.goto_entry(4),
+            "a song-1 entry is rejected when current_song == 0"
+        );
+        assert!(!seq.goto_entry(999), "an out-of-range index is rejected");
     }
 
     #[test]
