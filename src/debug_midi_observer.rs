@@ -12,11 +12,12 @@ use crate::midi_observer::{MidiEvent, MidiObserver};
 ///
 /// Register with [`crate::xmrsplayer::XmrsPlayer::add_midi_observer`]:
 ///
-/// ```ignore
+/// ```no_run
+/// use xmrs::core::module::Module;
 /// use xmrsplayer::prelude::*;
-/// use xmrsplayer::debug_midi_observer::DebugMidiObserver;
 ///
-/// let mut player = XmrsPlayer::new(&module, 48_000.0, 0);
+/// let module = Module::default();
+/// let mut player = XmrsPlayer::new(&module, 48_000, 0);
 /// player.add_midi_observer(Box::new(DebugMidiObserver::new()));
 /// ```
 ///

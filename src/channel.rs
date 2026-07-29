@@ -17,9 +17,9 @@ mod ghosts;
 mod lanes;
 mod macros;
 mod mix;
-#[cfg(feature = "import_s3m")]
+#[cfg(feature = "synth_opl")]
 pub(crate) mod opl;
-#[cfg(feature = "import_sid")]
+#[cfg(feature = "synth_sid")]
 pub(crate) mod sid;
 mod tick;
 mod tick0;
@@ -266,13 +266,13 @@ pub struct Channel<'a> {
     /// OPL (FM) state — non-empty only while this channel sounds an
     /// `InstrumentType::Opl`. Default/empty for every sample channel, so
     /// the FM path is inert. See [`self::opl`].
-    #[cfg(feature = "import_s3m")]
+    #[cfg(feature = "synth_opl")]
     opl: opl::OplChannelState,
 
     /// SID state — non-empty only while this channel sounds an
     /// `InstrumentType::RobSid`. Default/empty for every other channel, so
     /// the SID path is inert. See [`self::sid`].
-    #[cfg(feature = "import_sid")]
+    #[cfg(feature = "synth_sid")]
     sid: sid::SidChannelState,
 }
 
@@ -350,9 +350,9 @@ impl<'a> Channel<'a> {
             // construction so the streams stay independent.
             rng: xmrs::core::xorshift::XorShift32::default(),
             humanize_ekn: crate::state_humanize_ekn::StateHumanizeEkn::new(0xC0DE_0001),
-            #[cfg(feature = "import_s3m")]
+            #[cfg(feature = "synth_opl")]
             opl: opl::OplChannelState::default(),
-            #[cfg(feature = "import_sid")]
+            #[cfg(feature = "synth_sid")]
             sid: sid::SidChannelState::default(),
         }
     }

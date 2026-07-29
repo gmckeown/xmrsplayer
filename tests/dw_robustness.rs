@@ -115,9 +115,16 @@ fn render_channel_energy(module: &Module) -> (Vec<f64>, usize) {
 
 #[test]
 fn render_all_dw_modules_robustness() {
-    let dir = "/home/user/Music/dw";
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        eprintln!("skipped: {} not found", dir);
+    // Derived from `$HOME`, not written out: a literal `/home/<name>` resolves
+    // on one machine, and this gate reports a missing corpus by skipping — so
+    // everywhere else it would look like a pass. `$XMRS_CORPUS_DIR` overrides
+    // the root, matching the gates in `xmrs`'s own `lib.rs`.
+    let dir = std::env::var_os("XMRS_CORPUS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()))
+        .join("Music/dw");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        eprintln!("skipped: {} not found", dir.display());
         return;
     };
 

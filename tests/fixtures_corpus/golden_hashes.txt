@@ -7,6 +7,6 @@ dw:bubble_bobble = c829eb1a63c19675
 dw:grimblood = 4a6f69d271acfa6b
 it:myheart = 0e017250bf81a2e6
 mod:lizardking = 6a79f8c2afc2c387
-s3m:opl_min = 828a23e8d996eb35
+s3m:opl_min = 60faa40de2aa2ff5
 s3m:star_chips = 48e643770d4c80fc
 xm:lamb = 0746c672378ddaae

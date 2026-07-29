@@ -43,9 +43,7 @@ fn main() {
     } else {
         vec![9, 36, 48, 60, 72] // A-0, C-3, C-4, C-5, C-6
     };
-    let schism = std::env::var("SCHISM_BIN").unwrap_or_else(|_| {
-        "/home/user/Documents/schismtracker-20251014/build_xmrs/schismtracker".into()
-    });
+    let schism = schism_bin();
     let have_schism = std::path::Path::new(&schism).exists();
     if !have_schism {
         eprintln!("warning: Schism not found at {schism} (set $SCHISM_BIN) — pitch only");
@@ -124,6 +122,18 @@ fn main() {
 
 /// Find every SCRI (AdLib) instrument: `(file-1-based index, 80-byte
 /// record, name)`.
+/// Path to a local Schism Tracker build, the reference this example compares
+/// against. `$SCHISM_BIN` wins; otherwise a build under `$HOME/Documents`,
+/// derived rather than written out so the default is not one machine's.
+fn schism_bin() -> String {
+    std::env::var("SCHISM_BIN").unwrap_or_else(|_| {
+        std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+            .join("Documents/schismtracker-20251014/build_xmrs/schismtracker")
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
 fn find_opl_instruments(d: &[u8]) -> Vec<(usize, Vec<u8>, String)> {
     let ordnum = u16::from_le_bytes([d[0x20], d[0x21]]) as usize;
     let insnum = u16::from_le_bytes([d[0x22], d[0x23]]) as usize;

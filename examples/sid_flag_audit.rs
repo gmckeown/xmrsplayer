@@ -3,9 +3,9 @@
 //! quels effets "coupled-only" ses instruments posent. Un effet coupled-only posé
 //! par un tune PerInstrument = effet LATENT (absent aujourd'hui) que l'unification
 //! activerait → point d'arbitrage / risque de régression golden.
+use xmrs::core::instr_robsid::{ArpMode, VibratoMode};
 use xmrs::prelude::InstrumentType;
 use xmrs::tracker::import::sid::sid_module::SidModule;
-use xmrs::tracker::instr_robsid::ArpMode;
 
 type SidTune = (&'static str, fn() -> SidModule);
 
@@ -62,19 +62,27 @@ fn main() {
                     uses_coupled = true;
                     filter += 1;
                 }
-                if fx.interp.enable {
+                if matches!(fx.vibrato, VibratoMode::Semitone { .. }) {
                     interp += 1;
                 }
                 if matches!(fx.arpeggio, ArpMode::TwoNoteFixed(_)) {
                     arp2 += 1;
                 }
-                if fx.wave_alt.alt_ctrl != 0 {
+                if !fx.wave_alt.alt_shape.is_silent() {
                     wave_alt += 1;
                 }
-                if matches!(fx.arpeggio, ArpMode::TwoNoteInterval(_)) {
+                // The v15 two-note drop is a 2-step `Cycle` riding the skydive climb.
+                if matches!(
+                    fx.arpeggio,
+                    ArpMode::Cycle {
+                        len: 2,
+                        follow_climb: true,
+                        ..
+                    }
+                ) {
                     alt_arp += 1;
                 }
-                if fx.two_phase.attack_ctrl != 0 {
+                if !fx.two_phase.attack_shape.is_silent() {
                     two_phase += 1;
                 }
                 if fx.drum.enable {
@@ -86,7 +94,10 @@ fn main() {
                 if matches!(fx.arpeggio, ArpMode::Octave) {
                     arp_oct += 1;
                 }
-                if fx.vibrato.enable {
+                if matches!(
+                    fx.vibrato,
+                    VibratoMode::Upward { .. } | VibratoMode::Bipolar { .. }
+                ) {
                     vib += 1;
                 }
             }

@@ -45,9 +45,7 @@ fn main() {
     std::fs::write("/tmp/opl_xmrs.raw", &raw).unwrap();
 
     // schism
-    let schism = std::env::var("SCHISM_BIN").unwrap_or_else(|_| {
-        "/home/user/Documents/schismtracker-20251014/build_xmrs/schismtracker".into()
-    });
+    let schism = schism_bin();
     let inp = "/tmp/opl_dump_in.s3m";
     std::fs::write(inp, &s3m).unwrap();
     let _ = std::fs::remove_file("/tmp/opl_schism.wav");
@@ -57,6 +55,18 @@ fn main() {
         .arg(inp)
         .output();
     eprintln!("wrote /tmp/opl_xmrs.raw and /tmp/opl_schism.wav (instr #{want}, semitone {semi})");
+}
+
+/// Path to a local Schism Tracker build, the reference this example compares
+/// against. `$SCHISM_BIN` wins; otherwise a build under `$HOME/Documents`,
+/// derived rather than written out so the default is not one machine's.
+fn schism_bin() -> String {
+    std::env::var("SCHISM_BIN").unwrap_or_else(|_| {
+        std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+            .join("Documents/schismtracker-20251014/build_xmrs/schismtracker")
+            .to_string_lossy()
+            .into_owned()
+    })
 }
 
 fn find_rec(d: &[u8], want: usize) -> Option<Vec<u8>> {

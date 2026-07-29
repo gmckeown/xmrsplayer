@@ -51,7 +51,7 @@ impl<'a> Channel<'a> {
         // `tickn_effects` no-ops (no live voice); there's no sample step to
         // update. Gated on a held OPL note ⇒ never fires for sample channels
         // ⇒ bit-identical.
-        #[cfg(feature = "import_s3m")]
+        #[cfg(feature = "synth_opl")]
         if self.opl.instr.is_some() && self.live(pool).is_none() && !self.current.has_delay() {
             self.tickn_effects(current_tick, pool);
         }
@@ -289,6 +289,12 @@ impl<'a> Channel<'a> {
                         // Both sides typed — direct assignment.
                         self.volume = v;
                     }
+                }
+                TrackEffect::NoteArming { .. } => {
+                    // Consumed at row load by `tick0_sid`, which resolves it
+                    // into the channel's SID state before the trigger edge is
+                    // raised. Nothing to do per tick: it describes what the
+                    // note-ON does, not a per-tick modulation.
                 }
                 TrackEffect::MidiMacro(_) => {
                     // The macro is invoked from `cell.effects` by

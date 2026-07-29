@@ -1,0 +1,23 @@
+# Binary payloads. Without these lines a `core.autocrlf` (or any client that
+# guesses "text" from the first few bytes) rewrites 0x0A/0x0D inside them on
+# checkout or commit, and the corruption is silent until a test fails for a
+# reason that has nothing to do with the code.
+#
+# Deliberately no `* text=auto` here: on a repository that already has history,
+# turning it on renormalises every tracked text file in one commit. The point
+# of this file is to protect the binaries, not to reformat the tree.
+
+# Gzip-packed SID-oracle fixtures (tests/fixtures_sid_oracle/*.csv.gz). Gzip is
+# the least forgiving of the lot: a single rewritten byte fails the CRC and the
+# oracle gate stops with a decompression error rather than a fidelity verdict.
+*.gz  binary
+
+# Reference PCM renders for the cycle-exact golden gates.
+*.pcm binary
+
+# Tracker modules used as test corpus.
+*.mod binary
+*.xm  binary
+*.s3m binary
+*.it  binary
+*.dw  binary

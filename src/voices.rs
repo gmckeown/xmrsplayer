@@ -20,6 +20,10 @@ use crate::midi_observer::MidiEvent;
 use crate::triggerkeep::TRIGGER_KEEP_PERIOD;
 use crate::voice_pool::VoicePool;
 use alloc::{vec, vec::Vec};
+// Only the coupled-SID driver is heap-allocated; `Box` is unused (and absent
+// from the `no_std` prelude) when the SID synthesiser is not compiled in.
+#[cfg(feature = "synth_sid")]
+use alloc::boxed::Box;
 use xmrs::core::fixed::fixed::Q15;
 use xmrs::core::fixed::units::{Amplification, SampleRate, Volume};
 use xmrs::prelude::*;
@@ -131,13 +135,13 @@ pub struct Voices<'a> {
     /// carries at least one `InstrumentType::Opl` instrument. `None` for
     /// every other module ⇒ the FM drive/render passes are measured
     /// no-ops ⇒ bit-identical. See `OPL_SYNTHESIS_RFC.md`.
-    #[cfg(feature = "import_s3m")]
+    #[cfg(feature = "synth_opl")]
     opl: Option<xmrs::generators::opl::driver::OplDriver>,
 
     /// Per-instrument SID bank, instantiated only when the module carries at
     /// least one `InstrumentType::RobSid` instrument. `None` for every other
     /// module ⇒ the SID drive/fold passes are measured no-ops ⇒ bit-identical.
-    #[cfg(feature = "import_sid")]
+    #[cfg(feature = "synth_sid")]
     sid: Option<xmrs::generators::sid::driver::SidDriver>,
 }
 
@@ -320,7 +324,7 @@ impl<'a> Voices<'a> {
             })
             .collect();
         // Captured before the struct literal moves `channels` into `channel`.
-        #[cfg(feature = "import_sid")]
+        #[cfg(feature = "synth_sid")]
         let num_channels = channels.len();
         let mut voices = Self {
             sample_rate: sr,
@@ -343,7 +347,7 @@ impl<'a> Voices<'a> {
             audio_inject_scratch: Vec::new(),
             bus_acc_scratch: Vec::new(),
             // OPL chip only when the module actually uses FM instruments.
-            #[cfg(feature = "import_s3m")]
+            #[cfg(feature = "synth_opl")]
             opl: module
                 .instrument
                 .iter()
@@ -352,7 +356,7 @@ impl<'a> Voices<'a> {
             // SID bank only when the module actually uses SID instruments.
             // Default model/region (6581 / PAL); the PSID/RSID header hint is
             // a later refinement.
-            #[cfg(feature = "import_sid")]
+            #[cfg(feature = "synth_sid")]
             sid: module
                 .instrument
                 .iter()
@@ -365,12 +369,18 @@ impl<'a> Voices<'a> {
                     };
                     use xmrs::prelude::InstrumentType;
                     let rate = sr.hz().max(1);
-                    let speed = module.default_tempo as u8; // ticks-per-row → drum noise burst
-                                                            // Coupled (shared-chip) model when the song's voices
-                                                            // hard-sync / ring-modulate each other OR any instrument
-                                                            // drives the global SID filter — both need the 3 SID voices
-                                                            // on one chip. Otherwise the per-instrument model (the
-                                                            // default, all other tunes byte-identical).
+                    // Ticks-per-row → drum noise burst. `initial_tempo`, not
+                    // `module.default_tempo`: the latter is sub-song 0's, and a
+                    // `.sid` holding several tunes gives them different row
+                    // cadences (Commando runs [3, 4, 3]). Reading the module
+                    // scalar made every sub-song's drums as long as the first
+                    // one's. The caller resolves it per sub-song.
+                    let speed = initial_tempo as u8;
+                    // Coupled (shared-chip) model when the song's voices
+                    // hard-sync / ring-modulate each other OR any instrument
+                    // drives the global SID filter — both need the 3 SID voices
+                    // on one chip. Otherwise the per-instrument model (the
+                    // default, all other tunes byte-identical).
                     let uses_coupled = module.instrument.iter().any(|i| {
                         if let InstrumentType::RobSid(irs) = &i.instr_type {
                             let v = &irs.voice;
@@ -734,7 +744,7 @@ impl<'a> Voices<'a> {
     /// Push each channel's current OPL gesture (trigger / key-off / cut, or
     /// a held note's live pitch / volume / pan) into the shared chip.
     /// No-op unless the module instantiated an `OplDriver`.
-    #[cfg(feature = "import_s3m")]
+    #[cfg(feature = "synth_opl")]
     fn drive_opl(&mut self) {
         use crate::channel::opl::OplEdge;
         if self.opl.is_none() {
@@ -769,16 +779,18 @@ impl<'a> Voices<'a> {
         }
     }
 
-    #[cfg(not(feature = "import_s3m"))]
+    #[cfg(not(feature = "synth_opl"))]
     #[inline]
     fn drive_opl(&mut self) {}
 
     /// Push each channel's current SID gesture (trigger / key-off / cut, or a
     /// held note's live pitch) into the per-instrument bank. No-op unless the
     /// module instantiated a `SidBank`.
-    #[cfg(feature = "import_sid")]
+    #[cfg(feature = "synth_sid")]
     fn drive_sid(&mut self) {
         use crate::channel::sid::SidEdge;
+        use xmrs::core::effect::ArmMode;
+        use xmrs::core::instr_robsid::{ArpMode, ArpPhase, VibratoMode};
         if self.sid.is_none() {
             return;
         }
@@ -828,9 +840,104 @@ impl<'a> Voices<'a> {
                         if let Some(xmrs::prelude::InstrumentType::RobSid(irs)) =
                             self.module.instrument.get(h.instr).map(|x| &x.instr_type)
                         {
-                            // Trigger frame: no effect advance (state starts at
-                            // frame 0).
-                            bank.note_on(i, h.instr, &irs.voice, &irs.fx, h.milli_hz);
+                            // `TrackEffect::NoteArming`: this note may ask for
+                            // the instrument's modulators NOT to be re-armed, or
+                            // to be armed elsewhere. `RobEffects` is `Copy`, so
+                            // the override is a local tweak of the patch for this
+                            // trigger — the instrument itself is untouched and
+                            // the driver needs no new argument.
+                            let mut fx = irs.fx;
+                            let mut legato = false;
+                            if let Some(a) = upd.arming {
+                                legato = a.legato;
+                                match a.filter {
+                                    ArmMode::Reseed => {}
+                                    ArmMode::Hold => fx.filter.reseed_each_note = false,
+                                    ArmMode::At(v) => {
+                                        fx.filter.cutoff_seed = v;
+                                        fx.filter.reseed_each_note = true;
+                                    }
+                                }
+                                match a.pulse_width {
+                                    ArmMode::Reseed => {}
+                                    ArmMode::Hold | ArmMode::At(_) => {
+                                        fx.pulse_sweep.reseed_on_note = false
+                                    }
+                                }
+                                // The per-note arpeggio. The replayer keeps its
+                                // phase in a per-voice slot reset at note-on and
+                                // steps it every FRAME for the note's whole
+                                // length, so it belongs on the chip's own
+                                // arpeggio (`ArpPhase::PerNote`), not on the
+                                // row-tick tracker one. A zero low nibble
+                                // shortens the cycle to two steps: the replayer
+                                // wraps its phase counter at 2 (Ghidra
+                                // `lh_play_voice_loop $10b7`), which is what
+                                // makes an octave default shimmer every frame.
+                                if let ArmMode::At(n) = a.arpeggio {
+                                    let hi = ((n >> 4) & 0x0F) as i8;
+                                    let lo = (n & 0x0F) as i8;
+                                    fx.arpeggio = ArpMode::Cycle {
+                                        steps: [0, hi, lo],
+                                        len: if lo == 0 { 2 } else { 3 },
+                                        phase: ArpPhase::PerNote,
+                                        follow_climb: false,
+                                    };
+                                }
+                                // A per-note vibrato replaces the patch's swing
+                                // AND starts immediately: the marker suppresses
+                                // the reload of the instrument's start delay.
+                                if let ArmMode::At(v) = a.vibrato {
+                                    let v = v as u8;
+                                    if let VibratoMode::Semitone { flat, .. } = fx.vibrato {
+                                        fx.vibrato = VibratoMode::Semitone {
+                                            half_depth: (v & 0x78) >> 3,
+                                            shift: v & 0x07,
+                                            delay: 0,
+                                            flat,
+                                        };
+                                    }
+                                }
+                            }
+                            if legato {
+                                // A tie: the voice keeps its envelope, its gate
+                                // and every running sweep — only the pitch
+                                // moves. Re-triggering here would invent an
+                                // attack the score does not ask for.
+                                //
+                                // And no effect advance either: a tie is still a
+                                // pattern-entry FETCH frame, and the replayer's
+                                // fetch block ends in `goto lh_write_voice_regs`
+                                // whatever the entry is, jumping over the whole
+                                // effect chain. Confirmed against the replayer's
+                                // own work-RAM (`sidplay --statedump`): the
+                                // vibrato counter freezes on 151 of Lion_Heart
+                                // voice 2's 166 note-fetches, and the remaining
+                                // freezes fall on rests and ties.
+                                //
+                                // But a tie CAN change the instrument, and then
+                                // the timbre must follow without the envelope
+                                // restarting — see `retie`. Radio_ACE does it 12
+                                // times, Sun_Never_Shines 9, Lakers once; the
+                                // other three tunes never, so for them this is a
+                                // no-op. Not doing it left Radio_ACE's voice 1
+                                // holding a pulse through 90 frames the chip
+                                // spent on triangle + ring modulation.
+                                bank.retie(i, h.instr, &irs.voice, &fx, irs.program.as_ref());
+                                bank.set_frequency(i, h.milli_hz);
+                            } else {
+                                // Trigger frame: no effect advance (state starts
+                                // at frame 0).
+                                bank.note_on(
+                                    i,
+                                    h.instr,
+                                    &irs.voice,
+                                    &fx,
+                                    irs.program.as_ref(),
+                                    upd.arming.map_or(0, |a| a.release_in),
+                                    h.milli_hz,
+                                );
+                            }
                         }
                     }
                 }
@@ -849,7 +956,7 @@ impl<'a> Voices<'a> {
         bank.capture_frame();
     }
 
-    #[cfg(not(feature = "import_sid"))]
+    #[cfg(not(feature = "synth_sid"))]
     #[inline]
     fn drive_sid(&mut self) {}
 
@@ -950,7 +1057,7 @@ impl<'a> Voices<'a> {
         // (RFC Phase A — master-summed; per-channel routing is Phase B).
         // `None`/idle chip ⇒ skipped ⇒ bit-identical. The chip advances one
         // step per output frame, matching `mix`'s per-frame cadence.
-        #[cfg(feature = "import_s3m")]
+        #[cfg(feature = "synth_opl")]
         if let Some(opl) = self.opl.as_mut() {
             if opl.any_active() {
                 // Operator output is now ±4084 (the chip's 12-bit width); lift
@@ -972,7 +1079,7 @@ impl<'a> Voices<'a> {
         // full-scale — folded into the Q1.15 accumulator directly (the master
         // clamp catches the rare 3-loud-voice peak). `None`/idle ⇒ skipped ⇒
         // bit-identical.
-        #[cfg(feature = "import_sid")]
+        #[cfg(feature = "synth_sid")]
         if let Some(sid) = self.sid.as_mut() {
             if sid.any_active() {
                 let s = sid.mix_frame();

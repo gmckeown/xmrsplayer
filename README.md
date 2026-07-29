@@ -234,7 +234,12 @@ Typical invocation:
 xmrsplayer -f song.xm                 # play
 xmrsplayer -f song.xm -o song.wav     # render to WAV
 xmrsplayer -f song.xm -a 0.25 -l 1    # one loop, amplification 0.25
+xmrsplayer -f tune.sid -s 2           # a C64 tune, sub-song 2
 ```
+
+Every format is recognised from the file's own bytes — `-f` is the only
+way in. A `.sid` is no exception: its sub-songs are sub-songs of one
+module, picked with `-s`, exactly like a `.dw`.
 
 Interactive keys while playing: `Space` to pause, `←`/`→` to move, `Enter`/`i` for info, `Esc` or `q` to quit.
 

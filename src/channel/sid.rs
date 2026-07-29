@@ -9,6 +9,7 @@
 //! dynamics come from the patch ADSR; per-track volume / pan / per-voice
 //! routing are a later phase (not yet wired).
 
+use xmrs::core::effect::ArmMode;
 use xmrs::prelude::*;
 
 use super::Channel;
@@ -54,11 +55,30 @@ pub(crate) struct SidChannelState {
     /// end (the repeating "zip"), which a clamp would freeze. Reset to 0 on every
     /// (re)trigger; advanced once per frame while a slide is armed.
     pub freq_slide_reg: i32,
+    /// How this note asks the instrument's modulators to be (re)armed, from a
+    /// [`TrackEffect::NoteArming`] on the cell. `None` = the ordinary
+    /// behaviour: everything re-arms from the patch.
+    pub arming: Option<NoteArming>,
+}
+
+/// The resolved [`TrackEffect::NoteArming`] of the row being triggered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NoteArming {
+    pub legato: bool,
+    pub filter: ArmMode,
+    pub pulse_width: ArmMode,
+    pub vibrato: ArmMode,
+    pub arpeggio: ArmMode,
+    /// Frames until this note's release envelope takes over (0 = none).
+    pub release_in: u16,
 }
 
 /// What `Voices` needs to drive the bank for one channel this tick.
 pub(crate) struct SidChannelUpdate {
     pub edge: SidEdge,
+    /// The arming of the note being triggered, if it asked for anything
+    /// unusual. Only meaningful on a `Trigger` edge.
+    pub arming: Option<NoteArming>,
     /// Present while a SID instrument is held — the live frequency to push.
     pub held: Option<SidHeld>,
 }
@@ -71,7 +91,7 @@ pub(crate) struct SidHeld {
 /// PAL C64 system clock (Hz). The SID freq register is `Hz · 2^24 / clock`, so
 /// `milli_hz · 2^24 / (clock · 1000)` is the register value — used to fold the
 /// freq-register slide (with its 16-bit wrap) back into musical milli-Hertz.
-#[cfg(feature = "import_sid")]
+#[cfg(feature = "synth_sid")]
 const PAL_CLOCK_HZ: u64 = 985_248;
 
 impl<'a> Channel<'a> {
@@ -117,6 +137,40 @@ impl<'a> Channel<'a> {
             CellEvent::NoteOn { pitch, velocity } | CellEvent::NoteOnGhost { pitch, velocity } => {
                 self.sid.instr = Some(sid_instr);
                 self.sid.pitch = Some(pitch);
+                // Does this note ask for anything other than the usual
+                // "re-arm everything from the patch"?
+                self.sid.arming = self.current.effects.iter().find_map(|e| {
+                    if let TrackEffect::NoteArming {
+                        legato,
+                        filter,
+                        pulse_width,
+                        vibrato,
+                        arpeggio,
+                        release_in,
+                    } = e
+                    {
+                        Some(NoteArming {
+                            legato: *legato,
+                            filter: *filter,
+                            pulse_width: *pulse_width,
+                            vibrato: *vibrato,
+                            arpeggio: *arpeggio,
+                            release_in: *release_in,
+                        })
+                    } else {
+                        None
+                    }
+                });
+                // NOTE: a ghost trigger re-arms the gate here, exactly like a
+                // fresh one. That looks wrong for a TIE — on the chip a tied note
+                // skips the whole note-on block, so only the pitch moves — but it
+                // is LOAD-BEARING for the v10–v30 corpus: making ghosts retune
+                // without re-gating regressed 19 of the 40 oracle sub-songs
+                // (commando#1 gate 0→108, last_v8#0 0→480, monty#2 0→402…).
+                // Those importers encode ordinary note-stream entries as ghosts
+                // and rely on them triggering. The last player's tie therefore
+                // needs its own cell shape rather than borrowing this one —
+                // see ROBSID2_INSTRUMENT_MODEL.md §11.3.
                 self.sid.edge = SidEdge::Trigger;
                 self.volume = velocity;
                 self.struck_this_tick = true;
@@ -188,7 +242,11 @@ impl<'a> Channel<'a> {
         if edge == SidEdge::None && held.is_none() {
             None
         } else {
-            Some(SidChannelUpdate { edge, held })
+            Some(SidChannelUpdate {
+                edge,
+                arming: self.sid.arming,
+                held,
+            })
         }
     }
 
@@ -235,7 +293,7 @@ impl<'a> Channel<'a> {
     /// the chip's per-frame freq-register step as `|rate| << 4`. The `>> 6`/`<< 4`
     /// round-trip drops the slide step's low byte (`$c335`), a ≲2 % rate
     /// approximation — exact carriage would need a per-cell SID slide field.
-    #[cfg(feature = "import_sid")]
+    #[cfg(feature = "synth_sid")]
     fn sid_advance_freq_slide(&mut self) {
         use xmrs::core::daw::automation::AutomationTarget;
         // Mirror `apply_slides_from_lanes`: the slide is keyed on the row-start

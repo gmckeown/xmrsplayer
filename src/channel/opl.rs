@@ -218,7 +218,7 @@ impl<'a> Channel<'a> {
 
     /// Final 0..63 OPL volume = instrument volume × channel volume × cell
     /// volume (Q15), with the effect tremolo folded in.
-    fn opl_vol63(&self, instr: &xmrs::tracker::instr_opl::InstrOpl) -> u8 {
+    fn opl_vol63(&self, instr: &xmrs::core::instr_opl::InstrOpl) -> u8 {
         let vol_q15 =
             (self.volume.as_q15_i32() + self.tremolo_value_q15().raw() as i32).clamp(0, 32768);
         let chan_q15 = (vol_q15 * self.channel_volume.as_q15_i32()) >> 15;

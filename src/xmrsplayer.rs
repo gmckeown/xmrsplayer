@@ -100,6 +100,43 @@ pub struct XmrsPlayer<'a> {
     humanize_mode: HumanizeMode,
 }
 
+/// The nominal ticks-per-row of one sub-song.
+///
+/// `Module::default_tempo` is a single scalar and it belongs to **sub-song 0**.
+/// That was harmless while every multi-sub-song format that reached the chip
+/// synthesisers had a uniform cadence, and it stopped being harmless when a
+/// `.sid` holding several tunes became one module: Commando's three sub-songs
+/// run at 3, 4 and 3 ticks per row, and the SID driver sizes its drum burst
+/// from this number.
+///
+/// Sub-song 0 therefore answers with the scalar itself — it is that sub-song's
+/// authoritative value, and nothing here may second-guess it. Only the
+/// sub-songs that have no scalar of their own are derived, from the timeline:
+/// the **smallest** row gap. Not the first row's, and not the mean — a tune
+/// with a *fractional* cadence alternates between `R+1` and `R+2` ticks per row
+/// (the dual counter robs one tick when it wraps), and the nominal the replayer
+/// was written around is the lower of the two. For a uniform sub-song every gap
+/// is equal, so the minimum is just the cadence.
+///
+/// Keeping sub-song 0 on the scalar is not timidity, it is correctness for the
+/// other formats: a tracker module that slides its speed down mid-song
+/// (`F03` after starting at 6) has a smaller minimum than its initial tempo,
+/// and that minimum is not what the channel state should start from.
+fn nominal_tempo_of_song(module: &Module, song: usize) -> usize {
+    if song == 0 {
+        return module.default_tempo;
+    }
+    module
+        .timeline_map
+        .entries
+        .iter()
+        .filter(|e| e.song as usize == song)
+        .map(|e| e.speed_at_row as usize)
+        .filter(|&s| s > 0)
+        .min()
+        .unwrap_or(module.default_tempo)
+}
+
 impl<'a> XmrsPlayer<'a> {
     /// Build a player for the given module, with the default voice
     /// pool capacity (256 voices, matching schism's `MAX_VOICES`).
@@ -150,7 +187,7 @@ impl<'a> XmrsPlayer<'a> {
         let voices = Voices::new_with_voice_pool_capacity(
             module,
             sample_rate,
-            module.default_tempo,
+            nominal_tempo_of_song(module, song),
             voice_pool_capacity,
         );
         let num_channels = voices.num_channels();

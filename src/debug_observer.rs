@@ -11,11 +11,12 @@ use crate::observer::{PatternChangeContext, PlayerObserver, RowContext, TickCont
 ///
 /// Register with [`crate::xmrsplayer::XmrsPlayer::add_observer`]:
 ///
-/// ```ignore
+/// ```no_run
+/// use xmrs::core::module::Module;
 /// use xmrsplayer::prelude::*;
-/// use xmrsplayer::debug_observer::DebugObserver;
 ///
-/// let mut player = XmrsPlayer::new(&module, 48_000.0, 0);
+/// let module = Module::default();
+/// let mut player = XmrsPlayer::new(&module, 48_000, 0);
 /// player.add_observer(Box::new(DebugObserver::new()));
 /// ```
 #[derive(Default)]

@@ -357,7 +357,7 @@ impl<'a> Channel<'a> {
         // fall-through would `cut_pitch` (zeroing the channel volume the FM
         // note needs). A sample note taking the channel cuts any held FM
         // note via `opl_clear_for_sample`.
-        #[cfg(feature = "import_s3m")]
+        #[cfg(feature = "synth_opl")]
         {
             if let Some(opl_instr) = self.row_targets_opl() {
                 self.drop_live(pool); // an FM note silences any prior sample voice
@@ -371,7 +371,7 @@ impl<'a> Channel<'a> {
         // plays a `RobSid` instrument is handled entirely by `channel/sid.rs`
         // and never installs a sample voice. A sample note taking the channel
         // cuts any held SID note via `sid_clear_for_sample`.
-        #[cfg(feature = "import_sid")]
+        #[cfg(feature = "synth_sid")]
         {
             if let Some(sid_instr) = self.row_targets_sid() {
                 self.drop_live(pool);

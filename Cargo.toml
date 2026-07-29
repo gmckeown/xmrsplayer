@@ -1,7 +1,9 @@
 [package]
 name = "xmrsplayer"
-version = "0.14.4"
+version = "0.15.0"
 edition = "2021"
+# Tracks xmrs's own MSRV — the player has no newer requirement of its own.
+rust-version = "1.88"
 description = "Safe, no_std SoundTracker music player — plays MOD/XM/S3M/IT/DW with cycle-accurate SID and OPL/AdLib FM synthesis."
 authors = ["Sebastien Bechet"]
 documentation = "https://docs.rs/xmrsplayer"
@@ -23,10 +25,17 @@ exclude = [
 keywords = ["soundtracker", "chiptune", "sid", "tracker", "music"]
 categories = ["multimedia::audio", "embedded", "no-std"]
 
+# The default feature set is already the full player (std + every importer +
+# both chip synths); `demo` only adds the CLI binary's deps, which document
+# nothing. Pinned anyway so a later default change does not silently shrink
+# what docs.rs shows.
+[package.metadata.docs.rs]
+features = ["std", "import", "synth_opl", "synth_sid"]
+
 [dependencies]
 # `xmrs` is pulled in without default features; the `std` feature (on by
 # default here) re-enables it below.
-xmrs = { version = "0.14.3", path = "../xmrs", default-features = false }
+xmrs = { version = "0.15.0", path = "../xmrs", default-features = false }
 # `clap` defaults drop the `suggestions` feature (`-Did you mean
 # --foo?` typo correction) — it pulls in `strsim` for fuzzy
 # string match and costs ~12 KB in the final binary while
@@ -50,12 +59,14 @@ cpal = { version = "0.17", optional = true }
 hound = { version = "3.5", optional = true }
 
 [features]
-# `std` and `import` are on by default: the common case is a
-# desktop/server build that wants the standard library and every
-# format importer. Users targeting `no_std` or wanting a smaller
-# binary opt out with `default-features = false` and pick only what
-# they need.
-default = ["std", "import"]
+# `std`, `import` and both chip synthesisers are on by default: the
+# common case is a desktop/server build that wants the standard library,
+# every format importer, and full FM + SID playback. `synth_opl` /
+# `synth_sid` are listed explicitly so a build that drops `import`
+# (`default-features = false, features = ["std", "synth_opl", "synth_sid"]`)
+# still plays chip instruments — synthesis is not tied to import. Users
+# targeting `no_std` or a smaller binary opt out and pick what they need.
+default = ["std", "import", "synth_opl", "synth_sid"]
 
 # Enable the standard library. Forwarded to `xmrs`. The crate
 # compiles fully `no_std` without any extra math backend — the
@@ -75,15 +86,24 @@ std = ["xmrs/std", "xmrs/float-helpers"]
 # To install the player binary: `cargo install xmrsplayer --features demo`.
 demo = ["std", "import", "clap", "console", "cpal", "hound"]
 
+# ---- Chip synthesis (propagate to xmrs; independent of any importer) ----
+# The player's FM / SID *playback* paths (`voices.rs`, `channel/opl.rs`,
+# `channel/sid.rs`, the OPL/SID tick code) are gated on these, NOT on
+# `import_*` — a build can play a SID or OPL instrument without shipping a
+# parser. Mirrors xmrs's own split; see `xmrs/src/core/FORMAT_RFC.md` §5.2.
+synth_opl = ["xmrs/synth_opl"]
+synth_sid = ["xmrs/synth_sid"]
+
 # ---- Historical-format importers (propagate to xmrs) ----
 # `import` is an umbrella for all importers. Downstreams that want
 # a smaller binary can disable it and pick only the formats they
 # need, e.g. `features = ["std", "import_xm"]`.
 #
-# It must enable xmrsplayer's *own* per-format features (not just
-# `xmrs/import`), because player-side code is now gated on them — e.g.
-# the OPL FM synthesiser is `#[cfg(feature = "import_s3m")]`. Without
-# this, a default / `demo` build would silently drop FM playback.
+# Each per-format importer pulls the synthesiser it targets — an S3M can
+# carry OPL instruments, a SID module SID voices — so that enabling an
+# importer never silently drops the playback of what it can import. This
+# mirrors xmrs's `import_s3m = ["synth_opl"]`: the arrow points importer →
+# synth, never the reverse.
 import = [
     "xmrs/import",
     "import_mod",
@@ -95,9 +115,9 @@ import = [
 ]
 import_mod = ["xmrs/import_mod"]
 import_xm  = ["xmrs/import_xm"]
-import_s3m = ["xmrs/import_s3m"]
+import_s3m = ["xmrs/import_s3m", "synth_opl"]
 import_it  = ["xmrs/import_it"]
-import_sid = ["xmrs/import_sid"]
+import_sid = ["xmrs/import_sid", "synth_sid"]
 import_dw  = ["xmrs/import_dw"]
 
 [lib]
@@ -111,6 +131,12 @@ codegen-units = 1
 panic = "abort"
 
 [dev-dependencies]
+# The same `xmrs`, plus the bundled `.sid` images. The oracle gates and the SID
+# examples name tunes (`get_sid_lightforce()`) rather than reading files, so
+# they need the payload — but only they do: with resolver v2 a dev-dependency
+# feature does not reach a plain `cargo build`, so the shipped player binary
+# stays free of third-party music. See `xmrs`'s `sid_songs` feature.
+xmrs = { path = "../xmrs", features = ["sid_songs"] }
 # Serde round-trip harness for the DAW-generalization compatibility
 # contract (DAW_GENERALIZATION_RFC §0.3). Test-only; the library itself
 # stays serde-format-agnostic.
