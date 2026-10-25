@@ -196,9 +196,25 @@ fn main() -> Result<(), std::io::Error> {
     if let Some(filename) = cli.filename {
         println!("opening {}", filename);
         let contents = std::fs::read(filename.trim())?;
-        match Module::load(&contents) {
+        let is_tfmx = contents.len() >= 10 && (
+            &contents[..9] == b"TFMX-SONG" ||
+            &contents[..9] == b"TFMX_SONG" ||
+            &contents[..9] == b"TFMX_1.5"
+        ) || filename.trim().ends_with(".tfx") || filename.trim().ends_with(".TFX")
+          || std::path::Path::new(filename.trim()).file_name().and_then(|s| s.to_str()).map_or(false, |s| s.starts_with("mdat.") || s.starts_with("MDAT."));
+
+        let module_res = if is_tfmx {
+            Module::load_tfmx_path(filename.trim(), cli.song)
+        } else {
+            Module::load(&contents)
+        };
+
+        match module_res {
             Ok(mut module) => {
                 drop(contents); // cleanup memory
+                if is_tfmx {
+                    cli.song = 0;
+                }
                                 // David Whittaker `.dw` files carry no embedded
                                 // song name — the importer tags them all with the
                                 // same generic "David Whittaker (.dw)". Derive a
