@@ -88,6 +88,7 @@ impl<'a> Channel<'a> {
                         self.rate,
                         self.module.quirks.sample_volume_is_static_gain,
                     );
+                    state.interpolation = self.interpolation;
                     // RFC §2C: snapshot this note's per-note expression
                     // (MPE) onto the voice. Neutral for every tracker
                     // cell, so the voice behaves exactly as before.

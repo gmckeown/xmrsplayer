@@ -9,6 +9,8 @@ pub(crate) mod effect_arpeggio;
 pub(crate) mod effect_vibrato_tremolo;
 
 pub mod channel;
+pub mod interpolation;
+pub use interpolation::Interpolation;
 pub mod prelude;
 pub(crate) mod state_auto_vibrato;
 pub(crate) mod state_envelope;

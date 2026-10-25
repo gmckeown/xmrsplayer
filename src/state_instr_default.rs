@@ -30,6 +30,8 @@ pub struct StateInstrDefault<'a> {
     period_helper: PeriodHelper,
     /// Sample state
     pub state_sample: Option<StateSample<'a>>,
+    /// Sample interpolation mode
+    pub interpolation: crate::interpolation::Interpolation,
     /// Index into `instr.sample` for the currently-selected sample.
     /// `None` when no sample is loaded. Parallels `state_sample`'s
     /// lifecycle but carries the numeric id; DCT::Sample matching
@@ -137,6 +139,7 @@ impl<'a> StateInstrDefault<'a> {
             instr,
             num,
             rate,
+            interpolation: crate::interpolation::Interpolation::default(),
             period_helper: period_helper.clone(),
             state_sample: None,
             current_sample_num: None,
@@ -158,6 +161,13 @@ impl<'a> StateInstrDefault<'a> {
 
     pub fn has_volume_envelope(&self) -> bool {
         self.envelope_volume.has_volume_envelope()
+    }
+
+    pub fn set_interpolation(&mut self, interpolation: crate::interpolation::Interpolation) {
+        self.interpolation = interpolation;
+        if let Some(s) = &mut self.state_sample {
+            s.interpolation = interpolation;
+        }
     }
 
     pub fn replace_instr(&mut self, instr: &'a InstrDefault) {
@@ -789,7 +799,8 @@ impl<'a> StateInstrDefault<'a> {
     fn select_sample(&mut self, num: usize) -> bool {
         if num < self.instr.sample.len() {
             if let Some(sample) = &self.instr.sample[num] {
-                let state_sample = StateSample::new(sample, self.rate);
+                let mut state_sample = StateSample::new(sample, self.rate);
+                state_sample.interpolation = self.interpolation;
                 // IT's pan cascade: sample override → instrument
                 // default_pan → channel initial pan. The IT
                 // importer stores exactly `0.5` in Sample.panning

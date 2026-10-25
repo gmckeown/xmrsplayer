@@ -57,6 +57,8 @@ impl LoopRegion {
 #[derive(Clone)]
 pub struct StateSample<'a> {
     sample: &'a Sample,
+    /// Sample interpolation mode (defaults to `Interpolation::Nearest`)
+    pub interpolation: crate::interpolation::Interpolation,
     /// Voice finetune contribution in semitones. Stored as
     /// `Finetune` Q1.15 — represents fractional semitones in
     /// `[-1, +1)`. The tracker formats put a signed byte here
@@ -105,6 +107,7 @@ impl<'a> StateSample<'a> {
         let cached_len = sample.len();
         Self {
             sample,
+            interpolation: crate::interpolation::Interpolation::default(),
             finetune: sample.finetune,
             sustained: true,
             position: (0, 0),
@@ -289,27 +292,19 @@ impl<'a> StateSample<'a> {
                 return (Amp::SILENCE, Amp::SILENCE);
             }
         };
-        // Linear interpolation peek: the "next" sample follows the
-        // same rules. If the next frame is past the end, reuse the
-        // current one rather than blending into silence.
-        let vseek = self.seek_cached(pos + 1).unwrap_or(useek);
-
-        // Position fraction in Q1.15. `get_position_fraction()`
-        // returns a `u32` in `[0, 1 << M)` (M is the player's
-        // sub-sample bit count, typically 25). Right-shift by
-        // `M - 15` to bring it into the Q1.15 numerator space —
-        // exact for any `M ≥ 15`, no f32.
-        let frac = self.get_position_fraction();
-        let t = Q15::from_raw((frac >> (M - 15)) as i16);
-
         let u = self.sample.at(useek);
-        let v = self.sample.at(vseek);
-
         self.increment_position();
 
-        // `Amp::lerp` is a saturating Q1.15 lerp — `u + (v - u) * t`
-        // computed in widened i32.
-        (u.0.lerp(v.0, t), u.1.lerp(v.1, t))
+        match self.interpolation {
+            crate::interpolation::Interpolation::Nearest => (u.0, u.1),
+            crate::interpolation::Interpolation::Linear => {
+                let vseek = self.seek_cached(pos + 1).unwrap_or(useek);
+                let frac = self.get_position_fraction();
+                let t = Q15::from_raw((frac >> (M - 15)) as i16);
+                let v = self.sample.at(vseek);
+                (u.0.lerp(v.0, t), u.1.lerp(v.1, t))
+            }
+        }
     }
 
     pub fn set_position(&mut self, position: usize) {

@@ -423,6 +423,16 @@ impl<'a> XmrsPlayer<'a> {
         self.voices.set_amplification(a);
     }
 
+    /// Sample interpolation mode (defaults to `Interpolation::Nearest`).
+    pub fn interpolation(&self) -> crate::interpolation::Interpolation {
+        self.voices.interpolation()
+    }
+
+    /// Set sample interpolation mode (Nearest / Linear) dynamically.
+    pub fn set_interpolation(&mut self, interpolation: crate::interpolation::Interpolation) {
+        self.voices.set_interpolation(interpolation);
+    }
+
     // --- Navigation (goto) ---
 
     /// Jump to row at index `table_position` in pattern_order, at `speed`.

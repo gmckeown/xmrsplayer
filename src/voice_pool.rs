@@ -259,6 +259,14 @@ impl<'a> VoicePool<'a> {
         VoiceId::new(slot_idx, slot.generation)
     }
 
+    pub fn set_interpolation(&mut self, interpolation: crate::interpolation::Interpolation) {
+        for slot in &mut self.slots {
+            if let SlotState::Occupied(voice) = &mut slot.state {
+                voice.instr.set_interpolation(interpolation);
+            }
+        }
+    }
+
     /// Eviction-victim picker for `allocate_ghost`.
     ///
     /// Returns `Some(slot)` only when the pool contains at least one

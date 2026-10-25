@@ -44,6 +44,7 @@ pub const DEFAULT_VOICE_POOL_CAPACITY: usize = 256;
 /// them on each row/tick boundary).
 pub struct Voices<'a> {
     sample_rate: SampleRate,
+    pub(crate) interpolation: crate::interpolation::Interpolation,
 
     /// Module reference, kept so the global-volume / global-volume-
     /// slide lane lookups in [`Self::process_row`] can introspect
@@ -328,6 +329,7 @@ impl<'a> Voices<'a> {
         let num_channels = channels.len();
         let mut voices = Self {
             sample_rate: sr,
+            interpolation: crate::interpolation::Interpolation::default(),
             module,
             channel: channels,
             pool: VoicePool::new(voice_pool_capacity),
@@ -530,6 +532,19 @@ impl<'a> Voices<'a> {
     /// Set song-driven master volume.
     pub fn set_global_volume(&mut self, v: Volume) {
         self.global_volume = v;
+    }
+
+    /// Sample interpolation mode (point sampling vs linear).
+    pub fn interpolation(&self) -> crate::interpolation::Interpolation {
+        self.interpolation
+    }
+    /// Set sample interpolation mode across all channels and active voices.
+    pub fn set_interpolation(&mut self, interpolation: crate::interpolation::Interpolation) {
+        self.interpolation = interpolation;
+        for c in &mut self.channel {
+            c.set_interpolation(interpolation);
+        }
+        self.pool.set_interpolation(interpolation);
     }
 
     /// Q4.12 user-driven amplification (up to 8×).

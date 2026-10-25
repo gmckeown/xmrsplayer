@@ -262,6 +262,7 @@ pub struct Channel<'a> {
     /// Euclidean humanisation state — see
     /// [`crate::state_humanize_ekn`].
     pub(crate) humanize_ekn: crate::state_humanize_ekn::StateHumanizeEkn,
+    pub(crate) interpolation: crate::interpolation::Interpolation,
 
     /// OPL (FM) state — non-empty only while this channel sounds an
     /// `InstrumentType::Opl`. Default/empty for every sample channel, so
@@ -293,6 +294,7 @@ impl<'a> Channel<'a> {
         Self {
             module,
             period_helper: period_helper.clone(),
+            interpolation: crate::interpolation::Interpolation::default(),
             rate,
             channel_volume: ChannelVolume::FULL,
             volume: Volume::FULL,
@@ -394,6 +396,11 @@ impl<'a> Channel<'a> {
     #[inline(always)]
     pub(crate) fn set_initial_surround(&mut self, surround: bool) {
         self.surround = surround;
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_interpolation(&mut self, interpolation: crate::interpolation::Interpolation) {
+        self.interpolation = interpolation;
     }
 
     /// Re-seed the channel's PRNG. Called by `Voices::new` with a
