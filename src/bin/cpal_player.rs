@@ -194,17 +194,24 @@ fn main() -> Result<(), std::io::Error> {
     println!("Because demo scene can't die :)\n");
 
     if let Some(filename) = cli.filename {
+        let filename = filename.trim();
         println!("opening {}", filename);
-        let contents = std::fs::read(filename.trim())?;
-        let is_tfmx = contents.len() >= 10 && (
-            &contents[..9] == b"TFMX-SONG" ||
-            &contents[..9] == b"TFMX_SONG" ||
-            &contents[..9] == b"TFMX_1.5"
-        ) || filename.trim().ends_with(".tfx") || filename.trim().ends_with(".TFX")
-          || std::path::Path::new(filename.trim()).file_name().and_then(|s| s.to_str()).map_or(false, |s| s.starts_with("mdat.") || s.starts_with("MDAT."));
+        let contents = std::fs::read(filename)?;
+
+        #[cfg(feature = "import_tfmx")]
+        let is_tfmx = xmrs::tracker::import::tfmx::TfmxModule::is_tfmx(&contents, Some(filename));
+        #[cfg(not(feature = "import_tfmx"))]
+        let is_tfmx = false;
 
         let module_res = if is_tfmx {
-            Module::load_tfmx_path(filename.trim(), cli.song)
+            #[cfg(feature = "import_tfmx")]
+            {
+                Module::load_tfmx_path(filename, cli.song)
+            }
+            #[cfg(not(feature = "import_tfmx"))]
+            {
+                Module::load(&contents)
+            }
         } else {
             Module::load(&contents)
         };
@@ -222,7 +229,7 @@ fn main() -> Result<(), std::io::Error> {
                                 // of `.dw` rips is distinguishable in the player /
                                 // any UI. Other formats keep their embedded name.
                 if module.origin == Some(xmrs::tracker::format::ModuleFormat::Dw) {
-                    if let Some(stem) = std::path::Path::new(filename.trim())
+                    if let Some(stem) = std::path::Path::new(filename)
                         .file_stem()
                         .and_then(|s| s.to_str())
                     {

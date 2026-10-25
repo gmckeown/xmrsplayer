@@ -112,6 +112,7 @@ import = [
     "import_it",
     "import_sid",
     "import_dw",
+    "import_tfmx",
 ]
 import_mod = ["xmrs/import_mod"]
 import_xm  = ["xmrs/import_xm"]
@@ -119,6 +120,7 @@ import_s3m = ["xmrs/import_s3m", "synth_opl"]
 import_it  = ["xmrs/import_it"]
 import_sid = ["xmrs/import_sid", "synth_sid"]
 import_dw  = ["xmrs/import_dw"]
+import_tfmx = ["xmrs/import_tfmx"]
 
 [lib]
 name = "xmrsplayer"
