@@ -423,7 +423,7 @@ impl<'a> XmrsPlayer<'a> {
         self.voices.set_amplification(a);
     }
 
-    /// Sample interpolation mode (defaults to `Interpolation::Nearest`).
+    /// Sample interpolation mode (defaults to `Interpolation::Linear`).
     pub fn interpolation(&self) -> crate::interpolation::Interpolation {
         self.voices.interpolation()
     }

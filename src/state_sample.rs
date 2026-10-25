@@ -57,7 +57,7 @@ impl LoopRegion {
 #[derive(Clone)]
 pub struct StateSample<'a> {
     sample: &'a Sample,
-    /// Sample interpolation mode (defaults to `Interpolation::Nearest`)
+    /// Sample interpolation mode (defaults to `Interpolation::Linear`)
     pub interpolation: crate::interpolation::Interpolation,
     /// Voice finetune contribution in semitones. Stored as
     /// `Finetune` Q1.15 — represents fractional semitones in
