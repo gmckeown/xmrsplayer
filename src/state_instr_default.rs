@@ -644,7 +644,7 @@ impl<'a> StateInstrDefault<'a> {
         let base_pitch_q88 = match self.period_helper.freq_type {
             FrequencyType::LinearFrequencies => (7680_i32 - period.raw() as i32) * 4,
             FrequencyType::AmigaFrequencies => {
-                xmrs::core::fixed::tables::amiga_period_to_pitch(period).as_q8_8_i32()
+                self.period_helper.period_to_pitch(period).as_q8_8_i32()
             }
         };
         let pitch_q = self.finalize_pitch(base_pitch_q88, delta_q88, arp_active, semitone);

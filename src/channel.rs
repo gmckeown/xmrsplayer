@@ -289,8 +289,11 @@ impl<'a> Channel<'a> {
     /// player must subsequently call [`Self::set_tempo`] whenever the
     /// song tempo changes (Fxx effect) to keep the LUT index in sync.
     pub(crate) fn new(module: &'a Module, rate: SampleRate, tempo: usize) -> Self {
-        let period_helper =
-            PeriodHelper::new(module.frequency_type, module.quirks.ft2_arpeggio_note_clamp);
+        let period_helper = PeriodHelper::with_quirks(
+            module.frequency_type,
+            module.quirks.ft2_arpeggio_note_clamp,
+            module.quirks.legacy_amiga_period_base,
+        );
         Self {
             module,
             period_helper: period_helper.clone(),
