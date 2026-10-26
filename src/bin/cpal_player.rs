@@ -100,6 +100,111 @@ impl PlayerObserver for ExitOnSongEnd {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterMode {
+    None,
+    A500,       // 4.4 kHz Butterworth (LED filter) + 7.0 kHz RC
+    A500LedOff, // 7.0 kHz RC only (LED filter disabled)
+}
+
+struct Biquad {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    x1: f64,
+    x2: f64,
+    y1: f64,
+    y2: f64,
+}
+
+impl Biquad {
+    fn butterworth_lp(fc: f64, fs: f64) -> Self {
+        let c = (std::f64::consts::PI * fc / fs).tan();
+        let c2 = c * c;
+        let sqrt2 = std::f64::consts::SQRT_2;
+        let a0 = 1.0 + sqrt2 * c + c2;
+        let b0 = c2 / a0;
+        let b1 = 2.0 * b0;
+        let b2 = b0;
+        let a1 = 2.0 * (c2 - 1.0) / a0;
+        let a2 = (1.0 - sqrt2 * c + c2) / a0;
+        Self {
+            b0,
+            b1,
+            b2,
+            a1,
+            a2,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, x: f64) -> f64 {
+        let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2 - self.a1 * self.y1 - self.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
+    }
+}
+
+struct RcFilter {
+    alpha: f64,
+    y: f64,
+}
+
+impl RcFilter {
+    fn new(fc: f64, fs: f64) -> Self {
+        let w = 2.0 * std::f64::consts::PI * fc / fs;
+        let alpha = w / (1.0 + w);
+        Self { alpha, y: 0.0 }
+    }
+
+    #[inline]
+    fn process(&mut self, x: f64) -> f64 {
+        self.y += self.alpha * (x - self.y);
+        self.y
+    }
+}
+
+struct ChannelFilter {
+    mode: FilterMode,
+    butterworth: Biquad,
+    rc: RcFilter,
+}
+
+impl ChannelFilter {
+    fn new(mode: FilterMode, sample_rate: f64) -> Self {
+        Self {
+            mode,
+            butterworth: Biquad::butterworth_lp(4400.0, sample_rate),
+            rc: RcFilter::new(7000.0, sample_rate),
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, sample: i16) -> i16 {
+        match self.mode {
+            FilterMode::None => sample,
+            FilterMode::A500LedOff => {
+                let y = self.rc.process(sample as f64);
+                y.round().clamp(-32768.0, 32767.0) as i16
+            }
+            FilterMode::A500 => {
+                let y_bw = self.butterworth.process(sample as f64);
+                let y_rc = self.rc.process(y_bw);
+                y_rc.round().clamp(-32768.0, 32767.0) as i16
+            }
+        }
+    }
+}
+
 #[derive(Parser)]
 struct Cli {
     /// The music file to play. Every format the build can import is
@@ -157,6 +262,14 @@ struct Cli {
     /// (C-0 = 0, C-4 = 48, the default).
     #[arg(short = 'n', long, default_value = "48")]
     note: u8,
+
+    /// Amiga hardware analogue filter mode: 'a500' (default with --a500-filter), 'a500-led-off', or 'none'
+    #[arg(long, default_value = "none")]
+    filter: String,
+
+    /// Enable Amiga 500 analogue low-pass filter (4.4 kHz LED + 7.0 kHz RC)
+    #[arg(long, default_value = "false")]
+    a500_filter: bool,
 
     /// Compute the song's theoretical duration and exit without
     /// playing anything. The duration is reported as `MM:SS`,
@@ -316,6 +429,20 @@ fn main() -> Result<(), std::io::Error> {
                     song_bpm,
                 );
 
+                let filter_mode = if cli.a500_filter {
+                    FilterMode::A500
+                } else {
+                    match cli.filter.to_ascii_lowercase().as_str() {
+                        "a500" | "a500-led" | "led-on" | "on" => FilterMode::A500,
+                        "a500-led-off" | "led-off" => FilterMode::A500LedOff,
+                        "none" | "off" => FilterMode::None,
+                        other => {
+                            eprintln!("Unknown filter mode: '{other}'. Expected 'a500', 'a500-led-off', or 'none'.");
+                            std::process::exit(1);
+                        }
+                    }
+                };
+
                 let module = Box::new(module);
                 let module_ref: &'static Module = Box::leak(module);
                 play_music(
@@ -328,6 +455,7 @@ fn main() -> Result<(), std::io::Error> {
                     cli.ch,
                     cli.speed,
                     cli.output.clone(),
+                    filter_mode,
                 );
             }
             Err(e) => {
@@ -353,6 +481,7 @@ fn play_music(
     ch: u8,
     speed: usize,
     output: Option<String>,
+    filter_mode: FilterMode,
 ) {
     let host = cpal::default_host();
     let device = host
@@ -382,6 +511,12 @@ fn play_music(
     // below. When set, the loop exits — the binary returns to
     // `main` without waiting for the listener to press a key.
     let song_ended = Arc::new(AtomicBool::new(false));
+
+    let filter_pair = Arc::new(Mutex::new((
+        ChannelFilter::new(filter_mode, sample_rate_hz as f64),
+        ChannelFilter::new(filter_mode, sample_rate_hz as f64),
+    )));
+    let filter_pair_playback = Arc::clone(&filter_pair);
 
     {
         let mut player_lock = player.lock().unwrap();
@@ -419,7 +554,7 @@ fn play_music(
 
     if let Some(output) = output {
         tprintln!("writing {}...", output);
-        write_wave(player, output.as_str()).unwrap();
+        write_wave(player, output.as_str(), filter_mode).unwrap();
     } else {
         let player_clone = Arc::clone(&player);
         let stream = device
@@ -427,15 +562,16 @@ fn play_music(
                 &config.config(),
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let mut player_lock = player_clone.lock().unwrap();
-                    // The player produces `i16` PCM (full
-                    // ±32767 range). cpal in this stream
-                    // configuration wants `f32` in [-1, 1] —
-                    // convert at the demo boundary.
-                    data.iter_mut()
-                        .zip(player_lock.by_ref()) // itère sur les deux en parallèle
-                        .for_each(|(sample, value)| {
-                            *sample = value as f32 / i16::MAX as f32;
-                        });
+                    let mut filters = filter_pair_playback.lock().unwrap();
+                    // cpal wants stereo pairs: interleaved left, right
+                    for frame in data.chunks_exact_mut(2) {
+                        let left = player_lock.next().unwrap_or(0);
+                        let right = player_lock.next().unwrap_or(0);
+                        let left_f = filters.0.process(left);
+                        let right_f = filters.1.process(right);
+                        frame[0] = left_f as f32 / i16::MAX as f32;
+                        frame[1] = right_f as f32 / i16::MAX as f32;
+                    }
                 },
                 |_: cpal::StreamError| {},
                 None,
@@ -468,7 +604,7 @@ fn play_music(
         });
 
         tprintln!(
-            "Enter and i keys for info, Space for pause, left or right arrow to move, escape key to exit..."
+            "Enter and i for info, Space for pause, left/right arrow to seek, f for Amiga filter, Esc/q to exit..."
         );
         let mut playing = true;
         // The interactive loop now exits on any of three
@@ -566,6 +702,17 @@ fn play_music(
                         }
                     }
                 }
+                Key::Char('f') => {
+                    let mut filters = filter_pair.lock().unwrap();
+                    let next_mode = match filters.0.mode {
+                        FilterMode::None => FilterMode::A500,
+                        FilterMode::A500 => FilterMode::A500LedOff,
+                        FilterMode::A500LedOff => FilterMode::None,
+                    };
+                    filters.0.mode = next_mode;
+                    filters.1.mode = next_mode;
+                    tprintln!("Amiga analogue filter: {:?}", next_mode);
+                }
                 _ => {}
             }
         }
@@ -609,6 +756,7 @@ use hound::{SampleFormat, WavSpec, WavWriter};
 fn write_wave(
     amp: Arc<Mutex<XmrsPlayer>>,
     output_file: &str,
+    filter_mode: FilterMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let spec = WavSpec {
         channels: 2,
@@ -621,11 +769,12 @@ fn write_wave(
     amp.lock().unwrap().set_max_loop_count(1);
     let player_clone = Arc::clone(&amp);
     let mut player_lock = player_clone.lock().unwrap();
+    let mut filter_l = ChannelFilter::new(filter_mode, 44100.0);
+    let mut filter_r = ChannelFilter::new(filter_mode, 44100.0);
 
-    for sample in player_lock.by_ref() {
-        // Player iterator yields `i16` directly — write straight
-        // to the wav file with no float round-trip.
-        writer.write_sample(sample)?;
+    while let (Some(left), Some(right)) = (player_lock.next(), player_lock.next()) {
+        writer.write_sample(filter_l.process(left))?;
+        writer.write_sample(filter_r.process(right))?;
     }
 
     writer.finalize()?;

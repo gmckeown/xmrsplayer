@@ -1139,7 +1139,7 @@ dependencies = [
 
 [[package]]
 name = "xmrs"
-version = "0.15.0"
+version = "0.15.2"
 dependencies = [
  "ciborium",
  "oplon",
